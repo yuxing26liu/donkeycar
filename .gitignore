@@ -14,6 +14,10 @@ lag_log.csv
 site/*
 build
 
+# local copy of docs.donkeycar.com (autorope/donkeydocs), kept for reference only
+docs/
+mkdocs.yml
+
 #IDE
 .idea
 .spyproject

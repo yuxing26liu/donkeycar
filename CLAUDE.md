@@ -17,6 +17,11 @@ Fork of [autorope/donkeycar](https://github.com/autorope/donkeycar) — a self-d
 - The actual car app (calibrated `myconfig.py`, `models/`, `data/`) lives at **`/home/pi/mycar`** on the Pi, as a sibling directory to wherever this repo is cloned — not inside this repo, and not baked into the Docker image.
 - <!-- TODO: fill in drivetrain (PCA9685/servo-ESC vs. other), autopilot backend (Keras/TFLite/Torch), and any other hardware once settled -->
 
+## Reference docs
+
+- `docs/` is a local, gitignored, one-time copy of docs.donkeycar.com (from `autorope/donkeydocs`) — not tracked in this repo, won't update automatically, but useful to read locally.
+- Our task is improving the car's autonomous behaviors. [docs/guide/computer_vision/computer_vision.md](docs/guide/computer_vision/computer_vision.md) documents the **baseline** behavior we're trying to improve on: the built-in `cv_control` template's `LineFollower` autopilot ([donkeycar/parts/line_follower.py](donkeycar/parts/line_follower.py)) — a traditional (non-learned) computer-vision approach that takes a horizontal HSV color-threshold slice of the camera image to find a line, then a PID controller steers toward it and throttles down on turns / up on straights. Any new autonomous-behavior work should be understood as a comparison against this baseline, not a from-scratch design.
+
 ## Docker
 
 - `setup.cfg`'s extras groups (`pi`, `pc`, `nano`, `macos`) are for the full donkeycar experience (driving + training + the Kivy GUI). Some of what they pull in is slow to build from source (`python-prctl`, `stringzilla`/`simsimd` via `albumentations`) but does eventually succeed given enough time and the right system libs — it's not actually broken, just slow.
