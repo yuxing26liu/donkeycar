@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Fork of [autorope/donkeycar](https://github.com/autorope/donkeycar) for CSE150B — a self-driving RC car built on this library.
+Fork of [autorope/donkeycar](https://github.com/autorope/donkeycar) — a self-driving RC car built on this library.
 
 ## Architecture
 
