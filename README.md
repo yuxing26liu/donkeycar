@@ -1,5 +1,6 @@
 # Donkeycar: a python self driving library
 
+> Fork for UCSD's DSC190 class (Team 7)
 
 ![Build Status](https://github.com/autorope/donkeycar/actions/workflows/python-package-conda.yml/badge.svg?branch=main)
 ![Lint Status](https://github.com/autorope/donkeycar/actions/workflows/superlinter.yml/badge.svg?branch=main)
