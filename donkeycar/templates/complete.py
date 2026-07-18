@@ -874,8 +874,6 @@ def add_camera(V, cfg, camera_type):
     elif cfg.CAMERA_TYPE == "OAKD":
         from donkeycar.parts.oak_d import OakD
         cam = OakD(
-            width=cfg.IMAGE_W,
-            height=cfg.IMAGE_H,
             enable_rgb=cfg.OAKD_RGB,
             enable_depth=cfg.OAKD_DEPTH,
             device_id=cfg.OAKD_ID)
