@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-from simple_pid import PID
 import logging
 
 logger = logging.getLogger(__name__)
@@ -70,6 +69,21 @@ class RobustLineFollower:
         # freezing at the last commanded steering value.
         self.lost_steering_decay = getattr(cfg, 'LOST_STEERING_DECAY', 0.85)
 
+        # CHANGE 5: exponential smoothing applied to the measured position
+        # before it reaches the PID, to remove frame-to-frame jitter (e.g.
+        # from a dashed line's edge shifting slightly dash-to-dash) that
+        # would otherwise get amplified by the PID's derivative term into
+        # oscillating ("wobbly") steering. Lower alpha = smoother/slower
+        # to react; higher alpha = snappier/noisier.
+        self.smoothing_alpha = getattr(cfg, 'POSITION_SMOOTHING_ALPHA', 0.4)
+        self.smoothed_position = None
+        # set inside get_i_color(): True when we just (re)locked onto a
+        # line with no prior continuity (startup, or recovered from a long
+        # loss) - in that case change 5's smoothing should snap to the new
+        # position immediately instead of slowly blending in from a stale
+        # smoothed value that may be far away.
+        self.just_reacquired = False
+
     def get_i_color(self, cam_img):
         '''
         input: cam_image, an RGB numpy array
@@ -129,10 +143,14 @@ class RobustLineFollower:
         # waiting and re-acquire on the strongest candidate available.
         if self.tracked_position is None or self.lost_frames > self.reacquire_after_frames:
             chosen = max(candidates, key=lambda c: c[1])
+            # CHANGE 5 (cont'd): flag this as a fresh lock so the smoothing
+            # filter in run() snaps to it instead of blending in slowly.
+            self.just_reacquired = True
         else:
             nearest = min(candidates, key=lambda c: abs(c[0] - self.tracked_position))
             if abs(nearest[0] - self.tracked_position) <= self.max_jump_pixels:
                 chosen = nearest
+                self.just_reacquired = False
             else:
                 # the closest candidate is still an implausible jump away
                 # (e.g. a different line elsewhere in the row) - treat this
@@ -157,22 +175,40 @@ class RobustLineFollower:
         if cam_img is None:
             return 0, 0, None
 
-        position, confidence, mask = self.get_i_color(cam_img)
+        # CHANGE 6: default the target to the horizontal center of the
+        # image, as soon as we know the image width - not "wherever the
+        # line happened to be on the first frame we detected it"
+        # (LineFollower's behavior, inherited unchanged in earlier
+        # versions of this file). That auto-capture-from-first-frame
+        # behavior is meant for a two-lane "stay in whichever lane you
+        # started in" setup; for a single isolated line you want to
+        # actually drive centered on it, so if TARGET_PIXEL isn't
+        # explicitly set in config, this now means "the middle of the
+        # image" rather than "whatever offset we started at."
+        if self.target_pixel is None:
+            self.target_pixel = cam_img.shape[1] / 2.0
+            logger.info(f"Defaulting target line position to image center = {self.target_pixel}")
 
-        if self.target_pixel is None and position is not None:
-            # Use the first successful detection to set our relationship
-            # with the line, same as LineFollower.
-            self.target_pixel = position
-            logger.info(f"Automatically chosen line position = {self.target_pixel}")
-
-        if self.target_pixel is not None and self.pid_st.setpoint != self.target_pixel:
+        if self.pid_st.setpoint != self.target_pixel:
             self.pid_st.setpoint = self.target_pixel
 
+        position, confidence, mask = self.get_i_color(cam_img)
+
+        # CHANGE 5 (cont'd): smooth the raw per-frame measurement before it
+        # reaches the PID. On a fresh (re)lock, snap directly to the new
+        # position instead of blending from a possibly-stale old value.
+        if position is not None:
+            if self.smoothed_position is None or self.just_reacquired:
+                self.smoothed_position = position
+            else:
+                self.smoothed_position = (self.smoothing_alpha * position
+                                           + (1 - self.smoothing_alpha) * self.smoothed_position)
+
         if position is not None and confidence >= self.confidence_threshold:
-            self.steering = self.pid_st(position)
+            self.steering = self.pid_st(self.smoothed_position)
 
             # slow down linearly when away from ideal, and speed up when close
-            if abs(position - self.target_pixel) > self.target_threshold:
+            if abs(self.smoothed_position - self.target_pixel) > self.target_threshold:
                 self.throttle = max(self.throttle - self.delta_th, self.throttle_min)
             else:
                 self.throttle = min(self.throttle + self.delta_th, self.throttle_max)
@@ -202,11 +238,20 @@ class RobustLineFollower:
         img = np.copy(cam_img)
         img[iSlice: iSlice + self.scan_height, :, :] = mask_exp
 
-        # CHANGE 2 (cont'd): mark the tracked position and the target so
-        # it's visually obvious in the web UI when the track jumps or is lost.
+        # CHANGE 2 (cont'd) / CHANGE 5/6 (cont'd): mark the raw detection,
+        # the smoothed value actually driving the PID, and the target, so
+        # it's visually obvious in the web UI when the raw track jumps,
+        # how much the smoothing is correcting for it, and whether the
+        # car is actually centering on the target.
         if position is not None:
             xi = int(np.clip(position, 0, img.shape[1] - 1))
-            cv2.line(img, (xi, iSlice), (xi, iSlice + self.scan_height), (255, 0, 0), 2)
+            cv2.line(img, (xi, iSlice), (xi, iSlice + self.scan_height), (0, 255, 255), 1)  # raw = yellow
+        if self.smoothed_position is not None:
+            xs = int(np.clip(self.smoothed_position, 0, img.shape[1] - 1))
+            cv2.line(img, (xs, iSlice), (xs, iSlice + self.scan_height), (255, 0, 0), 2)  # smoothed = blue
+        if self.target_pixel is not None:
+            xt = int(np.clip(self.target_pixel, 0, img.shape[1] - 1))
+            cv2.line(img, (xt, iSlice), (xt, iSlice + self.scan_height), (0, 255, 0), 1)  # target = green
 
         display_str = []
         display_str.append("STEERING:{:.1f}".format(self.steering))
