@@ -139,13 +139,17 @@ class OakD(object):
 
         cam_rgb.setResolution(res)
         # Set preview size to match model input
-        cam_rgb.setPreviewSize(self.image_w, self.image_h)
+        cam_rgb.setPreviewSize(width, height)
         cam_rgb.setInterleaved(False)
+        # donkeycar CV parts (e.g. LineFollower) assume RGB frames.
+        cam_rgb.setColorOrder(depthai.ColorCameraProperties.ColorOrder.RGB)
 
         xout_rgb = self.pipeline.create(depthai.node.XLinkOut)
         xout_rgb.setStreamName("rgb")
 
-        cam_rgb.video.link(xout_rgb.input)
+        # Link .preview (sized via setPreviewSize above), not .video, which
+        # ignores setPreviewSize and always streams at the sensor resolution.
+        cam_rgb.preview.link(xout_rgb.input)
 
     def get_mono_camera(self, pipeline: Pipeline, is_left: bool):
         # Configure mono camera

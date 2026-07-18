@@ -73,10 +73,13 @@ class LineFollower:
         conf_thresh = 0.001
 
         if self.target_pixel is None:
-            # Use the first run of get_i_color to set our relationship with the yellow line.
-            # You could optionally init the target_pixel with the desired value.
-            self.target_pixel = max_yellow
-            logger.info(f"Automatically chosen line position = {self.target_pixel}")
+            # Default to the image center rather than latching onto whatever
+            # the first frame's strongest color match happens to be -- that
+            # match can be background clutter (a wall, plant, reflection)
+            # rather than the actual line, causing the car to track the
+            # wrong object for the rest of the run.
+            self.target_pixel = cam_img.shape[1] / 2
+            logger.info(f"No TARGET_PIXEL configured; defaulting to image center = {self.target_pixel}")
 
         if self.pid_st.setpoint != self.target_pixel:
             # this is the target of our steering PID controller
