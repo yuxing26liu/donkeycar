@@ -12,7 +12,7 @@ class BetterLineFollower:
 
     Same overall shape as LineFollower: take a horizontal slice of the
     image, threshold it in HSV to find "yellow", and steer a PID
-    controller to keep that position centered. Three changes on top of
+    controller to keep that position centered. Four changes on top of
     that, aimed specifically at the reported wobble/veering caused by
     sunlit rocks and gravel in the background matching the yellow
     threshold:
@@ -55,6 +55,35 @@ class BetterLineFollower:
          if IMAGE_W/IMAGE_H in config doesn't match what the camera is
          actually producing (see camera-resolution note below).
          cfg.TARGET_PIXEL still wins if explicitly set to a number.
+
+      4. PID output is clamped to [-1, 1] via simple_pid's own
+         output_limits, instead of being handed to the actuator
+         unbounded. LineFollower (and this class, until now) never
+         constrained self.steering at all: a recorded autopilot drive
+         showed |steering| > 1 on 71% of frames, ranging as far as
+         -9.3 to 6.5, because nothing between the PID and
+         VESC.run()'s set_servo() call clips it to the range every
+         actuator part in this codebase assumes. In practice that
+         means the "steering" the car acts on is just its sign - full
+         lock one way or the other - instead of a proportional
+         correction, which is what wobble/veering driven by a PID
+         that's alternately saturating positive and negative looks
+         like. output_limits is set on the pid object itself (rather
+         than clipping self.steering after computing it) because
+         simple_pid also clamps its internal integral accumulator to
+         the same limits on every call - see _clamp() in
+         simple_pid/pid.py - so the integral term can't wind up past
+         what the output can actually use. Clipping self.steering
+         post-hoc would leave that accumulator free to grow
+         unbounded whenever PID_I is nonzero, producing a stuck
+         lag after the line position reverses direction while the
+         integral term "unwinds" back through its inflated value -
+         a second, subtler wobble bug on top of the one this fixes.
+         PID_I is 0 in cfg_cv_control.py's defaults today, which is
+         exactly the kind of thing that's easy to change later while
+         tuning (this session's recording already shows PID_P being
+         adjusted live via the controller), so this is worth getting
+         right now rather than only clipping the symptom.
 
     Also fixed: LineFollower's run() returns a 4-tuple
     (0, 0, False, None) on its "no frame yet" path but a 3-tuple
@@ -109,6 +138,10 @@ class BetterLineFollower:
         self.min_line_aspect_ratio = getattr(cfg, "MIN_LINE_ASPECT_RATIO", 0.15)
 
         self.pid_st = pid
+        # change 4: see class docstring - this both bounds the output
+        # and caps the internal integral term so it can't wind up past
+        # what the actuator can use.
+        self.pid_st.output_limits = (-1.0, 1.0)
 
     def get_color_mask(self, scan_line):
         '''
