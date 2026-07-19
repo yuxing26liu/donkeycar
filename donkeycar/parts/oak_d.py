@@ -139,7 +139,7 @@ class OakD(object):
 
         cam_rgb.setResolution(res)
         # Set preview size to match model input
-        cam_rgb.setPreviewSize(self.image_w, self.image_h)
+        cam_rgb.setPreviewSize(width, height)
         cam_rgb.setInterleaved(False)
 
         xout_rgb = self.pipeline.create(depthai.node.XLinkOut)
