@@ -568,6 +568,15 @@ COLOR_THRESHOLD_HIGH = (35, 255, 255) # HSV light yellow (opencv HSV hue value i
 # (see bugs_to_solve.md) -- re-tune with scripts/hsv_picker.py if lighting
 # or the tape itself changes.
 
+LINE_WIDTH_MIN = 5    # narrowest pixel width (in the scan slice) of a valid tape dash -- guessed, not yet tuned
+LINE_WIDTH_MAX = 60   # widest pixel width (in the scan slice) of a valid tape dash -- guessed, not yet tuned
+# Same-color objects off the track (e.g. an orange/yellow rock) are rejected if
+# their matched blob's width falls outside this range, even though the color
+# match alone can't tell them apart from the tape. Tune with the "WIDTH:" log
+# line in line_follower.py (run with LOGLEVEL=DEBUG) -- record the width over
+# a real dash vs. over the offending object, then set MIN/MAX to bracket only
+# the dash.
+
 # LineFollower - target (expected) line position and detection thresholds
 TARGET_PIXEL = None   # In not None, then this is the expected horizontal position in pixels of the yellow line.
                       # If None, then detect the position yellow line at startup;
@@ -602,6 +611,38 @@ PID_D_DELTA = 0.00005 # amount the inc/dec function will change the D value
 
 OVERLAY_IMAGE = True  # True to draw computer vision overlay on camera image in web ui
                       # NOTE: this does not affect what is saved to the data
+
+# OAK-D depth camera settings, used when CAMERA_TYPE = "OAKD" (set per-car in
+# myconfig.py -- this template's CAMERA_TYPE default above stays "PICAM").
+# See donkeycar/parts/oak_d.py -- these are required by add_camera() whenever
+# CAMERA_TYPE is "OAKD", regardless of which template is used.
+OAKD_RGB = True    # stream the RGB preview (feeds cam/image_array, used by LineFollower)
+OAKD_DEPTH = True  # stream the depth map (feeds cam/depth_array, used by ObjectAvoider)
+OAKD_ID = None     # serial number of the device to use; None to use the only/default one
+
+# ObjectAvoider - depth based obstacle avoidance for two-way road navigation.
+# Watches a horizontal slice of cam/depth_array (same SCAN_Y/SCAN_HEIGHT style
+# as LineFollower's color scan, but over depth in mm) for an object closer
+# than OBJECT_DANGER_DISTANCE_MM, and if so overrides pilot/steering and
+# pilot/throttle to swerve away from whichever side it's on. Requires
+# CAMERA_TYPE = "OAKD" and OAKD_DEPTH = True to have any effect -- with any
+# other camera cam/depth_array is never populated, so this part is a no-op.
+HAVE_OBJECT_AVOIDANCE = True
+
+DEPTH_SCAN_Y = 100      # num pixels from the top to start horiz scan of the depth image
+DEPTH_SCAN_HEIGHT = 40  # num pixels high to grab from horiz scan
+# Guessed defaults, not yet tuned on hardware (depth stream from oak_d.py has
+# not been verified on the car yet -- see bugs_to_solve.md). Confirm
+# cam/depth_array looks sane first (log its shape/min/max), then re-tune
+# these against the real track using LOGLEVEL=DEBUG, same workflow as
+# LINE_WIDTH_MIN/MAX above.
+OBJECT_MIN_VALID_DEPTH_MM = 200    # ignore readings closer than this (lens-adjacent noise / invalid)
+OBJECT_DANGER_DISTANCE_MM = 800    # trigger avoidance when nearest object is closer than this
+OBJECT_AVOID_STEERING = 0.8        # magnitude of the override steering value while avoiding (-1 to 1)
+                                    # if the car swerves the wrong way, flip the sign convention
+                                    # by using a negative value here.
+OBJECT_AVOID_THROTTLE = THROTTLE_MIN  # throttle to use while avoiding -- slow, but still moving
+                                       # so the car can actually execute the swerve.
 
 
 #

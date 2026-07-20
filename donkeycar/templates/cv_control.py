@@ -108,6 +108,19 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
                       cfg.CV_CONTROLLER_OUTPUTS,
                       cfg.CV_CONTROLLER_CONDITION)
 
+    #
+    # Depth based obstacle avoidance -- overrides pilot/steering and
+    # pilot/throttle when an object is detected closer than
+    # OBJECT_DANGER_DISTANCE_MM. No-op if cam/depth_array isn't populated
+    # (e.g. CAMERA_TYPE isn't "OAKD").
+    #
+    if getattr(cfg, 'HAVE_OBJECT_AVOIDANCE', False):
+        from donkeycar.parts.object_avoider import ObjectAvoider
+        V.add(ObjectAvoider(cfg),
+              inputs=['cam/depth_array', 'pilot/steering', 'pilot/throttle'],
+              outputs=['pilot/steering', 'pilot/throttle'],
+              run_condition='run_pilot')
+
     recording_control = ToggleRecording(cfg.AUTO_RECORD_ON_THROTTLE, cfg.RECORD_DURING_AI)
     V.add(recording_control, inputs=['user/mode', "recording"], outputs=["recording"])
 

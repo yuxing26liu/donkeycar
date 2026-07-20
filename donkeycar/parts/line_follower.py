@@ -21,6 +21,8 @@ class LineFollower:
         self.scan_height = cfg.SCAN_HEIGHT  # num pixels high to grab from horiz scan
         self.color_thr_low = np.asarray(cfg.COLOR_THRESHOLD_LOW)  # hsv dark yellow
         self.color_thr_hi = np.asarray(cfg.COLOR_THRESHOLD_HIGH)  # hsv light yellow
+        self.line_width_min = cfg.LINE_WIDTH_MIN  # narrowest pixel width of a valid tape dash
+        self.line_width_max = cfg.LINE_WIDTH_MAX  # widest pixel width of a valid tape dash
         self.target_pixel = cfg.TARGET_PIXEL  # of the N slots above, which is the ideal relationship target
         self.target_threshold = cfg.TARGET_THRESHOLD # minimum distance from target_pixel before a steering change is made.
         self.confidence_threshold = cfg.CONFIDENCE_THRESHOLD  # percentage of yellow pixels that must be in target_pixel slice
@@ -37,7 +39,9 @@ class LineFollower:
         '''
         get the horizontal index of the color at the given slice of the image
         input: cam_image, an RGB numpy array
-        output: index of max color, value of cumulative color at that index, and mask of pixels in range
+        output: index of max color, value of cumulative color at that index, mask of
+                pixels in range, and the pixel width of the blob that was picked (for
+                tuning LINE_WIDTH_MIN/MAX -- 0 if nothing matched)
         '''
         # take a horizontal slice of the image
         iSlice = self.scan_y
@@ -49,11 +53,32 @@ class LineFollower:
         # make a mask of the colors in our range we are looking for
         mask = cv2.inRange(img_hsv, self.color_thr_low, self.color_thr_hi)
 
-        # which index of the range has the highest amount of yellow?
-        hist = np.sum(mask, axis=0)
-        max_yellow = np.argmax(hist)
+        # Group matched pixels into connected blobs and keep only the ones whose
+        # width matches the known width of a tape dash. A same-hue object off the
+        # track (e.g. an orange/yellow rock) forms a wider or narrower blob than
+        # the tape, so this rejects it even though the color match alone can't
+        # tell them apart.
+        num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+            mask, connectivity=8
+        )
 
-        return max_yellow, hist[max_yellow], mask
+        best_label = None
+        best_area = 0
+        for label in range(1, num_labels):  # label 0 is the background
+            width = stats[label, cv2.CC_STAT_WIDTH]
+            if self.line_width_min <= width <= self.line_width_max:
+                area = stats[label, cv2.CC_STAT_AREA]
+                if area > best_area:
+                    best_label = label
+                    best_area = area
+
+        if best_label is None:
+            return 0, 0, mask, 0
+
+        max_yellow = int(round(centroids[best_label][0]))
+        width = stats[best_label, cv2.CC_STAT_WIDTH]
+
+        return max_yellow, best_area, mask, width
 
 
     def run(self, cam_img):
@@ -69,8 +94,14 @@ class LineFollower:
         if cam_img is None:
             return 0, 0, False, None
 
-        max_yellow, confidence, mask = self.get_i_color(cam_img)
+        max_yellow, confidence, mask, width = self.get_i_color(cam_img)
         conf_thresh = 0.001
+
+        # width of the matched blob -- point the camera at a tape dash vs. the
+        # offending object and record this to pick LINE_WIDTH_MIN/MAX.
+        # enable with LOGLEVEL=DEBUG (default level is INFO, so this is silent
+        # during normal driving).
+        logger.debug(f"line width: {width} px (I_YELLOW={max_yellow}, CONF={confidence})")
 
         if self.target_pixel is None:
             # Default to the image center rather than latching onto whatever
@@ -108,11 +139,11 @@ class LineFollower:
 
         # show some diagnostics
         if self.overlay_image:
-            cam_img = self.overlay_display(cam_img, mask, max_yellow, confidence)
+            cam_img = self.overlay_display(cam_img, mask, max_yellow, confidence, width)
 
         return self.steering, self.throttle, cam_img
 
-    def overlay_display(self, cam_img, mask, max_yellow, confidense):
+    def overlay_display(self, cam_img, mask, max_yellow, confidense, width):
         '''
         composite mask on top the original image.
         show some values we are using for control
@@ -129,6 +160,9 @@ class LineFollower:
         display_str.append("THROTTLE:{:.2f}".format(self.throttle))
         display_str.append("I YELLOW:{:d}".format(max_yellow))
         display_str.append("CONF:{:.2f}".format(confidense))
+        # width of the matched blob -- use this to tune LINE_WIDTH_MIN/MAX:
+        # watch this value over the tape dashes vs. over a rock/off-track object.
+        display_str.append("WIDTH:{:d}".format(width))
 
         y = 10
         x = 10
