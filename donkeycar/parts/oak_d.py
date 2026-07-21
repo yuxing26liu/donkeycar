@@ -145,7 +145,7 @@ class OakD(object):
         xout_rgb = self.pipeline.create(depthai.node.XLinkOut)
         xout_rgb.setStreamName("rgb")
 
-        cam_rgb.video.link(xout_rgb.input)
+        cam_rgb.preview.link(xout_rgb.input)
 
     def get_mono_camera(self, pipeline: Pipeline, is_left: bool):
         # Configure mono camera
@@ -305,7 +305,7 @@ if __name__ == "__main__":
 
     camera = None
     try:
-        camera = OakDLite(
+        camera = OakD(
             width=width,
             height=height,
             enable_rgb=enable_rgb,

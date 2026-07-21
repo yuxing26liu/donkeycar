@@ -31,7 +31,7 @@ MAX_LOOPS = None        # the vehicle loop can abort after this many iterations,
 # CAMERA configuration
 #
 CAMERA_TYPE = "PICAM"   # (PICAM|WEBCAM|CVCAM|CSIC|V4L|D435|MOCK|IMAGE_LIST)
-IMAGE_W = 320
+IMAGE_W = 426
 IMAGE_H = 240
 IMAGE_DEPTH = 3         # default RGB=3, make 1 for mono
 CAMERA_FRAMERATE = DRIVE_LOOP_HZ
@@ -553,10 +553,11 @@ FPS_DEBUG_INTERVAL = 10    # the interval in seconds for printing the frequency 
 # computer vision template
 #
 # configure which part is used as the autopilot - change to use your own autopilot
-CV_CONTROLLER_MODULE = "donkeycar.parts.line_follower"
-CV_CONTROLLER_CLASS = "LineFollower"
+CV_CONTROLLER_MODULE = "donkeycar.parts.lane_follower"
+CV_CONTROLLER_CLASS = "LaneFollower"
 CV_CONTROLLER_INPUTS = ['cam/image_array']
-CV_CONTROLLER_OUTPUTS = ['pilot/steering', 'pilot/throttle', 'cv/image_array']
+CV_CONTROLLER_OUTPUTS = ['pilot/steering', 'pilot/throttle', 'cv/image_array',
+                          'lane/yellow_x', 'lane/white_x', 'lane/width_px']
 CV_CONTROLLER_CONDITION = "run_pilot"
 
 # LineFollower - line color and detection area
@@ -599,6 +600,68 @@ PID_D_DELTA = 0.00005 # amount the inc/dec function will change the D value
 
 OVERLAY_IMAGE = True  # True to draw computer vision overlay on camera image in web ui
                       # NOTE: this does not affect what is saved to the data
+
+#
+# LaneFollower - dual-line lane-keeping autopilot (donkeycar.parts.lane_follower)
+#
+# Tracks a solid outer boundary line and a dashed centerline and steers to keep
+# their midpoint centered, instead of LineFollower's single tracked line above.
+# The LineFollower config block above is left untouched and still works if you
+# point CV_CONTROLLER_CLASS back at "LineFollower" - it's this project's
+# documented baseline (see CLAUDE.md) to compare LaneFollower against.
+#
+
+# LaneFollower - scan geometry. Each row is scanned independently and combined
+# into a weighted average lane-center estimate; rows with a smaller scan_y are
+# higher up the frame, i.e. farther down the road (more lookahead), so give
+# them a lower weight than the near row - they anticipate curves, they don't
+# drive centering on their own.
+LANE_SCAN_ROWS = [
+    {'scan_y': 100, 'weight': 1.0},   # near row - primary; also publishes lane/yellow_x, lane/white_x, lane/width_px
+    {'scan_y': 70,  'weight': 0.5},   # far row - curve lookahead only
+]
+LANE_SCAN_HEIGHT = 20   # num pixels high to grab from each horiz scan row
+
+# LaneFollower - line colors, thresholded directly in RGB (not HSV like
+# LineFollower above - see lane_follower.py's module docstring for why).
+# Starting values below are a first guess to try on the car; if they don't
+# hold up under your track's actual lighting, sample real R/G/B pixel values
+# off a captured frame (e.g. via scripts/hsv_picker.py, or just printing
+# cam_img[y, x] for a few known-line pixels) and narrow/shift these bounds.
+YELLOW_COLOR_THRESHOLD_LOW  = (190, 120, 0)
+YELLOW_COLOR_THRESHOLD_HIGH = (255, 220, 100)
+WHITE_COLOR_THRESHOLD_LOW   = (190, 190, 190)
+WHITE_COLOR_THRESHOLD_HIGH  = (255, 255, 255)
+
+# LaneFollower - per-line blob-shape filter (ported from BetterLineFollower,
+# origin/better-line-follower) and continuity-tracking/smoothing (ported from
+# RobustLineFollower, origin/robustRyan). Shared by both the yellow and white
+# trackers; retune per-color via myconfig.py overrides if their physical
+# widths differ enough to need it.
+MIN_LINE_AREA_PX = 150        # reject color-matched blobs smaller than this (noise/gravel/glare)
+MAX_LINE_WIDTH_PX = 250       # reject color-matched blobs wider than this (a wall, a sunlit patch)
+MIN_LINE_ASPECT_RATIO = 0.15  # reject blobs flatter (height/width) than this
+MORPH_KERNEL_SIZE = 3         # morphological-open kernel size; erases small speckle before blob detection
+
+MAX_JUMP_PIXELS = 40          # max pixels a new detection may move from the last tracked position
+REACQUIRE_AFTER_FRAMES = 15   # consecutive lost frames before dropping continuity and re-locking on the strongest blob
+POSITION_SMOOTHING_ALPHA = 0.4  # exponential smoothing factor for the tracked position (0=frozen, 1=unsmoothed)
+
+# LaneFollower - lane geometry and target
+WHITE_RIGHT_OF_YELLOW = True  # True: our lane is to the right of the dashed yellow centerline
+LANE_WIDTH_PX = 150            # initial guess for the lane's pixel width at the near scan row; self-corrects
+                               # via LANE_WIDTH_SMOOTHING_ALPHA whenever both lines are visible - needs an
+                               # initial on-car measurement (drive the empty lane, read lane/width_px in the logs)
+LANE_WIDTH_SMOOTHING_ALPHA = 0.1  # exponential smoothing factor for the running lane-width estimate
+
+LANE_TARGET_PIXEL = None      # if None, defaults to image center on first frame (assumes the camera is
+                               # mounted looking straight down the lane's centerline); set explicitly if not
+LANE_TARGET_THRESHOLD = 10    # pixels of lane-center error tolerated before throttle backs off for a turn
+
+# LaneFollower - sustained-loss handling (both lines gone from every scan row,
+# not just a dashed-line gap - that's already tolerated per-tracker above)
+MAX_LOST_FRAMES = 40          # consecutive frames with no line at all before forcing throttle to a stop
+LOST_STEERING_DECAY = 0.85    # steering *= this value each lost frame, easing back toward straight
 
 
 #
