@@ -120,11 +120,24 @@ class LaneFollower:
 
         # --- lost-lane handling ---
         self.lost_steering_decay = getattr(cfg, 'LANE_LOST_STEERING_DECAY', 0.85)
+        # After this many *consecutive* lost frames, stop instead of just
+        # decaying steering while continuing to creep at throttle_min - a
+        # sustained loss (drove off the track, missed a turn entirely) means
+        # "stop and wait to be picked up," not "keep easing toward straight
+        # forever." Ported from a teammate's lane_follower.py (object-
+        # detection branch) after it was exercised by a real sharp-turn
+        # failure on the car.
+        self.max_lost_frames = getattr(cfg, 'LANE_MAX_LOST_FRAMES', 40)
         self.overlay_alpha = getattr(cfg, 'LANE_OVERLAY_ALPHA', 0.3)
 
         self.steering = 0.0
         self.lost_frames = 0
         self.pid_st = pid
+        # Clamp on the pid object itself, not just the returned value - this
+        # also bounds simple_pid's internal integral accumulator so it can't
+        # wind up past what the actuator can ever use. Same reasoning as
+        # BetterLineFollower (origin/better-line-follower).
+        self.pid_st.output_limits = (-1.0, 1.0)
 
     # ------------------------------------------------------------------
     # thresholding
@@ -346,9 +359,16 @@ class LaneFollower:
                 self.throttle = min(self.throttle + self.delta_th, self.throttle_max)
         else:
             self.lost_frames += 1
-            logger.info(f"No lane boundaries detected (lost_frames={self.lost_frames})")
             self.steering *= self.lost_steering_decay
-            self.throttle = max(self.throttle - self.delta_th, self.throttle_min)
+            if self.lost_frames > self.max_lost_frames:
+                if self.lost_frames == self.max_lost_frames + 1:
+                    logger.warning(
+                        f"Lane lost for more than LANE_MAX_LOST_FRAMES={self.max_lost_frames} "
+                        f"consecutive frames; stopping instead of holding stale output.")
+                self.throttle = max(self.throttle - self.delta_th, 0.0)
+            else:
+                logger.info(f"No lane boundaries detected ({self.lost_frames}/{self.max_lost_frames})")
+                self.throttle = max(self.throttle - self.delta_th, self.throttle_min)
 
         if self.overlay_image:
             cam_img = self._overlay_display(cam_img, center_line, right_edge_line, lane_center)
