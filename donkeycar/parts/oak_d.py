@@ -151,7 +151,7 @@ class OakD(object):
 
         cam_rgb.setResolution(res)
         # Set preview size to match model input
-        cam_rgb.setPreviewSize(self.image_w, self.image_h)
+        cam_rgb.setPreviewSize(width, height)
         cam_rgb.setInterleaved(False)
 
         xout_rgb = self.pipeline.create(depthai.node.XLinkOut)
@@ -198,6 +198,13 @@ class OakD(object):
         # Convert to OpenCV format
         return new_frame.getCvFrame()
 
+    def get_rgb_frame(self, queue: DataOutputQueue):
+        # getCvFrame() returns BGR (OpenCV's native order); the rest of
+        # donkeycar's parts (and cam/image_array consumers like LineFollower,
+        # the tub writer, and the web UI) all expect RGB, so convert here
+        # rather than pushing BGR handling into every consumer.
+        return cv2.cvtColor(self.get_frame(queue), cv2.COLOR_BGR2RGB)
+
     def _poll(self):
         last_time = self.frame_time
         self.frame_time = time.time() - self.start_time
@@ -206,20 +213,17 @@ class OakD(object):
         #
         # convert camera frames to images
         #
-        if self.enable_rgb or self.enable_depth:
-
+        if self.enable_depth:
             self.depth_queue: DataOutputQueue = self.oak_d_device.getOutputQueue(
                 name="depth", maxSize=1, blocking=False
             )
+            self.depth_image = self.get_frame(self.depth_queue)
+
+        if self.enable_rgb:
             self.rgb_queue: DataOutputQueue = self.oak_d_device.getOutputQueue(
                 "rgb", maxSize=1, blocking=False
             )
-
-            depth_frame = self.get_frame(self.depth_queue)
-            rgb_frame = self.get_frame(self.rgb_queue)
-
-            self.depth_image = depth_frame
-            self.color_image = rgb_frame
+            self.color_image = self.get_rgb_frame(self.rgb_queue)
 
         if self.resize and self.enable_depth:
             self.depth_image = cv2.resize(
@@ -353,13 +357,20 @@ if __name__ == "__main__":
                             else None
                         )
 
+                    # cv2.imshow expects BGR; color_image is RGB (see get_rgb_frame)
+                    bgr_color_image = (
+                        cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+                        if enable_rgb
+                        else None
+                    )
+
                     # Stack both images horizontally (i.e. side by side).
                     images = None
                     if enable_rgb:
                         images = (
-                            np.hstack((color_image, depth_colormap))
+                            np.hstack((bgr_color_image, depth_colormap))
                             if enable_depth
-                            else color_image
+                            else bgr_color_image
                         )
                     elif enable_depth:
                         images = depth_colormap
