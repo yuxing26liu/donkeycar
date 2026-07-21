@@ -130,6 +130,24 @@ class LaneFollower:
         self.max_lost_frames = getattr(cfg, 'LANE_MAX_LOST_FRAMES', 40)
         self.overlay_alpha = getattr(cfg, 'LANE_OVERLAY_ALPHA', 0.3)
 
+        # --- per-line continuity gate ---
+        # A detected boundary is only trusted if it's within max_jump_pixels
+        # of where that same line was last seen, unless we've gone
+        # reacquire_after_frames without a plausible candidate (then the
+        # gate drops and whatever's detected is accepted outright). Without
+        # this, a single frame's false-positive blob (e.g. a wall or door
+        # edge that happens to pass the color/gradient threshold) gets
+        # trusted just as much as a real, tracked line, and can swing
+        # steering to full lock on one bad frame. Ported from
+        # RobustLineFollower / a teammate's lane_follower.py (object-
+        # detection branch), both of which gate this way per-line; applied
+        # here to each color's *evaluated* boundary position rather than a
+        # raw scan-row position.
+        self.max_jump_pixels = getattr(cfg, 'LANE_MAX_JUMP_PIXELS', 60)
+        self.reacquire_after_frames = getattr(cfg, 'LANE_REACQUIRE_AFTER_FRAMES', 15)
+        self.last_x = {'yellow': None, 'white': None}
+        self.gate_lost_frames = {'yellow': 0, 'white': 0}
+
         self.steering = 0.0
         self.lost_frames = 0
         self.pid_st = pid
@@ -256,6 +274,31 @@ class LaneFollower:
     def _eval_fit(self, fit, y):
         return fit[0] * y ** 2 + fit[1] * y + fit[2]
 
+    def _gate_continuity(self, candidate_x, key):
+        '''
+        Accept or reject this frame's detected x position for a given line
+        color ('yellow' or 'white') based on continuity with the last
+        accepted position. See __init__ docstring comment for why.
+        '''
+        if candidate_x is None:
+            self.gate_lost_frames[key] += 1
+            return None
+
+        last_x = self.last_x[key]
+        if last_x is None or self.gate_lost_frames[key] > self.reacquire_after_frames:
+            accepted = True
+        else:
+            accepted = abs(candidate_x - last_x) <= self.max_jump_pixels
+
+        if accepted:
+            self.last_x[key] = candidate_x
+            self.gate_lost_frames[key] = 0
+            return candidate_x
+
+        # implausible jump - treat as noise, not a real detection
+        self.gate_lost_frames[key] += 1
+        return None
+
     def _classify_color(self, points_x, points_y, yellow_mask, white_mask):
         '''Majority vote of which color mask the line's pixels came from.'''
         ys = np.asarray(points_y, dtype=np.int32)
@@ -330,8 +373,15 @@ class LaneFollower:
         )
 
         eval_y = self.image_h - 1
-        yellow_x = self._eval_fit(center_line['fit'], eval_y) if center_line else None
-        right_x = self._eval_fit(right_edge_line['fit'], eval_y) if right_edge_line else None
+        raw_yellow_x = self._eval_fit(center_line['fit'], eval_y) if center_line else None
+        raw_right_x = self._eval_fit(right_edge_line['fit'], eval_y) if right_edge_line else None
+
+        # Reject either boundary's detection this frame if it jumped too
+        # far from where that line was last seen (see _gate_continuity) -
+        # a false-positive blob (wall/door edge, glare) shouldn't get the
+        # same trust as a continuously-tracked real line.
+        yellow_x = self._gate_continuity(raw_yellow_x, 'yellow')
+        right_x = self._gate_continuity(raw_right_x, 'white')
 
         if yellow_x is not None and right_x is not None:
             lane_center = (yellow_x + right_x) / 2.0
