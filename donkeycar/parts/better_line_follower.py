@@ -12,10 +12,10 @@ class BetterLineFollower:
 
     Same overall shape as LineFollower: take a horizontal slice of the
     image, threshold it in HSV to find "yellow", and steer a PID
-    controller to keep that position centered. Four changes on top of
-    that, aimed specifically at the reported wobble/veering caused by
-    sunlit rocks and gravel in the background matching the yellow
-    threshold:
+    controller to keep that position centered. Five changes on top of
+    that, aimed at the reported wobble/veering caused by sunlit rocks
+    and gravel in the background matching the yellow threshold, and at
+    what a real tub replay showed once that was mostly fixed:
 
       1. Connected-component blob filtering (replaces the raw
          "argmax over a flattened column histogram"). The color mask
@@ -85,6 +85,46 @@ class BetterLineFollower:
          adjusted live via the controller), so this is worth getting
          right now rather than only clipping the symptom.
 
+      5. Steering and throttle are forced toward neutral/stopped after
+         MAX_LOST_FRAMES consecutive frames with no valid line, instead
+         of holding the last computed output forever. A real tub
+         replay (tub_9_26-07-20) showed this happen for real: once the
+         car actually went off-track near the end of a run, steering
+         was pinned at exactly -1.0 (a rail value from change 4's
+         clamp) for 49+ consecutive frames with no recovery attempt,
+         while still driving forward at THROTTLE_MIN - almost
+         certainly why that run only covered half the track instead of
+         stopping somewhere recoverable. A handful of consecutive lost
+         frames is normal and shouldn't trigger this - the same replay
+         showed brief 4-20 frame gaps (a dash briefly out of the scan
+         band, or MAX_LINE_WIDTH_PX rejecting a valid detection) that
+         self-recovered fine once the line reappeared, holding the
+         last steering/throttle through the gap same as before.
+         MAX_LOST_FRAMES=40 (~2s at 20Hz) is chosen to comfortably
+         clear those observed gaps (worst case 19 frames) while still
+         intervening well before the car has driven far on a guess.
+         Once past that count, steering snaps to neutral (0.0) rather
+         than continuing to act on a value that's now unrelated to
+         where the line actually is, and throttle ramps down to 0 by
+         the same THROTTLE_STEP used elsewhere (not to THROTTLE_MIN -
+         the car should actually stop, not idle-crawl blind).
+
+    Note on PID gains: cfg_cv_control.py's shipped PID_P/PID_D
+    (-0.01/-0.0001) are tuned against that same file's IMAGE_W=320
+    default. If your camera runs at a different width, the same
+    real-world deviation produces a proportionally different pixel
+    error, so PID_P/PID_D need to be scaled down (or up) by
+    (your IMAGE_W / 320) to keep the same effective loop gain - see
+    myconfig.py for the current car's values and the math behind them.
+    Unscaled gains at a much higher resolution than 320 is a textbook
+    way to get a PID that saturates every frame regardless of how
+    small the actual deviation is, which - once clamped to [-1, 1] via
+    change 4 below - degrades into a bang-bang/relay controller
+    (always outputs the rail value, sign only). That's a textbook
+    limit-cycle oscillator once any actuation delay is in the loop:
+    full lock one way, overshoot, full lock the other way, forever -
+    i.e. wobbling like a snake even with the output clamped.
+
     Also fixed: LineFollower's run() returns a 4-tuple
     (0, 0, False, None) on its "no frame yet" path but a 3-tuple
     everywhere else. Vehicle.py's Memory.put() zips positionally
@@ -93,13 +133,13 @@ class BetterLineFollower:
     None on that path. This version always returns a 3-tuple.
 
     Deliberately NOT included in this pass (each is a bigger change
-    and easier to validate in isolation once these three are proven
-    out on the car):
-      - persistent frame-to-frame tracking, a max-jump clamp, or a
-        "reacquire after N lost frames" state machine
+    and easier to validate in isolation once these are proven out on
+    the car):
+      - persistent frame-to-frame tracking or a max-jump clamp on
+        line_x itself (change 5 only acts after sustained total loss,
+        it doesn't smooth or bound frame-to-frame jumps while a line
+        is being detected every frame)
       - reference-resolution scaling of SCAN_Y / SCAN_HEIGHT / etc.
-      - stopping the car (vs. just holding last output) after
-        sustained loss-of-line
 
     Drop-in replacement for LineFollower: same constructor signature
     (pid, cfg) and same run(cam_img) -> (steering, throttle, image)
@@ -136,6 +176,10 @@ class BetterLineFollower:
         self.min_line_area_px = getattr(cfg, "MIN_LINE_AREA_PX", 150)
         self.max_line_width_px = getattr(cfg, "MAX_LINE_WIDTH_PX", 250)
         self.min_line_aspect_ratio = getattr(cfg, "MIN_LINE_ASPECT_RATIO", 0.15)
+
+        # change 5: sustained-loss handling.
+        self.max_lost_frames = getattr(cfg, "MAX_LOST_FRAMES", 40)
+        self.lost_frames = 0
 
         self.pid_st = pid
         # change 4: see class docstring - this both bounds the output
@@ -254,6 +298,8 @@ class BetterLineFollower:
             self.pid_st.setpoint = self.target_pixel
 
         if line_x is not None:
+            self.lost_frames = 0
+
             # invoke the controller with the current line position
             # get the new steering value as it chases the ideal
             self.steering = self.pid_st(line_x)
@@ -272,7 +318,27 @@ class BetterLineFollower:
                 if self.throttle > self.throttle_max:
                     self.throttle = self.throttle_max
         else:
-            logger.info("No line detected: no component passed shape filtering")
+            self.lost_frames += 1
+
+            if self.lost_frames > self.max_lost_frames:
+                # change 5: genuinely lost, not just a brief gap - see
+                # class docstring. Stop acting on a steering value with
+                # no relationship to where the line actually is, and
+                # bring the car to a stop rather than coasting on it.
+                if self.lost_frames == self.max_lost_frames + 1:
+                    logger.warning(
+                        f"Line lost for more than MAX_LOST_FRAMES="
+                        f"{self.max_lost_frames} consecutive frames; "
+                        f"stopping instead of holding stale output.")
+                self.steering = 0.0
+                if self.throttle > 0:
+                    self.throttle -= self.delta_th
+                    if self.throttle < 0:
+                        self.throttle = 0.0
+            else:
+                logger.info(
+                    f"No line detected: no component passed shape filtering "
+                    f"({self.lost_frames}/{self.max_lost_frames} consecutive)")
 
         # show some diagnostics
         if self.overlay_image:
