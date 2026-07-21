@@ -6,7 +6,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio):
+def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag=None):
     '''
     Pick the best line-shaped connected component in a binary mask.
 
@@ -16,24 +16,33 @@ def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio):
     pavement or a wall), or too flat relative to their width (same wide-patch case,
     but resolution-independent). Of what's left, the largest by area wins.
 
-    input: mask, binary (0/255) uint8 image
+    input: mask, binary (0/255) uint8 image; log_tag, optional label (e.g. color
+           name) used to identify which tracker a rejection log line came from
     output: (x, area) of the winning blob's centroid x and pixel area, or (None, 0)
     '''
     num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
     best_label = None
     best_area = 0
+    rejected = []  # only populated when best_label stays None and DEBUG is on
+    log_rejections = log_tag is not None and logger.isEnabledFor(logging.DEBUG)
     for label in range(1, num_labels):  # label 0 is background, always skip it
         area = stats[label, cv2.CC_STAT_AREA]
         width = stats[label, cv2.CC_STAT_WIDTH]
         height = stats[label, cv2.CC_STAT_HEIGHT]
+        aspect = (height / width) if width > 0 else 0
 
         if area < min_area_px:
+            if log_rejections:
+                rejected.append(f"area={area}<{min_area_px}")
             continue
         if width > max_width_px:
+            if log_rejections:
+                rejected.append(f"width={width}>{max_width_px}")
             continue
-        aspect = (height / width) if width > 0 else 0
         if aspect < min_aspect_ratio:
+            if log_rejections:
+                rejected.append(f"aspect={aspect:.2f}<{min_aspect_ratio} (w={width},h={height})")
             continue
 
         if area > best_area:
@@ -41,6 +50,9 @@ def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio):
             best_label = label
 
     if best_label is None:
+        if rejected:
+            logger.debug(f"[{log_tag}] no blob passed shape filter; candidates rejected by "
+                          f"{', '.join(rejected)}")
         return None, 0
     return float(centroids[best_label][0]), int(best_area)
 
@@ -59,13 +71,17 @@ class _LineTracker:
     design and would otherwise look identical to a genuine loss.
     '''
 
-    def __init__(self, color_low, color_high, cfg):
+    def __init__(self, color_low, color_high, cfg, color_name=None):
         self.color_thr_low = np.asarray(color_low)
         self.color_thr_hi = np.asarray(color_high)
+        self.color_name = color_name  # only used to tag debug log lines
 
         self.min_area_px = getattr(cfg, 'MIN_LINE_AREA_PX', 150)
         self.max_width_px = getattr(cfg, 'MAX_LINE_WIDTH_PX', 250)
-        self.min_aspect_ratio = getattr(cfg, 'MIN_LINE_ASPECT_RATIO', 0.15)
+        # 0.10 (not the old 0.15) so a foreshortened yellow dash seen from a low
+        # camera angle still clears the bar - see MIN_LINE_ASPECT_RATIO in
+        # cfg_cv_control.py for the reasoning
+        self.min_aspect_ratio = getattr(cfg, 'MIN_LINE_ASPECT_RATIO', 0.10)
         self.morph_kernel_size = getattr(cfg, 'MORPH_KERNEL_SIZE', 3)
 
         self.max_jump_pixels = getattr(cfg, 'MAX_JUMP_PIXELS', 40)
@@ -92,7 +108,8 @@ class _LineTracker:
             kernel = np.ones((self.morph_kernel_size, self.morph_kernel_size), np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-        raw_x, _area = _select_line_blob(mask, self.min_area_px, self.max_width_px, self.min_aspect_ratio)
+        raw_x, _area = _select_line_blob(mask, self.min_area_px, self.max_width_px, self.min_aspect_ratio,
+                                          log_tag=self.color_name)
 
         if raw_x is None:
             self.lost_frames += 1
@@ -110,6 +127,10 @@ class _LineTracker:
         else:
             # implausible jump (e.g. this row's blob filter picked up the
             # *other* line, or track clutter) - treat this frame as a miss
+            if logger.isEnabledFor(logging.DEBUG):
+                tag = f"[{self.color_name}] " if self.color_name else ""
+                logger.debug(f"{tag}rejecting jump: raw_x={raw_x:.1f} vs tracked={self.tracked_position:.1f} "
+                              f"(delta={abs(raw_x - self.tracked_position):.1f} > max_jump={self.max_jump_pixels})")
             self.lost_frames += 1
             self.just_reacquired = False
             return None, mask
@@ -191,8 +212,10 @@ class LaneFollower:
         white_low = getattr(cfg, 'WHITE_COLOR_THRESHOLD_LOW', (190, 190, 190))
         white_high = getattr(cfg, 'WHITE_COLOR_THRESHOLD_HIGH', (255, 255, 255))
 
-        self.yellow_trackers = [_LineTracker(yellow_low, yellow_high, cfg) for _ in self.scan_rows]
-        self.white_trackers = [_LineTracker(white_low, white_high, cfg) for _ in self.scan_rows]
+        self.yellow_trackers = [_LineTracker(yellow_low, yellow_high, cfg, color_name='yellow')
+                                 for _ in self.scan_rows]
+        self.white_trackers = [_LineTracker(white_low, white_high, cfg, color_name='white')
+                                for _ in self.scan_rows]
 
         # geometry: which side of the dashed centerline our lane's solid
         # boundary is on. True = white is to the right of yellow (our lane is

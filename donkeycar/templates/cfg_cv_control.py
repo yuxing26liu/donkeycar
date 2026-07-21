@@ -640,7 +640,14 @@ WHITE_COLOR_THRESHOLD_HIGH  = (255, 255, 255)
 # widths differ enough to need it.
 MIN_LINE_AREA_PX = 150        # reject color-matched blobs smaller than this (noise/gravel/glare)
 MAX_LINE_WIDTH_PX = 250       # reject color-matched blobs wider than this (a wall, a sunlit patch)
-MIN_LINE_ASPECT_RATIO = 0.15  # reject blobs flatter (height/width) than this
+MIN_LINE_ASPECT_RATIO = 0.10  # reject blobs flatter (height/width) than this. 0.10 = accept up to a 10:1
+                               # width:height blob. A short dash's real-world shape is only ~3-4:1, but a
+                               # low camera mount foreshortens its along-track extent, stretching the
+                               # yellow dashed centerline's apparent ratio toward "long dash" (5-8:1) or
+                               # worse - the old 0.15 (6.7:1 cutoff) was rejecting those as if they were a
+                               # sunlit-pavement/glare patch. If yellow still drops out, enable DEBUG
+                               # logging on donkeycar.parts.lane_follower and check the rejected-blob
+                               # dimensions logged by _select_line_blob to retune this precisely.
 MORPH_KERNEL_SIZE = 3         # morphological-open kernel size; erases small speckle before blob detection
 
 MAX_JUMP_PIXELS = 40          # max pixels a new detection may move from the last tracked position

@@ -254,7 +254,10 @@ if __name__ == '__main__':
     numeric_level = getattr(logging, log_level.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError('Invalid log level: %s' % log_level)
-    logging.basicConfig(level=numeric_level)
+    # force=True: the module-level basicConfig() above already attached a
+    # handler at import time, which makes basicConfig() a no-op here
+    # otherwise - silently ignoring --log
+    logging.basicConfig(level=numeric_level, force=True)
 
     if args['drive']:
         drive(cfg, use_joystick=args['--js'], camera_type=args['--camera'])
