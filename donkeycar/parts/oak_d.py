@@ -27,8 +27,17 @@ from depthai import Pipeline, DataOutputQueue, ImgFrame, ImgDetections, ImgDetec
 from numpy import ndarray
 from typing import List
 
-WIDTH = 640
-HEIGHT = 480
+# Project-mandated CV resolution for the color/preview stream (see
+# myconfig.py IMAGE_W/IMAGE_H) - keep in sync with any PID/SCAN_Y/pixel
+# constants tuned against this size in the line/lane follower configs.
+WIDTH = 426
+HEIGHT = 240
+
+# Native resolution of the mono stereo pair (fixed by THE_480_P below,
+# independent of the color resolution above); used to decide whether the
+# depth map needs resizing to match the requested output size.
+MONO_WIDTH = 640
+MONO_HEIGHT = 480
 
 
 class OakD(object):
@@ -55,11 +64,14 @@ class OakD(object):
         self.width = width
         self.height = height
 
-        # TODO: Accommodate using device native resolutions to avoid resizing.
-        self.resize = (width != WIDTH) or (height != HEIGHT)
+        # The color/preview stream is captured directly at (width, height)
+        # by the camera's own ISP scaler (see setup_rgb_camera), so it never
+        # needs a software resize. The depth map comes off the mono stereo
+        # pair at its fixed native resolution, so it still may need one.
+        self.resize = (self.width != MONO_WIDTH) or (self.height != MONO_HEIGHT)
         if self.resize:
             print(
-                f"The output images will be resized from {(WIDTH, HEIGHT)} to {(self.width, self.height)} using OpenCV. Device resolution in use is 640x480."
+                f"Depth images will be resized from {(MONO_WIDTH, MONO_HEIGHT)} to {(self.width, self.height)} using OpenCV."
             )
 
         self.pipeline = None
@@ -69,10 +81,10 @@ class OakD(object):
             device_info = self.get_depthai_device_info(device_id)
 
             if self.enable_depth:
-                self.setup_depth_camera(WIDTH, HEIGHT)
+                self.setup_depth_camera(MONO_WIDTH, MONO_HEIGHT)
 
             if self.enable_rgb:
-                self.setup_rgb_camera(WIDTH, HEIGHT)
+                self.setup_rgb_camera(self.width, self.height)
 
             self.oak_d_device = depthai.Device(self.pipeline, device_info)
 
@@ -145,7 +157,12 @@ class OakD(object):
         xout_rgb = self.pipeline.create(depthai.node.XLinkOut)
         xout_rgb.setStreamName("rgb")
 
-        cam_rgb.video.link(xout_rgb.input)
+        # NOTE: `.video` ignores setPreviewSize() and always streams at the
+        # full sensor resolution (1920x1080 for THE_1080_P); `.preview` is
+        # the output that's actually scaled to (width, height) in hardware.
+        # Linking `.video` here was why frames stayed 1920x1080 regardless
+        # of what width/height were requested.
+        cam_rgb.preview.link(xout_rgb.input)
 
     def get_mono_camera(self, pipeline: Pipeline, is_left: bool):
         # Configure mono camera
@@ -204,24 +221,10 @@ class OakD(object):
             self.depth_image = depth_frame
             self.color_image = rgb_frame
 
-        if self.resize:
-            if self.width != WIDTH or self.height != HEIGHT:
-                import cv2
-
-                self.color_image = (
-                    cv2.resize(
-                        self.color_image, (self.width, self.height), cv2.INTER_NEAREST
-                    )
-                    if self.enable_rgb
-                    else None
-                )
-                self.depth_image = (
-                    cv2.resize(
-                        self.depth_image, (self.width, self.height), cv2.INTER_NEAREST
-                    )
-                    if self.enable_depth
-                    else None
-                )
+        if self.resize and self.enable_depth:
+            self.depth_image = cv2.resize(
+                self.depth_image, (self.width, self.height), cv2.INTER_NEAREST
+            )
 
     def update(self):
         """
@@ -293,15 +296,15 @@ if __name__ == "__main__":
 
     device_id = args.device_id  # getMxId
 
-    width = 640
-    height = 480
+    width = WIDTH
+    height = HEIGHT
     channels = 3
 
     profile_frames = 0  # set to non-zero to calculate the max frame rate using given number of frames
 
     camera = None
     try:
-        camera = OakDLite(
+        camera = OakD(
             width=width,
             height=height,
             enable_rgb=enable_rgb,
