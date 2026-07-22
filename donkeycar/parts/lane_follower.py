@@ -83,10 +83,18 @@ class _LineTracker:
     design and would otherwise look identical to a genuine loss.
     '''
 
-    def __init__(self, color_low, color_high, cfg, color_name=None):
+    def __init__(self, color_low, color_high, cfg, color_name=None, color_space='RGB'):
         self.color_thr_low = np.asarray(color_low)
         self.color_thr_hi = np.asarray(color_high)
         self.color_name = color_name  # only used to tag debug log lines
+        # 'RGB' (default) or 'HSV'. Added after on-car testing (tub_4_26-07-22)
+        # showed the yellow dashed line and this track's plain concrete are
+        # nearly indistinguishable in RGB - both are a similar washed-out
+        # tan/gray under overcast light, differing mainly in saturation
+        # (measured ~15-25 for concrete, ~60-125 for the actual paint) which
+        # RGB bounds can't express as a single separating axis the way HSV's
+        # S channel can. White stays on RGB (already working reliably).
+        self.color_space = color_space
 
         self.min_area_px = getattr(cfg, 'MIN_LINE_AREA_PX', 150)
         self.max_width_px = getattr(cfg, 'MAX_LINE_WIDTH_PX', 250)
@@ -111,10 +119,15 @@ class _LineTracker:
         output: (smoothed_x, mask) if a plausible line was found this frame,
                  else (None, mask)
         '''
-        # thresholded directly in RGB, not HSV - simpler to reason about and to
-        # measure sample values for (just read R/G/B off a few pixels), and this
-        # project doesn't ever need to isolate hue on its own
-        mask = cv2.inRange(scan_line_rgb, self.color_thr_low, self.color_thr_hi)
+        # RGB is thresholded directly (simpler to read pixel samples for and
+        # measure/tune against); HSV is used for colors where hue/saturation
+        # is the only reliable separator from the track surface - see
+        # color_space's docstring in __init__.
+        if self.color_space == 'HSV':
+            scan_line = cv2.cvtColor(scan_line_rgb, cv2.COLOR_RGB2HSV)
+        else:
+            scan_line = scan_line_rgb
+        mask = cv2.inRange(scan_line, self.color_thr_low, self.color_thr_hi)
 
         if self.morph_kernel_size > 1:
             kernel = np.ones((self.morph_kernel_size, self.morph_kernel_size), np.uint8)
@@ -190,11 +203,14 @@ class LaneFollower:
         the target pixel to image-center instead of latching onto whatever
         matched on the first frame (which could be background clutter).
 
-    Colors are thresholded directly in RGB (cv2.inRange on the raw camera
-    frame), not HSV - LineFollower and the ported branches above all convert
-    to HSV first, but plain RGB bounds are simpler to read pixel samples for
-    and measure/tune against, and this project has no need to isolate hue
-    from brightness on its own.
+    White is thresholded directly in RGB (cv2.inRange on the raw camera
+    frame) - simpler to read pixel samples for and measure/tune against, and
+    white doesn't need hue isolated from brightness to stand out. Yellow
+    uses HSV instead: on-car testing (tub_4_26-07-22) showed the dashed
+    line and this track's plain concrete surface are nearly the same RGB
+    triplet under overcast light and only really separate on saturation,
+    which RGB bounds can't express as cleanly as HSV's S channel can - see
+    _LineTracker.color_space.
 
     New in this class, not present in any of the above (none of them do
     dual-line or curve-aware detection): when only one line is visible (e.g.
@@ -218,13 +234,15 @@ class LaneFollower:
         self.scan_height = getattr(cfg, 'LANE_SCAN_HEIGHT', getattr(cfg, 'SCAN_HEIGHT', 20))
         self.scan_rows = getattr(cfg, 'LANE_SCAN_ROWS', [{'scan_y': cfg.SCAN_Y, 'weight': 1.0}])
 
-        # RGB, not HSV - see class docstring
-        yellow_low = getattr(cfg, 'YELLOW_COLOR_THRESHOLD_LOW', (190, 120, 0))
-        yellow_high = getattr(cfg, 'YELLOW_COLOR_THRESHOLD_HIGH', (255, 220, 100))
+        # Yellow uses HSV (min-saturation is what actually separates the
+        # dashed line from plain track surface - see _LineTracker.color_space);
+        # white stays on RGB, per the class docstring.
+        yellow_low = getattr(cfg, 'YELLOW_HSV_THRESHOLD_LOW', (15, 60, 60))
+        yellow_high = getattr(cfg, 'YELLOW_HSV_THRESHOLD_HIGH', (35, 255, 255))
         white_low = getattr(cfg, 'WHITE_COLOR_THRESHOLD_LOW', (190, 190, 190))
         white_high = getattr(cfg, 'WHITE_COLOR_THRESHOLD_HIGH', (255, 255, 255))
 
-        self.yellow_trackers = [_LineTracker(yellow_low, yellow_high, cfg, color_name='yellow')
+        self.yellow_trackers = [_LineTracker(yellow_low, yellow_high, cfg, color_name='yellow', color_space='HSV')
                                  for _ in self.scan_rows]
         self.white_trackers = [_LineTracker(white_low, white_high, cfg, color_name='white')
                                 for _ in self.scan_rows]
