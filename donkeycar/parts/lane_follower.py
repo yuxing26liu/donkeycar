@@ -121,7 +121,18 @@ class _LineTracker:
             # re-acquire on whatever the strongest candidate is
             accepted_x = raw_x
             self.just_reacquired = True
-        elif abs(raw_x - self.tracked_position) <= self.max_jump_pixels:
+        elif abs(raw_x - self.tracked_position) <= self.max_jump_pixels * (1 + self.lost_frames):
+            # gate widens with consecutive misses: tracked_position only
+            # updates on acceptance, so on a turn it otherwise stays pinned
+            # to a stale pre-turn anchor while the line keeps drifting -
+            # every subsequent frame would then be farther from that frozen
+            # anchor than the last, rejecting almost everything until
+            # REACQUIRE_AFTER_FRAMES gives up and re-locks from scratch.
+            # Scaling by (1 + lost_frames) accounts for drift accumulated
+            # since the anchor was last refreshed - a single dashed-line gap
+            # still only gets 2x tolerance, but a multi-frame miss during a
+            # curve gets proportionally more room each frame instead of
+            # rejecting a genuinely-moving line for the full reacquire window.
             accepted_x = raw_x
             self.just_reacquired = False
         else:
@@ -129,8 +140,9 @@ class _LineTracker:
             # *other* line, or track clutter) - treat this frame as a miss
             if logger.isEnabledFor(logging.DEBUG):
                 tag = f"[{self.color_name}] " if self.color_name else ""
+                effective_max_jump = self.max_jump_pixels * (1 + self.lost_frames)
                 logger.debug(f"{tag}rejecting jump: raw_x={raw_x:.1f} vs tracked={self.tracked_position:.1f} "
-                              f"(delta={abs(raw_x - self.tracked_position):.1f} > max_jump={self.max_jump_pixels})")
+                              f"(delta={abs(raw_x - self.tracked_position):.1f} > max_jump={effective_max_jump})")
             self.lost_frames += 1
             self.just_reacquired = False
             return None, mask

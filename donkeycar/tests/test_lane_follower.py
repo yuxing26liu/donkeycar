@@ -130,6 +130,25 @@ class TestLineTracker(unittest.TestCase):
         x, _mask = tracker.update(_scan_line(170))  # 20px jump, within the gate
         self.assertIsNotNone(x)
 
+    def test_jump_gate_widens_after_consecutive_misses(self):
+        # regression test for the outer-turn stall: a dashed line's gap plus
+        # in-turn drift can put the next real detection farther than
+        # MAX_JUMP_PIXELS from the last *accepted* position, even though it's
+        # a legitimate detection - the gate should widen with lost_frames
+        # instead of freezing at a stale anchor and rejecting it outright.
+        tracker = self._tracker(MAX_JUMP_PIXELS=40, REACQUIRE_AFTER_FRAMES=15)
+        tracker.update(_scan_line(150))
+        tracker.update(_blank_scan_line())  # miss 1: lost_frames=1, gate=80
+        tracker.update(_blank_scan_line())  # miss 2: lost_frames=2, gate=120
+        # 100px jump from the stale anchor (150) - rejected by a fixed 40px
+        # gate (see test_rejects_implausible_jump), accepted once widened to
+        # 120px by two consecutive misses, and well under the 15-frame
+        # REACQUIRE_AFTER_FRAMES threshold so continuity hasn't been dropped
+        x, _mask = tracker.update(_scan_line(250))
+        self.assertIsNotNone(x)  # accepted, not rejected as an implausible jump
+        self.assertAlmostEqual(tracker.tracked_position, 250, delta=1.0)
+        self.assertEqual(tracker.lost_frames, 0)
+
     def test_reacquires_after_sustained_loss(self):
         tracker = self._tracker(MAX_JUMP_PIXELS=40, REACQUIRE_AFTER_FRAMES=3)
         tracker.update(_scan_line(150))

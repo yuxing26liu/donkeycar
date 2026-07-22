@@ -624,12 +624,19 @@ LANE_SCAN_HEIGHT = 20   # num pixels high to grab from each horiz scan row
 
 # LaneFollower - line colors, thresholded directly in RGB (not HSV like
 # LineFollower above - see lane_follower.py's module docstring for why).
-# Starting values below are a first guess to try on the car; if they don't
-# hold up under your track's actual lighting, sample real R/G/B pixel values
-# off a captured frame (e.g. via scripts/hsv_picker.py, or just printing
-# cam_img[y, x] for a few known-line pixels) and narrow/shift these bounds.
-YELLOW_COLOR_THRESHOLD_LOW  = (190, 120, 0)
-YELLOW_COLOR_THRESHOLD_HIGH = (255, 220, 100)
+# YELLOW bounds below are measured off track.png (a real photo of this
+# track's yellow dashed line), not guessed: sampling the actual dash pixels
+# gave R in [183,243], G in [172,221], B in [108,148] (5th-95th percentile) -
+# the old HIGH=(...,100) blue cap was rejecting essentially the entire line
+# (only 14/269304 px in that photo matched; the dash's real blue channel
+# medians around 120). If your camera's white balance/exposure differs
+# meaningfully from that reference photo, or the line still drops out on
+# car, sample real R/G/B pixel values off a captured on-car frame (e.g. via
+# scripts/hsv_picker.py, or just printing cam_img[y, x] for a few known-line
+# pixels) and narrow/shift these bounds again. WHITE bounds are still an
+# unverified first guess - narrow/shift the same way if needed.
+YELLOW_COLOR_THRESHOLD_LOW  = (170, 150, 90)
+YELLOW_COLOR_THRESHOLD_HIGH = (255, 230, 160)
 WHITE_COLOR_THRESHOLD_LOW   = (190, 190, 190)
 WHITE_COLOR_THRESHOLD_HIGH  = (255, 255, 255)
 
