@@ -134,7 +134,7 @@ class ObstacleAvoider:
         # diagnostic-logging state only (see _log_raw_detection /
         # _warn_if_lane_geometry_missing) - not used for detection itself
         self._was_raw_detected = False
-        self._raw_seen_frames = 0
+        self._frame_count = 0
         self._warned_no_lane_geometry = False
 
     def _open(self, mask):
@@ -146,12 +146,69 @@ class ObstacleAvoider:
     def detect_cone(self, band_hsv):
         '''
         input: band_hsv, HSV numpy array of the forward scan band
-        output: x position in pixels of the blue tape marker's blob centroid, or None
+        output: (x, mask) - x position in pixels of the blue tape marker's blob
+                centroid (or None), and the binary color mask used to find it
+                (returned for _describe_mask's diagnostics below, so the mask
+                isn't recomputed twice per frame)
         '''
         mask = self._open(cv2.inRange(band_hsv, self.blue_low, self.blue_high))
         x, _area = _select_line_blob(mask, self.cone_min_area_px, self.cone_max_width_px,
                                       min_aspect_ratio=0.0, log_tag='cone_tape')
-        return x
+        return x, mask
+
+    def _describe_mask(self, mask):
+        '''
+        Diagnostics-only, independent of the shape filter in _select_line_blob:
+        that function only logs *why* a blob was rejected (too small/too wide)
+        when the root logger is at DEBUG - which on this car would also spam
+        LaneFollower's own per-frame yellow/white rejections. This reports the
+        same thing for the cone-tape mask alone, at the default INFO level, so
+        "why isn't it detecting the tape" is answerable from a normal `python
+        manage.py drive` run: was the color threshold ever matched at all
+        (raw_pixel_count), and if so, did the largest blob fail the shape
+        filter and why.
+
+        output: (raw_pixel_count, reasons) - reasons is a list of strings
+                describing why the largest raw blob (if any) was rejected by
+                the shape filter, or [] if either no blob exists or one passed
+        '''
+        raw_pixel_count = int(np.count_nonzero(mask))
+        if raw_pixel_count == 0:
+            return raw_pixel_count, []
+
+        num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        best_label, best_area = None, 0
+        for label in range(1, num_labels):
+            area = stats[label, cv2.CC_STAT_AREA]
+            if area > best_area:
+                best_area, best_label = area, label
+        if best_label is None:
+            return raw_pixel_count, []
+
+        width = stats[best_label, cv2.CC_STAT_WIDTH]
+        reasons = []
+        if best_area < self.cone_min_area_px:
+            reasons.append(f"largest blob area {best_area}px < CONE_MIN_AREA_PX {self.cone_min_area_px}")
+        if width > self.cone_max_width_px:
+            reasons.append(f"largest blob width {width}px > CONE_MAX_WIDTH_PX {self.cone_max_width_px}")
+        return raw_pixel_count, reasons
+
+    def _decide_action(self):
+        '''
+        Human-readable recommended action for the terminal diagnostics below.
+        Phase 1 is detection-only (see class docstring) - this never actually
+        changes steering/throttle, it just states what a future avoidance
+        maneuver *would* do, so the detector can be verified end-to-end before
+        that maneuver is built.
+        '''
+        if self.cone_detected:
+            return "SWERVE - cone confirmed in our lane, steer toward other lane"
+        if self.cone_in_our_lane:
+            return (f"cone candidate in our lane, confirming "
+                     f"({self._pending_frames}/{self.cone_trigger_frames} frames) - hold lane for now")
+        if self.cone_x is not None:
+            return "blue blob seen but not in our lane - hold lane"
+        return "no blue tape visible - hold lane"
 
     def _x_in_bounds(self, x, bounds):
         lo, hi = bounds
@@ -180,32 +237,61 @@ class ObstacleAvoider:
         mean_rgb = band_rgb[y0:y1, x0:x1].reshape(-1, 3).mean(axis=0)
         return mean_hsv, mean_rgb
 
-    def _log_raw_detection(self, band_rgb, band_hsv):
+    def _log_raw_detection(self, band_rgb, band_hsv, mask):
         '''
-        Terminal diagnostics, independent of the in-lane/debounce gating
-        below: prints whenever a blue blob enters/leaves the scan band, plus
-        a periodic reminder (every CONE_LOG_INTERVAL_FRAMES frames) while it
-        stays in view, with the actually-sampled HSV/RGB color value each
-        time. This is what to watch when tuning BLUE_HSV_THRESHOLD_LOW/HIGH
-        or CONE_SCAN_Y/HEIGHT against the real tape on the car - and it
-        fires regardless of whether lane geometry is available, so it still
-        confirms the color detector itself is working even if lane/yellow_x
-        etc. turn out not to be wired (see _warn_if_lane_geometry_missing).
+        Terminal diagnostics, separate from run()'s in-lane/debounce gating
+        (already settled by the time this runs, see run()): prints whenever
+        a blue blob enters/leaves the scan band, with
+        the actually-sampled HSV/RGB color value - what to watch when tuning
+        BLUE_HSV_THRESHOLD_LOW/HIGH or CONE_SCAN_Y/HEIGHT against the real
+        tape on the car. It fires regardless of whether lane geometry is
+        available, so it still confirms the color detector itself is working
+        even if lane/yellow_x etc. turn out not to be wired (see
+        _warn_if_lane_geometry_missing).
+
+        Also prints a heartbeat every CONE_LOG_INTERVAL_FRAMES frames
+        *regardless* of whether anything is detected, so `python manage.py
+        drive`'s terminal always shows current status + recommended action
+        (this is the actual per-run() answer to "is it seeing the tape and
+        what would it do about it") - and, when nothing passes the shape
+        filter, *why* (see _describe_mask): raw_pixel_count==0 means the
+        color threshold itself never matched anything (tune
+        BLUE_HSV_THRESHOLD_LOW/HIGH), while a nonzero count with rejection
+        reasons means a blue blob exists but is the wrong size/shape (tune
+        CONE_MIN_AREA_PX/CONE_MAX_WIDTH_PX or check CONE_SCAN_Y/HEIGHT).
         '''
         raw_detected = self.cone_x is not None
-        self._raw_seen_frames = self._raw_seen_frames + 1 if raw_detected else 0
+        action = self._decide_action()
+        self._frame_count += 1
+        heartbeat_due = self._frame_count % self.log_interval_frames == 0
 
-        if raw_detected and (not self._was_raw_detected
-                              or self._raw_seen_frames % self.log_interval_frames == 0):
+        if raw_detected and not self._was_raw_detected:
             mean_hsv, mean_rgb = self._sample_color(band_rgb, band_hsv, self.cone_x)
             lane_note = "IN our lane" if self.cone_in_our_lane else "NOT in our lane (or lane unknown)"
             logger.info(
                 f"[cone_tape] blue tape candidate at x={self.cone_x:.1f}, scan_y={self.scan_y} - "
                 f"sampled color HSV=({mean_hsv[0]:.0f},{mean_hsv[1]:.0f},{mean_hsv[2]:.0f}) "
-                f"RGB=({mean_rgb[0]:.0f},{mean_rgb[1]:.0f},{mean_rgb[2]:.0f}) - {lane_note}"
+                f"RGB=({mean_rgb[0]:.0f},{mean_rgb[1]:.0f},{mean_rgb[2]:.0f}) - {lane_note} - "
+                f"ACTION: {action}"
             )
         elif not raw_detected and self._was_raw_detected:
-            logger.info("[cone_tape] blue tape candidate no longer visible in scan band")
+            logger.info(f"[cone_tape] blue tape no longer visible in scan band - ACTION: {action}")
+        elif heartbeat_due:
+            if raw_detected:
+                mean_hsv, mean_rgb = self._sample_color(band_rgb, band_hsv, self.cone_x)
+                logger.info(
+                    f"[cone_tape] blue tape still at x={self.cone_x:.1f} "
+                    f"HSV=({mean_hsv[0]:.0f},{mean_hsv[1]:.0f},{mean_hsv[2]:.0f}) - ACTION: {action}"
+                )
+            else:
+                raw_pixel_count, reasons = self._describe_mask(mask)
+                if raw_pixel_count == 0:
+                    detail = "no pixels matched BLUE_HSV_THRESHOLD_LOW/HIGH in scan band"
+                elif reasons:
+                    detail = f"{raw_pixel_count}px matched color but rejected: " + "; ".join(reasons)
+                else:
+                    detail = f"{raw_pixel_count}px matched color, no blob"
+                logger.info(f"[cone_tape] no blue tape detected ({detail}) - ACTION: {action}")
 
         self._was_raw_detected = raw_detected
 
@@ -248,24 +334,28 @@ class ObstacleAvoider:
 
         our_lane = _lane_bounds(yellow_x, white_x, lane_width_px, self.white_right_of_yellow, other_lane=False)
 
-        self.cone_x = self.detect_cone(band_hsv)
+        self.cone_x, mask = self.detect_cone(band_hsv)
         self.cone_in_our_lane = self._x_in_bounds(self.cone_x, our_lane)
-
-        self._log_raw_detection(band_rgb, band_hsv)
-        self._warn_if_lane_geometry_missing(yellow_x, white_x)
 
         if self.cone_in_our_lane:
             self._pending_frames += 1
         else:
             self._pending_frames = 0
 
+        # cone_detected (and therefore _decide_action's "SWERVE" verdict)
+        # must be settled *before* _log_raw_detection runs below, so the
+        # printed ACTION reflects this frame's decision instead of lagging
+        # one frame behind it.
         was_detected = self.cone_detected
         self.cone_detected = self._pending_frames >= self.cone_trigger_frames
         if self.cone_detected and not was_detected:
             logger.info(f"cone marker detected in our lane at x={self.cone_x:.1f} "
-                         f"(held {self._pending_frames} frames)")
+                         f"(held {self._pending_frames} frames) - ACTION: {self._decide_action()}")
         elif was_detected and not self.cone_detected:
-            logger.info("cone marker no longer in our lane")
+            logger.info(f"cone marker no longer in our lane - ACTION: {self._decide_action()}")
+
+        self._log_raw_detection(band_rgb, band_hsv, mask)
+        self._warn_if_lane_geometry_missing(yellow_x, white_x)
 
         if self.overlay_image and cv_img is not None:
             cv_img = self.overlay_display(cv_img)
