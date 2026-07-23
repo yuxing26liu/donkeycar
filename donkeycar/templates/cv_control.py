@@ -108,6 +108,22 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
                       cfg.CV_CONTROLLER_OUTPUTS,
                       cfg.CV_CONTROLLER_CONDITION)
 
+    #
+    # Obstacle avoidance -- Phase 1 (see project_doc/obstacle_avoidance.md):
+    # detects the traffic cone's blue tape ground marker within our lane.
+    # Detection-only for now -- pilot/steering and pilot/throttle pass
+    # through unchanged; obstacle/cone_detected is published for tuning/
+    # verification (e.g. via tub recording or the CV overlay) before any
+    # avoidance maneuver is wired up.
+    #
+    if getattr(cfg, 'HAVE_OBSTACLE_AVOIDANCE', False):
+        from donkeycar.parts.obstacle_avoider import ObstacleAvoider
+        V.add(ObstacleAvoider(cfg),
+              inputs=['cam/image_array', 'lane/yellow_x', 'lane/white_x', 'lane/width_px',
+                      'pilot/steering', 'pilot/throttle', 'cv/image_array'],
+              outputs=['pilot/steering', 'pilot/throttle', 'cv/image_array', 'obstacle/cone_detected'],
+              run_condition='run_pilot')
+
     recording_control = ToggleRecording(cfg.AUTO_RECORD_ON_THROTTLE, cfg.RECORD_DURING_AI)
     V.add(recording_control, inputs=['user/mode', "recording"], outputs=["recording"])
 

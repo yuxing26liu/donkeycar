@@ -600,6 +600,33 @@ PID_D_DELTA = 0.00005 # amount the inc/dec function will change the D value
 OVERLAY_IMAGE = True  # True to draw computer vision overlay on camera image in web ui
                       # NOTE: this does not affect what is saved to the data
 
+# ObstacleAvoider - Phase 1: blue-tape cone-marker detection (see
+# project_doc/obstacle_avoidance.md for the full design and current status).
+# Detection-only for now -- does not change pilot/steering or pilot/throttle.
+# Requires CV_CONTROLLER_CLASS = "LaneFollower" (lane/yellow_x, lane/white_x,
+# lane/width_px must be populated) to do anything useful; with LineFollower
+# those inputs stay None and the cone is never considered "in our lane".
+HAVE_OBSTACLE_AVOIDANCE = False
+
+CONE_SCAN_Y = 60        # num pixels from the top to start the cone scan slice
+                        # (higher up / farther ahead than SCAN_Y, for lead time to react)
+CONE_SCAN_HEIGHT = 30   # num pixels high to grab from the cone scan slice
+
+# HSV range for the blue tape marker. Guessed, not yet tuned on hardware --
+# same workflow as COLOR_THRESHOLD_LOW/HIGH above: run with LOGLEVEL=DEBUG
+# and re-tune with scripts/hsv_picker.py against real footage of the tape.
+BLUE_HSV_THRESHOLD_LOW = (95, 100, 60)
+BLUE_HSV_THRESHOLD_HIGH = (130, 255, 255)
+
+CONE_MIN_AREA_PX = 80     # smallest pixel area (in the scan slice) counted as the tape marker
+CONE_MAX_WIDTH_PX = 250   # widest pixel width (in the scan slice) counted as the tape marker
+
+LANE_SHIFT_MARGIN_PX = 10  # margin added to our lane's pixel bounds when testing
+                            # whether a detection falls inside it
+CONE_TRIGGER_FRAMES = 2    # consecutive in-lane detections required before
+                            # obstacle/cone_detected latches True -- rejects a
+                            # single noisy frame (glare, a leaf, etc.)
+
 
 #
 # Assign path follow functions to buttons.
