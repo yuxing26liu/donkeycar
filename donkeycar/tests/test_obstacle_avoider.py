@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import pytest
 
@@ -25,6 +27,7 @@ class _Cfg:
     CONE_TRIGGER_FRAMES = 2
     MORPH_KERNEL_SIZE = 3
     OVERLAY_IMAGE = False
+    CONE_LOG_INTERVAL_FRAMES = 10
 
 
 def _make_frame(patches=()):
@@ -161,3 +164,60 @@ class TestObstacleAvoiderConeDetection:
         assert steering == 0.0 and throttle == 0.2
         assert out_cv_img is not None
         assert out_cv_img.shape == img.shape
+
+
+class TestObstacleAvoiderDiagnostics:
+    '''
+    Terminal-output checks for on-car verification: a raw blue-blob
+    detection must print its sampled color value regardless of whether lane
+    geometry is available, and a missing lane/yellow_x + lane/white_x must
+    be surfaced as a one-time warning rather than silently never triggering
+    (see project_doc/obstacle_avoidance.md, "would this work on the pi").
+    '''
+
+    def test_raw_detection_logs_sampled_color_even_without_lane_geometry(self, caplog):
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(210, 230, 65, 85, BLUE)])
+        with caplog.at_level(logging.INFO, logger='donkeycar.parts.obstacle_avoider'):
+            avoider.run(img, None, None, LANE_WIDTH_PX, 0.0, 0.2)
+        messages = [r.message for r in caplog.records]
+        color_logs = [m for m in messages if 'blue tape candidate at' in m]
+        assert len(color_logs) == 1
+        assert 'HSV=' in color_logs[0] and 'RGB=' in color_logs[0]
+        assert 'NOT in our lane' in color_logs[0]
+
+        # the sampled color should reflect the pure-blue patch itself, not a
+        # blend with the surrounding gray track (regression check: the patch
+        # must be centered on the marker's vertical extent within the scan
+        # band, not averaged over the whole scan band height)
+        hue = int(color_logs[0].split('HSV=(')[1].split(',')[0])
+        assert hue == pytest.approx(120, abs=5)
+
+    def test_raw_detection_log_clears_on_loss(self, caplog):
+        avoider = ObstacleAvoider(_Cfg())
+        with_cone = _make_frame([(210, 230, 65, 85, BLUE)])
+        without_cone = _make_frame()
+        with caplog.at_level(logging.INFO, logger='donkeycar.parts.obstacle_avoider'):
+            avoider.run(with_cone, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+            avoider.run(without_cone, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        messages = [r.message for r in caplog.records]
+        assert any('no longer visible' in m for m in messages)
+
+    def test_missing_lane_geometry_warns_once(self, caplog):
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame()
+        with caplog.at_level(logging.INFO, logger='donkeycar.parts.obstacle_avoider'):
+            for _ in range(5):
+                avoider.run(img, None, None, LANE_WIDTH_PX, 0.0, 0.2)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING
+                    and 'CV_CONTROLLER_OUTPUTS' in r.message]
+        assert len(warnings) == 1  # logged once, not every frame
+
+    def test_present_lane_geometry_never_warns(self, caplog):
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame()
+        with caplog.at_level(logging.INFO, logger='donkeycar.parts.obstacle_avoider'):
+            for _ in range(5):
+                avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings == []

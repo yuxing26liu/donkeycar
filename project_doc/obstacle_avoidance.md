@@ -108,6 +108,65 @@ maneuver (which depends on decisions 2-5 above) is built on top of it.
    `OVERLAY_IMAGE` is set, the detection is also drawn on `cv/image_array`
    (orange box = in our lane, gray box = detected but in the other lane).
 
+### Terminal diagnostics (what to watch when verifying on the car)
+
+With `cv_control.py`'s default logging (`--log=INFO`, no flag needed), two
+things print to the terminal, independent of each other and of whether a
+maneuver would trigger:
+
+- **Whenever the blue tape enters/leaves the scan band**, one line with the
+  actually-sampled color at the detection, e.g.:
+  ```
+  [cone_tape] blue tape candidate at x=219.5, scan_y=60 - sampled color HSV=(120,255,255) RGB=(0,0,255) - IN our lane
+  ```
+  This repeats every `CONE_LOG_INTERVAL_FRAMES` frames (default 10, ~0.5s at
+  20Hz) while the tape stays in view, so it's usable for live tuning — move
+  the car/tape and watch the HSV number track. Fires regardless of lane
+  geometry, so it confirms the color detector itself works even before
+  `lane/*` is wired correctly (see the gotcha below). The sampled patch is
+  centered on the scan band's vertical midline, not averaged over the whole
+  band height — if the tape doesn't fill `CONE_SCAN_HEIGHT`, a full-height
+  average would blend in the gray track and under-report saturation/value;
+  this was caught by `test_raw_detection_logs_sampled_color_even_without_lane_geometry`
+  actually failing (hue landed near 80, not blue's ~120) before the fix.
+- **`obstacle/cone_detected` transitions** (a separate, debounced line) once
+  the tape has been in our lane for `CONE_TRIGGER_FRAMES` consecutive
+  frames, and again when it clears.
+
+### Known gotcha: `CV_CONTROLLER_OUTPUTS` must include the `lane/*` keys
+
+`LaneFollower.run()` returns 6 values: `(steering, throttle, image,
+yellow_x, white_x, lane_width_px)`. The `Vehicle`/`Memory` plumbing
+(`donkeycar/vehicle.py` `update_parts()` -> `Memory.put()`,
+`donkeycar/memory.py`) assigns those 6 return values to
+`cfg.CV_CONTROLLER_OUTPUTS` **by position, and silently drops anything past
+the end of that list** if it's shorter than the tuple — no error, no
+warning. The template's own default `CV_CONTROLLER_OUTPUTS` in
+`cfg_cv_control.py` is still the 3-element
+`['pilot/steering', 'pilot/throttle', 'cv/image_array']` (left that way
+because it's shared with `LineFollower`, which only returns 3 values).
+
+Since steering and throttle are first in `LaneFollower`'s tuple, **the car
+drives identically either way** — a 3-element `CV_CONTROLLER_OUTPUTS`
+doesn't break lane-keeping, it just means `lane/yellow_x`, `lane/white_x`,
+`lane/width_px` are never written to `Memory`, `ObstacleAvoider` always sees
+`None` for them, `_lane_bounds` always returns `(None, None)`, and the cone
+can never be judged "in our lane" — with no symptom visible from driving
+behavior alone. **This must be checked directly in the car's
+`myconfig.py`** (outside this repo, at `/home/pi/mycar/myconfig.py` — not
+verifiable from this repo alone):
+
+```python
+CV_CONTROLLER_MODULE = "donkeycar.parts.lane_follower"
+CV_CONTROLLER_CLASS = "LaneFollower"
+CV_CONTROLLER_OUTPUTS = ['pilot/steering', 'pilot/throttle', 'cv/image_array',
+                          'lane/yellow_x', 'lane/white_x', 'lane/width_px']
+```
+
+If this isn't set, `ObstacleAvoider` now logs a one-time warning
+(`_warn_if_lane_geometry_missing`) naming exactly this, instead of silently
+never triggering.
+
 ### Why a positive color match, not "detect anything unusual"
 
 The alternative (mask out everything already known about the track, treat
@@ -162,6 +221,29 @@ cone detection can ever be "in our lane". Safe to leave enabled regardless:
 it degrades to reporting `cone_detected = False` always, never touching
 `pilot/steering`/`pilot/throttle`.
 
+### Does this actually run in full-auto mode on the car?
+
+Traced through, not assumed:
+
+- `run_condition='run_pilot'` — `Vehicle.update_parts()`
+  (`donkeycar/vehicle.py`) reads `mem.get(['run_pilot'])` each loop tick and
+  skips the part's `run()` entirely (inputs untouched, outputs untouched)
+  when it's `False`.
+- `run_pilot` is set by `UserPilotCondition.run()` (`donkeycar/templates/complete.py`):
+  `True` whenever `user/mode != 'user'` — i.e. in both `'local_angle'`
+  (assisted-steering) and `'local_pilot'` (full auto) modes. Only manual
+  `'user'` mode is skipped.
+- So yes: in full-auto mode, `ObstacleAvoider.run()` executes every loop
+  tick alongside `LaneFollower`, in the order they were added to `V`
+  (`LaneFollower` first, so its `lane/*` and `pilot/*` outputs are already
+  in `Memory` — same loop tick, no staleness — by the time `ObstacleAvoider`
+  reads them).
+- The one thing this trace can't confirm from inside this repo is whether
+  `myconfig.py` on the Pi actually has `HAVE_OBSTACLE_AVOIDANCE = True` (the
+  part is opt-in, off by default in the shared template) and the full
+  `CV_CONTROLLER_OUTPUTS` list from the gotcha above — both live outside
+  this repo and need to be checked directly on the car.
+
 ### Configuration
 
 All in `donkeycar/templates/cfg_cv_control.py`, overridable per-car in
@@ -182,6 +264,10 @@ CONE_MAX_WIDTH_PX = 250  # widest pixel width (in the scan slice) counted as the
 
 LANE_SHIFT_MARGIN_PX = 10  # margin added to our lane's bounds when testing membership
 CONE_TRIGGER_FRAMES = 2    # consecutive in-lane frames required before latching
+
+CONE_LOG_INTERVAL_FRAMES = 10  # re-print the sampled color this often (frames)
+                                # while the tape stays in view -- see
+                                # "Terminal diagnostics" above
 ```
 
 Like every other CV threshold in this codebase (`COLOR_THRESHOLD_LOW/HIGH`,
@@ -191,7 +277,7 @@ against real tape under the car's actual lighting.
 
 ## Testing performed
 
-`donkeycar/tests/test_obstacle_avoider.py`, 17 tests, all passing (run with
+`donkeycar/tests/test_obstacle_avoider.py`, 21 tests, all passing (run with
 `conda activate donkey && python -m pytest donkeycar/tests/test_obstacle_avoider.py -v`
 — this repo's dev tooling lives in the `donkey` conda environment, not the
 system Python). All synthetic-image tests (no camera/hardware needed):
@@ -211,6 +297,12 @@ system Python). All synthetic-image tests (no camera/hardware needed):
   a miss correctly resets the debounce counter instead of carrying over.
 - `cam_img=None` and the overlay path both pass through cleanly without
   altering `steering`/`throttle`.
+- **Diagnostics:** a raw detection logs its sampled HSV/RGB color even with
+  no lane geometry available, and that logged hue is asserted close to true
+  blue's ~120 (this test caught the vertical-averaging bug described in
+  "Terminal diagnostics" above — it originally logged ~80 before the fix);
+  the log clears on loss; the missing-lane-geometry warning fires exactly
+  once across repeated frames, and never fires when geometry is present.
 
 **Not yet tested/verified:** real camera footage. The HSV thresholds and
 scan-row placement are guesses (see above) and need to be checked against

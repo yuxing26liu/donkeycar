@@ -121,6 +121,8 @@ class ObstacleAvoider:
         self.lane_margin_px = getattr(cfg, 'LANE_SHIFT_MARGIN_PX', 10)
         self.cone_trigger_frames = getattr(cfg, 'CONE_TRIGGER_FRAMES', 2)
 
+        self.log_interval_frames = getattr(cfg, 'CONE_LOG_INTERVAL_FRAMES', 10)
+
         # public detection state - what a future avoidance maneuver (or a
         # test) reads; updated every run() call
         self.cone_x = None              # raw detected x this frame (any lane), or None
@@ -128,6 +130,12 @@ class ObstacleAvoider:
         self.cone_detected = False      # debounced: True once cone_in_our_lane has held
                                          # for cone_trigger_frames consecutive frames
         self._pending_frames = 0
+
+        # diagnostic-logging state only (see _log_raw_detection /
+        # _warn_if_lane_geometry_missing) - not used for detection itself
+        self._was_raw_detected = False
+        self._raw_seen_frames = 0
+        self._warned_no_lane_geometry = False
 
     def _open(self, mask):
         if self.morph_kernel_size > 1:
@@ -150,6 +158,70 @@ class ObstacleAvoider:
         if x is None or lo is None:
             return False
         return lo - self.lane_margin_px <= x <= hi + self.lane_margin_px
+
+    def _sample_color(self, band_rgb, band_hsv, x, radius=4):
+        '''
+        Mean HSV/RGB over a small patch centered on a detected x AND on the
+        scan band's vertical midline, for the terminal diagnostics below -
+        lets BLUE_HSV_THRESHOLD_LOW/HIGH be checked against what the camera
+        is actually seeing on the car, without needing to pull frames off
+        the Pi first. Deliberately a small patch, not the full band height:
+        the tape marker may not fill CONE_SCAN_HEIGHT, and averaging over
+        rows outside it would blend in the gray track surface and wash out
+        the reported color - this stays inside the marker as long as it
+        crosses the band's vertical midline, which is the same assumption
+        CONE_SCAN_Y/HEIGHT being sized to the marker already makes.
+        '''
+        h, w = band_hsv.shape[:2]
+        x0, x1 = max(0, int(round(x)) - radius), min(w, int(round(x)) + radius + 1)
+        y_mid = h // 2
+        y0, y1 = max(0, y_mid - radius), min(h, y_mid + radius + 1)
+        mean_hsv = band_hsv[y0:y1, x0:x1].reshape(-1, 3).mean(axis=0)
+        mean_rgb = band_rgb[y0:y1, x0:x1].reshape(-1, 3).mean(axis=0)
+        return mean_hsv, mean_rgb
+
+    def _log_raw_detection(self, band_rgb, band_hsv):
+        '''
+        Terminal diagnostics, independent of the in-lane/debounce gating
+        below: prints whenever a blue blob enters/leaves the scan band, plus
+        a periodic reminder (every CONE_LOG_INTERVAL_FRAMES frames) while it
+        stays in view, with the actually-sampled HSV/RGB color value each
+        time. This is what to watch when tuning BLUE_HSV_THRESHOLD_LOW/HIGH
+        or CONE_SCAN_Y/HEIGHT against the real tape on the car - and it
+        fires regardless of whether lane geometry is available, so it still
+        confirms the color detector itself is working even if lane/yellow_x
+        etc. turn out not to be wired (see _warn_if_lane_geometry_missing).
+        '''
+        raw_detected = self.cone_x is not None
+        self._raw_seen_frames = self._raw_seen_frames + 1 if raw_detected else 0
+
+        if raw_detected and (not self._was_raw_detected
+                              or self._raw_seen_frames % self.log_interval_frames == 0):
+            mean_hsv, mean_rgb = self._sample_color(band_rgb, band_hsv, self.cone_x)
+            lane_note = "IN our lane" if self.cone_in_our_lane else "NOT in our lane (or lane unknown)"
+            logger.info(
+                f"[cone_tape] blue tape candidate at x={self.cone_x:.1f}, scan_y={self.scan_y} - "
+                f"sampled color HSV=({mean_hsv[0]:.0f},{mean_hsv[1]:.0f},{mean_hsv[2]:.0f}) "
+                f"RGB=({mean_rgb[0]:.0f},{mean_rgb[1]:.0f},{mean_rgb[2]:.0f}) - {lane_note}"
+            )
+        elif not raw_detected and self._was_raw_detected:
+            logger.info("[cone_tape] blue tape candidate no longer visible in scan band")
+
+        self._was_raw_detected = raw_detected
+
+    def _warn_if_lane_geometry_missing(self, yellow_x, white_x):
+        if yellow_x is not None or white_x is not None or self._warned_no_lane_geometry:
+            return
+        logger.warning(
+            "[cone_tape] lane/yellow_x and lane/white_x are both None - cone-in-our-lane "
+            "detection can never trigger this way. Check myconfig.py: CV_CONTROLLER_CLASS "
+            "must be 'LaneFollower', and CV_CONTROLLER_OUTPUTS must be the full "
+            "['pilot/steering','pilot/throttle','cv/image_array','lane/yellow_x','lane/white_x',"
+            "'lane/width_px'] (LaneFollower.run() returns all 6; Memory.put() silently drops "
+            "anything past the end of CV_CONTROLLER_OUTPUTS, so a shorter list here still lets "
+            "the car steer normally while leaving lane/yellow_x etc. permanently unset)."
+        )
+        self._warned_no_lane_geometry = True
 
     def run(self, cam_img, yellow_x, white_x, lane_width_px, steering, throttle, cv_img=None):
         '''
@@ -178,6 +250,9 @@ class ObstacleAvoider:
 
         self.cone_x = self.detect_cone(band_hsv)
         self.cone_in_our_lane = self._x_in_bounds(self.cone_x, our_lane)
+
+        self._log_raw_detection(band_rgb, band_hsv)
+        self._warn_if_lane_geometry_missing(yellow_x, white_x)
 
         if self.cone_in_our_lane:
             self._pending_frames += 1

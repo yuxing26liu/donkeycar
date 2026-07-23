@@ -627,6 +627,12 @@ CONE_TRIGGER_FRAMES = 2    # consecutive in-lane detections required before
                             # obstacle/cone_detected latches True -- rejects a
                             # single noisy frame (glare, a leaf, etc.)
 
+CONE_LOG_INTERVAL_FRAMES = 10  # while the blue tape stays in view, re-print its
+                                # sampled color value this often (in frames) -- the
+                                # thing to watch when tuning BLUE_HSV_THRESHOLD_LOW/HIGH
+                                # against the real tape on the car (LOGLEVEL=INFO,
+                                # cv_control.py's default, is enough to see these)
+
 
 #
 # Assign path follow functions to buttons.
