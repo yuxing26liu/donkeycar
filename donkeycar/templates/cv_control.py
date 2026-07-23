@@ -187,11 +187,20 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
     #
     # add tub to save data
     #
+    # lane/yellow_x, lane/white_x, lane/width_px are only ever populated
+    # when CV_CONTROLLER_CLASS is LaneFollower (see lane_follower.py) -
+    # Memory.get() returns None for a key nothing has written, and
+    # Tub.write_record() skips None values, so this is a no-op (those
+    # three columns just never appear) when running LineFollower instead.
+    # Recording them lets a tub be analyzed for exactly what was detected
+    # per frame, instead of having to infer it from steering/throttle.
     inputs=['cam/image_array',
-            'steering', 'throttle']
+            'steering', 'throttle',
+            'lane/yellow_x', 'lane/white_x', 'lane/width_px']
 
     types=['image_array',
-           'float', 'float']
+           'float', 'float',
+           'float', 'float', 'float']
 
     #
     # Create data storage part
@@ -215,8 +224,16 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
     #
     # run the vehicle
     #
-    V.start(rate_hz=cfg.DRIVE_LOOP_HZ, 
-            max_loop_count=cfg.MAX_LOOPS)
+    # verbose=True (set VERBOSE_CAR in myconfig.py) gets you two things
+    # Vehicle.start() otherwise stays silent about: a WARN log line any
+    # loop that can't keep up with DRIVE_LOOP_HZ, and a per-part timing
+    # table (max/min/avg/percentiles, in ms) printed every 200 loops -
+    # the direct way to see how long LaneFollower's run() actually takes
+    # per frame, rather than inferring it from tub timestamps after the
+    # fact.
+    V.start(rate_hz=cfg.DRIVE_LOOP_HZ,
+            max_loop_count=cfg.MAX_LOOPS,
+            verbose=getattr(cfg, 'VERBOSE_CAR', False))
 
 
 #

@@ -69,6 +69,25 @@ def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag
     return float(centroids[best_label][0]), int(best_area)
 
 
+def _shape_param(cfg, color_name, key, default):
+    '''
+    Per-color shape-filter override with fallback to the shared key, then
+    a hardcoded default: f'{COLOR}_{key}' (e.g. YELLOW_MIN_LINE_AREA_PX)
+    takes precedence over the shared f'{key}' (MIN_LINE_AREA_PX) if it's
+    set in cfg, so each color's blob-shape filter can be tuned
+    independently. A dashed yellow segment (short, often foreshortened)
+    and a continuous white edge line don't actually look the same shape,
+    and one bound compromising between both was a known gap - see the
+    old _LineTracker docstring ("no per-color override hook"). Backward
+    compatible: if no per-color keys are set, behavior is unchanged.
+    '''
+    if color_name:
+        per_color_key = f'{color_name.upper()}_{key}'
+        if hasattr(cfg, per_color_key):
+            return getattr(cfg, per_color_key)
+    return getattr(cfg, key, default)
+
+
 class _LineTracker:
     '''
     Per-color, per-scan-row line detector with continuity tracking and smoothing.
@@ -96,12 +115,12 @@ class _LineTracker:
         # S channel can. White stays on RGB (already working reliably).
         self.color_space = color_space
 
-        self.min_area_px = getattr(cfg, 'MIN_LINE_AREA_PX', 150)
-        self.max_width_px = getattr(cfg, 'MAX_LINE_WIDTH_PX', 250)
+        self.min_area_px = _shape_param(cfg, color_name, 'MIN_LINE_AREA_PX', 150)
+        self.max_width_px = _shape_param(cfg, color_name, 'MAX_LINE_WIDTH_PX', 250)
         # 0.10 (not the old 0.15) so a foreshortened yellow dash seen from a low
         # camera angle still clears the bar - see MIN_LINE_ASPECT_RATIO in
         # cfg_cv_control.py for the reasoning
-        self.min_aspect_ratio = getattr(cfg, 'MIN_LINE_ASPECT_RATIO', 0.10)
+        self.min_aspect_ratio = _shape_param(cfg, color_name, 'MIN_LINE_ASPECT_RATIO', 0.10)
         self.morph_kernel_size = getattr(cfg, 'MORPH_KERNEL_SIZE', 3)
 
         self.max_jump_pixels = getattr(cfg, 'MAX_JUMP_PIXELS', 40)
