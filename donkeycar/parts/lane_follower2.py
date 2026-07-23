@@ -50,6 +50,41 @@ Changes from lane_follower.py, all isolated to white detection:
      the yellow tracker, applied here as an exclusion instead of an
      inclusion band.
 
+  4. A ceiling on the L channel's own stddev (ADAPTIVE_MAX_STD), and
+     optional CLAHE contrast normalization before the adaptive threshold
+     is computed (ADAPTIVE_USE_CLAHE). Both address the same failure,
+     found on tub_25_26-07-23: "brighter than this frame's own mean/std"
+     assumes the scan band represents one lighting condition with paint
+     as the brightness anomaly within it. When the band straddles a hard
+     shadow/sun boundary, that's false - the band contains two lighting
+     conditions, and sunlit *bare pavement* is brighter than the real,
+     shaded white paint elsewhere in the same band. Measured directly:
+     normal bands have L-channel stddev ~16-20; bands straddling a
+     shadow/sun boundary hit 55-65+. Worse, when this pushes the
+     threshold high enough that nothing passes for several consecutive
+     frames, the continuity tracker's reacquire-after-loss logic (see
+     _LineTracker.update below) kicks in and confidently locks onto
+     whatever the next frame's strongest candidate is - which is often
+     exactly the sunlit patch, since it really is the brightest thing in
+     the band. ADAPTIVE_MAX_STD rejects the frame outright when this
+     happens (mirrors the existing ADAPTIVE_MIN_STD guard for the
+     opposite case - a band too uniform to threshold against) so the
+     tracker fails safe (loses lock, car slows) instead of failing
+     confidently wrong (locks onto pavement). ADAPTIVE_USE_CLAHE was a
+     complementary idea tried alongside this - locally re-normalize
+     contrast in tiles across the band before the mean/std math runs, so
+     a shadow/sun split doesn't dominate the per-band statistics the way
+     a single global mean/std does - but it tested worse in practice:
+     replayed against tub_25's confirmed false-lock frames, CLAHE alone
+     still picked nearly the same wrong (bare-pavement) position on most
+     of them, and combined with ADAPTIVE_MAX_STD it made tub_16
+     dramatically worse (white hit-rate 11.8%->4.1%) - CLAHE changes the
+     L channel's own statistics enough that a max-std threshold
+     calibrated on raw images isn't calibrated for CLAHE's output
+     anymore. Left in as an option (off by default) for future
+     experimentation, not because it's known to help - ADAPTIVE_MAX_STD
+     alone is the actual, verified fix.
+
 Yellow's detection, the continuity/shape/PID/sustained-loss machinery,
 and the overlay are all unchanged from lane_follower.py - only the things
 above differ. Same constructor signature (pid, cfg) and same 6-tuple
@@ -143,7 +178,7 @@ def _shape_param(cfg, color_name, key, default):
     return getattr(cfg, key, default)
 
 
-def _adaptive_lab_mask(scan_line_rgb, k_std, min_std, max_saturation):
+def _adaptive_lab_mask(scan_line_rgb, k_std, min_std, max_std, max_saturation, clahe=None):
     '''
     Lighting-robust "brighter than the surrounding pavement" mask, used
     for white instead of a fixed absolute RGB threshold (see module
@@ -164,7 +199,22 @@ def _adaptive_lab_mask(scan_line_rgb, k_std, min_std, max_saturation):
     shadow, or a blown-out overexposed patch) has no reliable local
     contrast to threshold against; below that floor there's nothing
     trustworthy to call "brighter than," so this returns an all-zero
-    mask rather than manufacturing a threshold from noise.
+    mask rather than manufacturing a threshold from noise. Symmetrically,
+    a band with stddev *above* max_std (see module docstring point 4) is
+    just as untrustworthy in the other direction - not "one lighting
+    condition with some contrast," but two different lighting conditions
+    (e.g. a hard shadow/sun boundary crossing the band), where "brighter
+    than this band's own mean" picks out sunlit bare pavement rather than
+    the real, shaded paint. Confirmed on tub_25_26-07-23: normal bands
+    run ~16-20 stddev; shadow/sun-split bands hit 55-65+.
+
+    If clahe is given (an OpenCV CLAHE object), it's applied to the L
+    channel before any of the above - locally renormalizing contrast in
+    tiles across the band so a large-scale brightness gradient (like a
+    shadow/sun split) doesn't dominate the whole-band mean/std the way it
+    otherwise would, in principle letting real paint-vs-pavement contrast
+    stand out relative to its own local neighborhood on both sides of the
+    split rather than only the globally brightest region winning.
 
     L-channel brightness alone can't tell a genuine white line from a
     sunlit yellow dash (see module docstring point 3) - both are
@@ -176,15 +226,19 @@ def _adaptive_lab_mask(scan_line_rgb, k_std, min_std, max_saturation):
 
     input: scan_line_rgb, an RGB numpy array (one scan row's cropped band);
            max_saturation, HSV saturation (0-255) above which a pixel is
-           excluded even if it passed the brightness threshold
+           excluded even if it passed the brightness threshold;
+           clahe, optional cv2.CLAHE instance (None = disabled)
     output: mask, binary (0/255) uint8, same height/width as scan_line_rgb
     '''
     lab = cv2.cvtColor(scan_line_rgb, cv2.COLOR_RGB2LAB)
     l_channel = lab[:, :, 0]
 
+    if clahe is not None:
+        l_channel = clahe.apply(l_channel)
+
     mean = float(np.mean(l_channel))
     std = float(np.std(l_channel))
-    if std < min_std:
+    if std < min_std or std > max_std:
         return np.zeros(l_channel.shape, dtype=np.uint8)
 
     threshold = mean + k_std * std
@@ -241,6 +295,18 @@ class _LineTracker:
         # Only used when color_space == 'LAB_ADAPTIVE'; see _adaptive_lab_mask.
         self.adaptive_k_std = _shape_param(cfg, color_name, 'ADAPTIVE_K_STD', 1.5)
         self.adaptive_min_std = _shape_param(cfg, color_name, 'ADAPTIVE_MIN_STD', 5.0)
+        # New: rejects a band whose L-channel stddev is implausibly high -
+        # not "some contrast to threshold against" but "this band spans
+        # two different lighting conditions" (see module docstring point
+        # 4 and _adaptive_lab_mask). Calibrated across tub_4/8/9/11/13/16/25:
+        # normal bands run ~16-20 stddev, with occasional legitimate spikes
+        # into the 30s-40s; tub_16 and tub_25 (the two tubs with a real
+        # shadow/sun split within the band) average 30-50 with a long tail
+        # to 70+. 50 sits above the normal tubs' occasional legitimate
+        # spikes (p99 up to ~58 on tub_9) but well below where a genuine
+        # split-lighting band sits - re-check against new tubs before
+        # assuming this is final, it's from one round of calibration.
+        self.adaptive_max_std = _shape_param(cfg, color_name, 'ADAPTIVE_MAX_STD', 50.0)
         # Conceptually this should track whatever YELLOW_HSV_THRESHOLD_LOW's
         # saturation floor is calibrated to for the current lighting -
         # anything less saturated than "counts as yellow paint" is
@@ -248,6 +314,19 @@ class _LineTracker:
         # 60 here is just a generic fallback if myconfig doesn't set one;
         # set ADAPTIVE_MAX_SATURATION explicitly to keep it in sync.
         self.adaptive_max_saturation = _shape_param(cfg, color_name, 'ADAPTIVE_MAX_SATURATION', 60)
+
+        # New: optional CLAHE contrast normalization before the adaptive
+        # threshold math (see module docstring point 4). Off by default -
+        # the min/max std guards above are the load-bearing fix; this is
+        # a complementary, more ambitious attempt to reduce how often a
+        # band's stats are split-lighting-contaminated in the first place.
+        # Only relevant in LAB_ADAPTIVE mode.
+        self.use_clahe = _shape_param(cfg, color_name, 'ADAPTIVE_USE_CLAHE', False)
+        self.clahe = None
+        if self.use_clahe and color_space == 'LAB_ADAPTIVE':
+            clip_limit = _shape_param(cfg, color_name, 'ADAPTIVE_CLAHE_CLIP_LIMIT', 2.0)
+            tile_grid = _shape_param(cfg, color_name, 'ADAPTIVE_CLAHE_TILE_GRID', (8, 1))
+            self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tuple(tile_grid))
 
         self.max_jump_pixels = getattr(cfg, 'MAX_JUMP_PIXELS', 40)
         self.reacquire_after_frames = getattr(cfg, 'REACQUIRE_AFTER_FRAMES', 15)
@@ -269,7 +348,8 @@ class _LineTracker:
             mask = cv2.inRange(scan_line, self.color_thr_low, self.color_thr_hi)
         elif self.color_space == 'LAB_ADAPTIVE':
             mask = _adaptive_lab_mask(scan_line_rgb, self.adaptive_k_std, self.adaptive_min_std,
-                                       self.adaptive_max_saturation)
+                                       self.adaptive_max_std, self.adaptive_max_saturation,
+                                       clahe=self.clahe)
         else:
             mask = cv2.inRange(scan_line_rgb, self.color_thr_low, self.color_thr_hi)
 
