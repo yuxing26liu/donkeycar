@@ -10,7 +10,7 @@ the opposite way - white hit-rate spiking to 30-55% (vs. a normal ~3-5%)
 during what looked like glare/overexposure, almost certainly a false
 positive rather than an actual line.
 
-Two changes from lane_follower.py, both isolated to white detection:
+Changes from lane_follower.py, all isolated to white detection:
 
   1. White now uses an adaptive, per-frame-relative threshold in LAB's L
      channel instead of a fixed absolute RGB threshold. LAB's L channel
@@ -33,6 +33,22 @@ Two changes from lane_follower.py, both isolated to white detection:
      the shape filter, which operates per-blob and isn't guaranteed to
      reject a diffuse, frame-filling false positive the way it reliably
      rejects a compact noise blob.
+
+  3. A saturation ceiling on the LAB_ADAPTIVE mask (ADAPTIVE_MAX_SATURATION):
+     the L channel alone is purely a brightness signal, so a sunlit yellow
+     dash - which is *brighter than the surrounding pavement* just like a
+     real white line is - passed the white check as readily as genuine
+     white paint. Confirmed on tub_13_26-07-23: on frames where the yellow
+     tracker had a real detection, the same pixels passed the LAB_ADAPTIVE
+     white mask 90-98% of the time on a meaningful fraction of those
+     frames. Since real white paint and bare pavement are both
+     low-saturation (that's the whole reason RGB/LAB brightness works for
+     white to begin with) while yellow paint is not, rejecting any would-be
+     "white" pixel above a saturation ceiling filters out the yellow-dash
+     false positives without touching genuine white detections - the same
+     HSV saturation signal that already separates yellow from concrete for
+     the yellow tracker, applied here as an exclusion instead of an
+     inclusion band.
 
 Yellow's detection, the continuity/shape/PID/sustained-loss machinery,
 and the overlay are all unchanged from lane_follower.py - only the things
@@ -127,7 +143,7 @@ def _shape_param(cfg, color_name, key, default):
     return getattr(cfg, key, default)
 
 
-def _adaptive_lab_mask(scan_line_rgb, k_std, min_std):
+def _adaptive_lab_mask(scan_line_rgb, k_std, min_std, max_saturation):
     '''
     Lighting-robust "brighter than the surrounding pavement" mask, used
     for white instead of a fixed absolute RGB threshold (see module
@@ -150,7 +166,17 @@ def _adaptive_lab_mask(scan_line_rgb, k_std, min_std):
     trustworthy to call "brighter than," so this returns an all-zero
     mask rather than manufacturing a threshold from noise.
 
-    input: scan_line_rgb, an RGB numpy array (one scan row's cropped band)
+    L-channel brightness alone can't tell a genuine white line from a
+    sunlit yellow dash (see module docstring point 3) - both are
+    "brighter than this frame's pavement." Real white paint and bare
+    pavement are both low-saturation, so any pixel that cleared the
+    brightness bar but is more saturated than max_saturation is dropped
+    from the mask - this is what actually excludes the yellow-dash false
+    positives without touching genuine white detections.
+
+    input: scan_line_rgb, an RGB numpy array (one scan row's cropped band);
+           max_saturation, HSV saturation (0-255) above which a pixel is
+           excluded even if it passed the brightness threshold
     output: mask, binary (0/255) uint8, same height/width as scan_line_rgb
     '''
     lab = cv2.cvtColor(scan_line_rgb, cv2.COLOR_RGB2LAB)
@@ -162,7 +188,12 @@ def _adaptive_lab_mask(scan_line_rgb, k_std, min_std):
         return np.zeros(l_channel.shape, dtype=np.uint8)
 
     threshold = mean + k_std * std
-    return np.where(l_channel >= threshold, 255, 0).astype(np.uint8)
+    mask = np.where(l_channel >= threshold, 255, 0).astype(np.uint8)
+
+    saturation = cv2.cvtColor(scan_line_rgb, cv2.COLOR_RGB2HSV)[:, :, 1]
+    mask[saturation > max_saturation] = 0
+
+    return mask
 
 
 class _LineTracker:
@@ -210,6 +241,13 @@ class _LineTracker:
         # Only used when color_space == 'LAB_ADAPTIVE'; see _adaptive_lab_mask.
         self.adaptive_k_std = _shape_param(cfg, color_name, 'ADAPTIVE_K_STD', 1.5)
         self.adaptive_min_std = _shape_param(cfg, color_name, 'ADAPTIVE_MIN_STD', 5.0)
+        # Conceptually this should track whatever YELLOW_HSV_THRESHOLD_LOW's
+        # saturation floor is calibrated to for the current lighting -
+        # anything less saturated than "counts as yellow paint" is
+        # presumed genuinely low-chroma (white paint or bare pavement).
+        # 60 here is just a generic fallback if myconfig doesn't set one;
+        # set ADAPTIVE_MAX_SATURATION explicitly to keep it in sync.
+        self.adaptive_max_saturation = _shape_param(cfg, color_name, 'ADAPTIVE_MAX_SATURATION', 60)
 
         self.max_jump_pixels = getattr(cfg, 'MAX_JUMP_PIXELS', 40)
         self.reacquire_after_frames = getattr(cfg, 'REACQUIRE_AFTER_FRAMES', 15)
@@ -230,7 +268,8 @@ class _LineTracker:
             scan_line = cv2.cvtColor(scan_line_rgb, cv2.COLOR_RGB2HSV)
             mask = cv2.inRange(scan_line, self.color_thr_low, self.color_thr_hi)
         elif self.color_space == 'LAB_ADAPTIVE':
-            mask = _adaptive_lab_mask(scan_line_rgb, self.adaptive_k_std, self.adaptive_min_std)
+            mask = _adaptive_lab_mask(scan_line_rgb, self.adaptive_k_std, self.adaptive_min_std,
+                                       self.adaptive_max_saturation)
         else:
             mask = cv2.inRange(scan_line_rgb, self.color_thr_low, self.color_thr_hi)
 
