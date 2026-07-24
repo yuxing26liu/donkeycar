@@ -136,6 +136,7 @@ class ObstacleAvoider:
         self._was_raw_detected = False
         self._frame_count = 0
         self._warned_no_lane_geometry = False
+        self._warned_no_cam_img = False
 
     def _open(self, mask):
         if self.morph_kernel_size > 1:
@@ -323,6 +324,14 @@ class ObstacleAvoider:
         output: steering, throttle (unchanged), cv_img, cone_detected
         '''
         if cam_img is None:
+            # cam/image_array not populated yet (e.g. camera part hasn't
+            # produced a frame this loop) - silent otherwise, which is
+            # indistinguishable from run_condition='run_pilot' skipping this
+            # part's run() entirely (see Vehicle.update_parts). Logged once,
+            # not every frame, since this is expected transiently at startup.
+            if not self._warned_no_cam_img:
+                logger.warning("[cone_tape] cam_img is None - cam/image_array not populated yet")
+                self._warned_no_cam_img = True
             return steering, throttle, cv_img, self.cone_detected
 
         band_rgb = cam_img[self.scan_y: self.scan_y + self.scan_height, :, :]
