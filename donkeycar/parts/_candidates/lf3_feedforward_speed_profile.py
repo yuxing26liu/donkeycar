@@ -1,95 +1,55 @@
 """
-lane_follower3.py
+lf3_feedforward_speed_profile.py
 
-Next-generation lane follower - built step by step on top of the lessons
-from lane_follower.py and lane_follower2.py (see CLAUDE.md's "Current
-focus" section and this project's memory notes for what those two
-established and where they hit a ceiling).
+Candidate variant, forked from lane_follower2.py with exactly one axis of
+change: the throttle/steering post-processing that runs after position is
+computed, in run(). Detection (yellow/white trackers, continuity gating,
+shape filter, LAB-adaptive white mask, glare guard) and the PID object itself
+are untouched, copied verbatim from lane_follower2.py.
 
-Built via an offline candidate-testing pass (2026-07-24): five single-variable
-strategy candidates were each implemented as an isolated diff from
-lane_follower2.py and scored against donkeycar/tools/tub_eval.py across all
-10 recorded tubs (autonomous runs at varied lighting + the two manually-driven
-"stay centered" ground-truth tubs), compared against a lane_follower2.py
-baseline. See donkeycar/parts/_candidates/ for the full set and their
-individual results.
+Motivation (targets raised from real-tub review): the existing throttle law
+is a binary step - full accel unless |error| crosses target_threshold, then
+full decel - which means the car spends most of a turn either flooring it
+right up to the moment it crosses the threshold, or being at throttle_min
+regardless of whether the error is barely over threshold or way over. This
+change replaces that with a continuous throttle *target* (throttle_max at
+zero error, linearly down to throttle_min once |error| >= a new
+LANE_THROTTLE_ERROR_SCALE_PX pixels) that the existing delta_th ramp moves
+toward every frame, same as before - so the ramp's smoothness is unchanged,
+only what it's ramping toward. A small error now nudges the target down
+slightly instead of nothing happening until the fixed threshold is crossed,
+and the target saturates at throttle_min instead of only implicitly bottoming
+out through repeated per-frame decrements.
 
-Merged into this file so far:
+Second, independent change: a steering feedforward term proportional to the
+frame-to-frame change in tracked lane-center position (position - previous
+position), added on top of the existing PID output before clamping to
+[-1, 1]. This is a cheap, fast-reacting proxy for "the lane center is moving
+right now, i.e. a curve is actively developing" - it responds one frame
+faster than the PID's own D-term, which only reacts after the smoothed
+position has already shifted enough to move the filtered error. The gain
+(LANE_STEERING_FEEDFORWARD_GAIN) is deliberately small in this starting
+value: it is meant to nudge the PID's decision earlier, not override or
+dominate it. Both new constants are starting estimates (see CFG_OVERRIDES),
+not calibrated against real footage yet.
 
-  1. Soft-saturating lateral error (from lf3_soft_saturating_error.py) -
-     targets "turns too tight / crosses lane boundary". The pixel error
-     handed to the steering PID is passed through k*tanh(error/k) instead of
-     fed raw. Small errors are numerically ~unchanged (tanh(x/k) ~= x/k near
-     zero); large errors (tight turns, post-loss reacquire snaps) compress
-     instead of growing linearly, so a big momentary error is less likely to
-     drive the PID's proportional term straight to full steering lock and
-     overshoot a boundary. Verified: full-lock-steering fraction dropped
-     roughly 10x worst-case (0.309 -> 0.026) across every one of the 10
-     tubs with zero regressions on any other metric (mean_abs_steering,
-     steering-vs-human-driving error on the two ground-truth tubs, sign-flip
-     rate, stopped fraction all flat or improved). k = LANE_ERROR_SATURATION_PX
-     (see myconfig.py), a starting estimate (~image_width/5), not yet
-     calibrated against real on-car turning behavior.
-
-Not yet merged - bugs found and fixed, but not yet good enough to adopt
-(see donkeycar/parts/_candidates/):
-
-  - boundary_margin_bias: an asymmetric steering bias meant to push away
-    from whichever lane edge is closer than a safety margin. First version
-    was a complete no-op - the two edge-margin correction terms cancel
-    exactly whenever LANE_SCAN_ROWS has only one row (today's config),
-    since position is then always exactly the primary row's midpoint.
-    Fixed (2026-07-24) to react to only the single nearer edge, verified
-    directly to now produce a real nonzero bias on real footage. Re-scored:
-    no regressions, but the effect is a small mixed wash (some tubs
-    marginally better, others marginally worse, all within tolerance) -
-    LANE_SAFETY_MARGIN_PX/LANE_MARGIN_BIAS_GAIN are still uncalibrated
-    starting guesses now that the mechanism actually works. Not adopted
-    yet - needs real tuning, not just a working mechanism, before it earns
-    a place in this file.
-  - kalman_position_tracker: replaces each line tracker's ad hoc
-    jump-gate/reacquire-frames/smoothing-alpha trio with a small
-    constant-velocity Kalman filter. First version regressed full-lock-
-    steering fraction on every tub uniformly - traced to the velocity term
-    accumulating from every detection's innovation with no decay or clamp.
-    Fixed (2026-07-24) with a velocity decay term and a hard magnitude
-    clamp, verified velocity no longer grows unbounded. Re-scored: the
-    worst-hit tub (two_outer_laps) improved dramatically (full-lock
-    30.9% -> 16.4%), but full-lock fraction still regressed on 5 of the
-    other 9 tubs - a more fundamental tuning issue (the constant-velocity
-    model likely overshooting through real curves) rather than the single
-    bug that's now fixed. Not adopted - needs real tuning work on the
-    process/measurement variance and velocity-gain-factor constants, not
-    further blind iteration on this offline dataset alone.
-
-Also tested, not yet merged (works, no regressions, but held back so this
-file's first on-car test isolates one change at a time rather than combining
-two behavioral changes before either has been driven):
-
-  - feedforward_speed_profile: continuous (not binary) throttle-vs-error law
-    plus a small steering feedforward term proportional to the lane-center's
-    frame-to-frame rate of change. Reduced full-lock fraction similarly to
-    the soft-saturating-error change, but raised sign-flip rate (steering
-    direction changes) on 7 of 9 non-ground-truth tubs - a plausible side
-    effect of the feedforward term amplifying detection jitter. Stayed
-    within the harness's regression tolerance everywhere, but worth its own
-    isolated on-car check given this project's known PID-wobble history,
-    rather than folding it in alongside the soft-saturating-error change.
-  - joint_edge_selection: jointly selects the (yellow, white) blob pair by
-    lane-width plausibility instead of each color picking independently.
-    Not shown to help OR hurt - the joint-selection condition (both colors
-    having a shape-passing candidate simultaneously on the primary row)
-    rarely triggers on this tub set, so it's essentially untested rather
-    than validated.
+Everything else - white's LAB_ADAPTIVE mask, the glare/overexposure guard,
+the saturation ceiling, multi-row curve lookahead, lane-width estimation,
+the lost-lane decay behavior - is identical to lane_follower2.py; see that
+file's module docstring for the rationale behind those.
 """
 
 import logging
-import math
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+CFG_OVERRIDES = {
+    "LANE_THROTTLE_ERROR_SCALE_PX": 60,
+    "LANE_STEERING_FEEDFORWARD_GAIN": 0.01,
+}
 
 
 def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag=None, preferred_x=None):
@@ -298,21 +258,21 @@ class _LineTracker:
         self.min_aspect_ratio = _shape_param(cfg, color_name, 'MIN_LINE_ASPECT_RATIO', 0.10)
         self.morph_kernel_size = getattr(cfg, 'MORPH_KERNEL_SIZE', 3)
 
-        # Glare/overexposure guard: a mask matching more than this fraction
-        # of the whole scan band is rejected outright as unreliable rather
-        # than handed to the shape filter - see module docstring's point 2.
-        # 0.25 is a starting guess (a real thin line should never come close
-        # to a quarter of the band), not a calibration - watch how often
-        # this actually fires on real footage.
+        # Glare/overexposure guard (new in this file): a mask matching more
+        # than this fraction of the whole scan band is rejected outright as
+        # unreliable rather than handed to the shape filter - see module
+        # docstring's point 2. 0.25 is a starting guess (a real thin line
+        # should never come close to a quarter of the band), not a
+        # calibration - watch how often this actually fires on real footage.
         self.max_mask_fraction = _shape_param(cfg, color_name, 'MAX_MASK_FRACTION', 0.25)
 
         # Only used when color_space == 'LAB_ADAPTIVE'; see _adaptive_lab_mask.
         self.adaptive_k_std = _shape_param(cfg, color_name, 'ADAPTIVE_K_STD', 1.5)
         self.adaptive_min_std = _shape_param(cfg, color_name, 'ADAPTIVE_MIN_STD', 5.0)
-        # Rejects a band whose L-channel stddev is implausibly high - not
-        # "some contrast to threshold against" but "this band spans two
-        # different lighting conditions" (see module docstring point 4 and
-        # _adaptive_lab_mask). Calibrated across tub_4/8/9/11/13/16/25:
+        # New: rejects a band whose L-channel stddev is implausibly high -
+        # not "some contrast to threshold against" but "this band spans
+        # two different lighting conditions" (see module docstring point
+        # 4 and _adaptive_lab_mask). Calibrated across tub_4/8/9/11/13/16/25:
         # normal bands run ~16-20 stddev, with occasional legitimate spikes
         # into the 30s-40s; tub_16 and tub_25 (the two tubs with a real
         # shadow/sun split within the band) average 30-50 with a long tail
@@ -329,7 +289,7 @@ class _LineTracker:
         # set ADAPTIVE_MAX_SATURATION explicitly to keep it in sync.
         self.adaptive_max_saturation = _shape_param(cfg, color_name, 'ADAPTIVE_MAX_SATURATION', 60)
 
-        # Optional CLAHE contrast normalization before the adaptive
+        # New: optional CLAHE contrast normalization before the adaptive
         # threshold math (see module docstring point 4). Off by default -
         # the min/max std guards above are the load-bearing fix; this is
         # a complementary, more ambitious attempt to reduce how often a
@@ -427,8 +387,12 @@ class _LineTracker:
 
 class LaneFollower:
     '''
-    OpenCV based lane-keeping controller - see this module's docstring for
-    the changelog of what's been merged into this file vs. lane_follower2.py.
+    OpenCV based lane-keeping controller - candidate fork of lane_follower2.py
+    exploring a continuous throttle law plus a steering feedforward term (see
+    module docstring). Detection (multi-row scan, yellow HSV / white
+    LAB_ADAPTIVE trackers, continuity/shape/PID/sustained-loss machinery, and
+    the overlay) is unchanged from lane_follower2.py; only the throttle/
+    steering post-processing in run() differs.
 
     LineFollower tracks one line with one horizontal scan row and one PID loop.
     This class instead tracks the pair of lines that bound a lane - a solid
@@ -441,8 +405,8 @@ class LaneFollower:
     Yellow uses HSV (on-car testing showed the dashed line and this track's
     plain concrete surface are nearly the same RGB triplet under overcast
     light and only really separate on saturation). White uses the
-    LAB_ADAPTIVE mode (see _adaptive_lab_mask) instead of a fixed RGB
-    threshold.
+    LAB_ADAPTIVE mode (see _adaptive_lab_mask) instead of lane_follower.py's
+    fixed RGB threshold.
 
     When only one line is visible (e.g. the dashed line is mid-gap, or the
     solid line briefly leaves the scan band on a curve), the lane center is
@@ -451,15 +415,10 @@ class LaneFollower:
     smoothed off the primary scan row whenever both lines are visible
     together).
 
-    New in this file (see module docstring): the lateral pixel error handed
-    to the steering PID is soft-saturated (k*tanh(error/k)) instead of fed
-    raw, to reduce full-steering-lock overshoot on large momentary errors.
-
-    Drop-in replacement for LineFollower (or lane_follower.py's/
-    lane_follower2.py's LaneFollower): same constructor signature (pid, cfg).
-    run(cam_img) returns a 6-tuple - (steering, throttle, image, yellow_x,
-    white_x, lane_width_px) - matching lane_follower.py's
-    CV_CONTROLLER_OUTPUTS.
+    Drop-in replacement for LineFollower (or lane_follower.py's
+    LaneFollower): same constructor signature (pid, cfg). run(cam_img)
+    returns a 6-tuple - (steering, throttle, image, yellow_x, white_x,
+    lane_width_px) - matching lane_follower.py's CV_CONTROLLER_OUTPUTS.
     '''
 
     def __init__(self, pid, cfg):
@@ -491,18 +450,28 @@ class LaneFollower:
         self.target_pixel = getattr(cfg, 'LANE_TARGET_PIXEL', None)
         self.target_threshold = getattr(cfg, 'LANE_TARGET_THRESHOLD', 10)
 
-        # The lateral pixel error (position - target_pixel) is soft-clipped
-        # through k*tanh(error/k) before being handed to the PID, where k is
-        # this value (see module docstring). 80px is a starting estimate
-        # (~image_width/5 for a 426px-wide frame), not a calibrated constant -
-        # watch real turning behavior on the car before trusting it further.
-        self.error_saturation_px = getattr(cfg, 'LANE_ERROR_SATURATION_PX', 80)
-
         self.steering = 0.0  # from -1 to 1
         self.throttle = cfg.THROTTLE_INITIAL  # from -1 to 1
         self.delta_th = cfg.THROTTLE_STEP
         self.throttle_max = cfg.THROTTLE_MAX
         self.throttle_min = cfg.THROTTLE_MIN
+
+        # New (this candidate): continuous throttle-target law replaces the
+        # old binary threshold - see module docstring. This is the pixel
+        # error at which the throttle target bottoms out at throttle_min;
+        # 60px is a starting estimate (roughly 6x the old 10px
+        # LANE_TARGET_THRESHOLD - deliberately wider so throttle eases down
+        # gradually rather than slamming to throttle_min right after crossing
+        # the old, much tighter, threshold), not yet calibrated against real
+        # tub footage.
+        self.throttle_error_scale_px = getattr(cfg, 'LANE_THROTTLE_ERROR_SCALE_PX', 60)
+        # New (this candidate): steering feedforward gain - see module
+        # docstring. Deliberately small/conservative: meant to nudge the PID
+        # term earlier in a developing curve, not dominate or replace it.
+        # 0.01 is a starting estimate, not yet calibrated against real tub
+        # footage.
+        self.steering_feedforward_gain = getattr(cfg, 'LANE_STEERING_FEEDFORWARD_GAIN', 0.01)
+        self._prev_position = None
 
         self.max_lost_frames = getattr(cfg, 'MAX_LOST_FRAMES', 40)
         self.lost_steering_decay = getattr(cfg, 'LOST_STEERING_DECAY', 0.85)
@@ -611,24 +580,30 @@ class LaneFollower:
             # before the near row's detection would otherwise catch it
             position = sum(c * w for c, w in zip(row_centers, row_weights)) / sum(row_weights)
 
-            # Soft-saturate the lateral error before handing it to the PID
-            # (see module docstring): for small errors this is numerically
-            # ~identical to using position directly (tanh(x/k) ~= x/k near
-            # 0), but large errors are compressed instead of growing
-            # linearly, so a big momentary error is less likely to drive
-            # the proportional term straight to full steering lock.
-            error_px = position - self.target_pixel
-            k = self.error_saturation_px
-            soft_error_px = k * math.tanh(error_px / k)
-            pid_input = self.target_pixel + soft_error_px
-            self.steering = self.pid_st(pid_input)
+            # Steering feedforward (new in this candidate - see module
+            # docstring): a cheap, one-frame-faster proxy for "the lane
+            # center is moving right now" than the PID's own D-term, added
+            # on top of the PID output before clamping. Deliberately small
+            # gain - meant to nudge, not dominate.
+            feedforward = 0.0
+            if self._prev_position is not None:
+                feedforward = self.steering_feedforward_gain * (position - self._prev_position)
+            self.steering = self.pid_st(position)
+            self.steering = max(-1.0, min(1.0, self.steering + feedforward))
+            self._prev_position = position
 
-            if abs(position - self.target_pixel) > self.target_threshold:
-                # turning - slow down
-                self.throttle = max(self.throttle - self.delta_th, self.throttle_min)
+            # Continuous throttle-target law (new in this candidate - see
+            # module docstring): replaces the old binary
+            # "over/under target_threshold" step with a target that scales
+            # linearly from throttle_max (zero error) down to throttle_min
+            # (error >= throttle_error_scale_px), which the existing
+            # delta_th ramp moves toward every frame exactly as before.
+            error_fraction = min(abs(position - self.target_pixel) / self.throttle_error_scale_px, 1.0)
+            throttle_target = self.throttle_max - (self.throttle_max - self.throttle_min) * error_fraction
+            if self.throttle < throttle_target:
+                self.throttle = min(self.throttle + self.delta_th, throttle_target)
             else:
-                # straight - speed up
-                self.throttle = min(self.throttle + self.delta_th, self.throttle_max)
+                self.throttle = max(self.throttle - self.delta_th, throttle_target)
         else:
             # neither line visible in any scan row this frame - a genuine
             # loss, not just the dashed line's expected per-frame gap (that's

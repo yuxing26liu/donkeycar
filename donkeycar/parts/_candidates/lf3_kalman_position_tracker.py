@@ -1,95 +1,75 @@
 """
-lane_follower3.py
+lf3_kalman_position_tracker.py
 
-Next-generation lane follower - built step by step on top of the lessons
-from lane_follower.py and lane_follower2.py (see CLAUDE.md's "Current
-focus" section and this project's memory notes for what those two
-established and where they hit a ceiling).
+Single-variable candidate forked from lane_follower2.py. The color masking
+(_adaptive_lab_mask), blob selection/shape-filter (_select_line_blob), PID
+loop, lane-center geometry, and overlay are byte-for-byte unchanged - the
+only thing that changes is how _LineTracker turns this frame's raw blob
+pick into the position handed to the PID: the old ad hoc trio (a fixed
+max-pixel-jump gate, a hard reacquire-after-N-frames cutover, and a fixed
+exponential-smoothing blend) is replaced with a constant-velocity 1D Kalman
+filter (state = [position, velocity]).
 
-Built via an offline candidate-testing pass (2026-07-24): five single-variable
-strategy candidates were each implemented as an isolated diff from
-lane_follower2.py and scored against donkeycar/tools/tub_eval.py across all
-10 recorded tubs (autonomous runs at varied lighting + the two manually-driven
-"stay centered" ground-truth tubs), compared against a lane_follower2.py
-baseline. See donkeycar/parts/_candidates/ for the full set and their
-individual results.
+Why: the old scheme freezes at the last smoothed position during a gap
+(dashed-line miss, momentary occlusion, a rejected jump) and then either
+waits for the next raw pick to be close enough or, after
+REACQUIRE_AFTER_FRAMES, snaps hard onto whatever the strongest candidate
+is - both are blind to the fact that the line was very likely still moving
+during the gap (e.g. mid-turn). A constant-velocity Kalman filter carries
+the last known velocity forward through a gap (dead reckoning) instead of
+freezing, which should track a moving line through a dashed-line gap more
+smoothly, and uses the same predicted position (not a stale fixed value)
+as the proximity anchor for _select_line_blob's tiebreak, so continuity
+gating and reacquisition emerge from the filter's own uncertainty growth
+rather than a separate fixed-pixel gate. This is expected to help
+lighting-robustness indirectly too: a real detection dropout (e.g. white
+collapsing at dusk, see lane_follower2.py's docstring) now degrades into
+smooth extrapolation rather than a frozen value or a wrong hard snap.
 
-Merged into this file so far:
+REACQUIRE_AFTER_FRAMES is kept with its original meaning (a sustained-loss
+cutover), but the mechanism changes: instead of "next raw pick wins no
+matter how far", a sustained loss now resets the filter entirely (state
+back to None/cold-start) so an extrapolating filter doesn't keep
+confidently projecting a stale velocity further and further from reality -
+the same "don't trust a value blindly forever" intent as before, just
+implemented as a hard reset instead of a gate relaxation.
 
-  1. Soft-saturating lateral error (from lf3_soft_saturating_error.py) -
-     targets "turns too tight / crosses lane boundary". The pixel error
-     handed to the steering PID is passed through k*tanh(error/k) instead of
-     fed raw. Small errors are numerically ~unchanged (tanh(x/k) ~= x/k near
-     zero); large errors (tight turns, post-loss reacquire snaps) compress
-     instead of growing linearly, so a big momentary error is less likely to
-     drive the PID's proportional term straight to full steering lock and
-     overshoot a boundary. Verified: full-lock-steering fraction dropped
-     roughly 10x worst-case (0.309 -> 0.026) across every one of the 10
-     tubs with zero regressions on any other metric (mean_abs_steering,
-     steering-vs-human-driving error on the two ground-truth tubs, sign-flip
-     rate, stopped fraction all flat or improved). k = LANE_ERROR_SATURATION_PX
-     (see myconfig.py), a starting estimate (~image_width/5), not yet
-     calibrated against real on-car turning behavior.
+measurement_variance and process_variance (CFG_OVERRIDES below) are
+per-color configurable via the same _shape_param convention as every other
+per-color override in this file (e.g. YELLOW_KALMAN_MEASUREMENT_VAR
+overrides KALMAN_MEASUREMENT_VAR for the yellow tracker only). The
+defaults (process variance 4.0, well below measurement variance 25.0) bias
+the filter toward trusting the constant-velocity motion model between
+frames over any single raw measurement - appropriate for a position that
+is expected to move smoothly frame-to-frame rather than jump. These are
+unvalidated starting guesses carried over verbatim from the design spec,
+not a calibration - re-tune against real tub footage before trusting them.
 
-Not yet merged - bugs found and fixed, but not yet good enough to adopt
-(see donkeycar/parts/_candidates/):
-
-  - boundary_margin_bias: an asymmetric steering bias meant to push away
-    from whichever lane edge is closer than a safety margin. First version
-    was a complete no-op - the two edge-margin correction terms cancel
-    exactly whenever LANE_SCAN_ROWS has only one row (today's config),
-    since position is then always exactly the primary row's midpoint.
-    Fixed (2026-07-24) to react to only the single nearer edge, verified
-    directly to now produce a real nonzero bias on real footage. Re-scored:
-    no regressions, but the effect is a small mixed wash (some tubs
-    marginally better, others marginally worse, all within tolerance) -
-    LANE_SAFETY_MARGIN_PX/LANE_MARGIN_BIAS_GAIN are still uncalibrated
-    starting guesses now that the mechanism actually works. Not adopted
-    yet - needs real tuning, not just a working mechanism, before it earns
-    a place in this file.
-  - kalman_position_tracker: replaces each line tracker's ad hoc
-    jump-gate/reacquire-frames/smoothing-alpha trio with a small
-    constant-velocity Kalman filter. First version regressed full-lock-
-    steering fraction on every tub uniformly - traced to the velocity term
-    accumulating from every detection's innovation with no decay or clamp.
-    Fixed (2026-07-24) with a velocity decay term and a hard magnitude
-    clamp, verified velocity no longer grows unbounded. Re-scored: the
-    worst-hit tub (two_outer_laps) improved dramatically (full-lock
-    30.9% -> 16.4%), but full-lock fraction still regressed on 5 of the
-    other 9 tubs - a more fundamental tuning issue (the constant-velocity
-    model likely overshooting through real curves) rather than the single
-    bug that's now fixed. Not adopted - needs real tuning work on the
-    process/measurement variance and velocity-gain-factor constants, not
-    further blind iteration on this offline dataset alone.
-
-Also tested, not yet merged (works, no regressions, but held back so this
-file's first on-car test isolates one change at a time rather than combining
-two behavioral changes before either has been driven):
-
-  - feedforward_speed_profile: continuous (not binary) throttle-vs-error law
-    plus a small steering feedforward term proportional to the lane-center's
-    frame-to-frame rate of change. Reduced full-lock fraction similarly to
-    the soft-saturating-error change, but raised sign-flip rate (steering
-    direction changes) on 7 of 9 non-ground-truth tubs - a plausible side
-    effect of the feedforward term amplifying detection jitter. Stayed
-    within the harness's regression tolerance everywhere, but worth its own
-    isolated on-car check given this project's known PID-wobble history,
-    rather than folding it in alongside the soft-saturating-error change.
-  - joint_edge_selection: jointly selects the (yellow, white) blob pair by
-    lane-width plausibility instead of each color picking independently.
-    Not shown to help OR hurt - the joint-selection condition (both colors
-    having a shape-passing candidate simultaneously on the primary row)
-    rarely triggers on this tub set, so it's essentially untested rather
-    than validated.
+FIX (2026-07-24, after initial offline scoring): the first version had no
+decay or bound on the velocity state - it accumulated from every
+detection's innovation indefinitely. Measured effect: full-lock-steering
+fraction roughly doubled on every one of the 10 test tubs uniformly
+(independent of lighting/curve content), the signature of a runaway state
+variable rather than a strategy that simply underperformed. Added
+KALMAN_VELOCITY_DECAY (velocity shrinks each predict step absent a
+corroborating measurement, instead of persisting through a gap
+indefinitely) and KALMAN_MAX_VELOCITY_PX (a hard clamp against one large
+innovation setting an implausible velocity outright) - see _LineTracker's
+__init__/update for the exact mechanism.
 """
 
 import logging
-import math
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+CFG_OVERRIDES = {
+    "KALMAN_PROCESS_VAR": 4.0,
+    "KALMAN_MEASUREMENT_VAR": 25.0,
+}
 
 
 def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag=None, preferred_x=None):
@@ -113,11 +93,12 @@ def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag
     area, for 16 consecutive frames, before the tracker gave up waiting for a
     close-enough candidate and snapped hard to whatever was biggest by then -
     a full steering-lock swerve. Preferring proximity to the last tracked
-    position (passed in by the caller, typically _LineTracker.tracked_position)
-    picks the correct blob directly instead of relying on the continuity gate
-    to reject the wrong one after the fact - it doesn't reduce false positives
-    within a single blob, it fixes *choosing between two true positives*, which
-    the area rule was never meant to arbitrate.
+    position (passed in by the caller, typically the Kalman filter's predicted
+    position - see _LineTracker.update below) picks the correct blob directly
+    instead of relying on the continuity gate to reject the wrong one after
+    the fact - it doesn't reduce false positives within a single blob, it
+    fixes *choosing between two true positives*, which the area rule was
+    never meant to arbitrate.
 
     input: mask, binary (0/255) uint8 image; log_tag, optional label (e.g. color
            name) used to identify which tracker a rejection log line came from;
@@ -195,48 +176,32 @@ def _shape_param(cfg, color_name, key, default):
 def _adaptive_lab_mask(scan_line_rgb, k_std, min_std, max_std, max_saturation, clahe=None):
     '''
     Lighting-robust "brighter than the surrounding pavement" mask, used
-    for white instead of a fixed absolute RGB threshold (see module
-    docstring for why: tub_9_26-07-22 showed the fixed threshold
-    collapse to 0% hit-rate for multi-second stretches as shadows fell).
+    for white instead of a fixed absolute RGB threshold (see
+    lane_follower2.py's module docstring for why: tub_9_26-07-22 showed the
+    fixed threshold collapse to 0% hit-rate for multi-second stretches as
+    shadows fell). Unchanged from lane_follower2.py - this candidate only
+    touches _LineTracker's continuity/smoothing logic, not color masking.
 
     Works in LAB's L channel (perceptual lightness - more shadow/
     highlight-invariant than raw RGB per-channel values) and thresholds
     relative to *this frame's own* scan-band brightness rather than a
-    constant: mean + k_std * stddev. That self-adjusts across both a
-    slow sunset fade and the faster shaded/sunlit swings a single lap
-    can have (tub_9's scan-band brightness bounced between ~80 and ~170
-    multiple times in one session, not a single monotonic fade - a
-    fixed threshold re-tuned for "evening" would still fail part of
-    that same lap).
+    constant: mean + k_std * stddev.
 
-    A near-uniform band (stddev below min_std - e.g. deep uniform
-    shadow, or a blown-out overexposed patch) has no reliable local
-    contrast to threshold against; below that floor there's nothing
-    trustworthy to call "brighter than," so this returns an all-zero
-    mask rather than manufacturing a threshold from noise. Symmetrically,
-    a band with stddev *above* max_std (see module docstring point 4) is
-    just as untrustworthy in the other direction - not "one lighting
-    condition with some contrast," but two different lighting conditions
-    (e.g. a hard shadow/sun boundary crossing the band), where "brighter
-    than this band's own mean" picks out sunlit bare pavement rather than
-    the real, shaded paint. Confirmed on tub_25_26-07-23: normal bands
-    run ~16-20 stddev; shadow/sun-split bands hit 55-65+.
+    A near-uniform band (stddev below min_std) has no reliable local
+    contrast to threshold against, so this returns an all-zero mask.
+    Symmetrically, a band with stddev above max_std is untrustworthy in
+    the other direction - not one lighting condition with some contrast,
+    but two different lighting conditions (e.g. a hard shadow/sun boundary
+    crossing the band).
 
     If clahe is given (an OpenCV CLAHE object), it's applied to the L
-    channel before any of the above - locally renormalizing contrast in
-    tiles across the band so a large-scale brightness gradient (like a
-    shadow/sun split) doesn't dominate the whole-band mean/std the way it
-    otherwise would, in principle letting real paint-vs-pavement contrast
-    stand out relative to its own local neighborhood on both sides of the
-    split rather than only the globally brightest region winning.
+    channel before any of the above.
 
     L-channel brightness alone can't tell a genuine white line from a
-    sunlit yellow dash (see module docstring point 3) - both are
-    "brighter than this frame's pavement." Real white paint and bare
-    pavement are both low-saturation, so any pixel that cleared the
-    brightness bar but is more saturated than max_saturation is dropped
-    from the mask - this is what actually excludes the yellow-dash false
-    positives without touching genuine white detections.
+    sunlit yellow dash - both are "brighter than this frame's pavement."
+    Real white paint and bare pavement are both low-saturation, so any
+    pixel that cleared the brightness bar but is more saturated than
+    max_saturation is dropped from the mask.
 
     input: scan_line_rgb, an RGB numpy array (one scan row's cropped band);
            max_saturation, HSV saturation (0-255) above which a pixel is
@@ -266,28 +231,40 @@ def _adaptive_lab_mask(scan_line_rgb, k_std, min_std, max_std, max_saturation, c
 
 class _LineTracker:
     '''
-    Per-color, per-scan-row line detector with continuity tracking and smoothing.
+    Per-color, per-scan-row line detector with continuity tracking, now via
+    a constant-velocity Kalman filter (state = [position, velocity]) instead
+    of lane_follower2.py's fixed-jump-gate + reacquire-frames +
+    exponential-smoothing trio. Color masking (_adaptive_lab_mask) and blob
+    selection (_select_line_blob) are unchanged - ported straight from
+    lane_follower2.py.
 
-    Combines two techniques ported from unmerged teammate branches (see
-    LaneFollower's docstring below for why): BetterLineFollower's connected-component
-    blob-shape filter (_select_line_blob) picks a single best line-shaped blob each
-    frame; RobustLineFollower's continuity gating - prefer the candidate nearest the
-    last tracked position, drop the gate and re-acquire on the strongest candidate
-    after a sustained loss - plus exponential smoothing make that per-frame pick
-    stable enough for a *dashed* line, whose blob disappears every other frame by
-    design and would otherwise look identical to a genuine loss.
+    Each frame: predict (position += velocity, uncertainty grows by
+    process_variance), then either correct against this frame's raw blob
+    pick (if one passed the shape filter) or, on a miss, just keep the
+    predicted state - dead reckoning through a gap using the last known
+    velocity, rather than freezing at the last smoothed value the way fixed
+    exponential smoothing does. The predicted position (not a fixed last
+    value) is what _select_line_blob uses as its proximity anchor, so the
+    same continuity-tiebreak behavior lane_follower2.py relied on
+    (tub_31_26-07-24) still works, just anchored to a filter's best current
+    guess of where the line is *now* instead of where it last was.
 
-    color_space adds a third mode over lane_follower.py's 'RGB'/'HSV':
-    'LAB_ADAPTIVE' (see _adaptive_lab_mask) - used for white in this file.
+    REACQUIRE_AFTER_FRAMES keeps its original meaning (give up on a
+    sustained loss) but the mechanism is a full filter reset - state back
+    to cold-start (position=None, velocity=0) - rather than relaxing the
+    jump gate, since letting a constant-velocity filter keep extrapolating
+    indefinitely through a real, prolonged loss would just confidently
+    project the position further and further from reality with no
+    correcting signal.
     '''
 
     def __init__(self, color_low, color_high, cfg, color_name=None, color_space='RGB'):
         self.color_thr_low = np.asarray(color_low)
         self.color_thr_hi = np.asarray(color_high)
         self.color_name = color_name  # only used to tag debug log lines
-        # 'RGB' (default), 'HSV', or 'LAB_ADAPTIVE' (see module docstring).
-        # color_thr_low/high are unused in LAB_ADAPTIVE mode - the threshold
-        # is computed fresh per frame instead.
+        # 'RGB' (default), 'HSV', or 'LAB_ADAPTIVE' (see lane_follower2.py's
+        # module docstring). color_thr_low/high are unused in LAB_ADAPTIVE
+        # mode - the threshold is computed fresh per frame instead.
         self.color_space = color_space
 
         self.min_area_px = _shape_param(cfg, color_name, 'MIN_LINE_AREA_PX', 150)
@@ -298,43 +275,18 @@ class _LineTracker:
         self.min_aspect_ratio = _shape_param(cfg, color_name, 'MIN_LINE_ASPECT_RATIO', 0.10)
         self.morph_kernel_size = getattr(cfg, 'MORPH_KERNEL_SIZE', 3)
 
-        # Glare/overexposure guard: a mask matching more than this fraction
-        # of the whole scan band is rejected outright as unreliable rather
-        # than handed to the shape filter - see module docstring's point 2.
-        # 0.25 is a starting guess (a real thin line should never come close
-        # to a quarter of the band), not a calibration - watch how often
-        # this actually fires on real footage.
+        # Glare/overexposure guard (unchanged from lane_follower2.py): a mask
+        # matching more than this fraction of the whole scan band is
+        # rejected outright as unreliable rather than handed to the shape
+        # filter. 0.25 is a starting guess, not a calibration.
         self.max_mask_fraction = _shape_param(cfg, color_name, 'MAX_MASK_FRACTION', 0.25)
 
         # Only used when color_space == 'LAB_ADAPTIVE'; see _adaptive_lab_mask.
         self.adaptive_k_std = _shape_param(cfg, color_name, 'ADAPTIVE_K_STD', 1.5)
         self.adaptive_min_std = _shape_param(cfg, color_name, 'ADAPTIVE_MIN_STD', 5.0)
-        # Rejects a band whose L-channel stddev is implausibly high - not
-        # "some contrast to threshold against" but "this band spans two
-        # different lighting conditions" (see module docstring point 4 and
-        # _adaptive_lab_mask). Calibrated across tub_4/8/9/11/13/16/25:
-        # normal bands run ~16-20 stddev, with occasional legitimate spikes
-        # into the 30s-40s; tub_16 and tub_25 (the two tubs with a real
-        # shadow/sun split within the band) average 30-50 with a long tail
-        # to 70+. 50 sits above the normal tubs' occasional legitimate
-        # spikes (p99 up to ~58 on tub_9) but well below where a genuine
-        # split-lighting band sits - re-check against new tubs before
-        # assuming this is final, it's from one round of calibration.
         self.adaptive_max_std = _shape_param(cfg, color_name, 'ADAPTIVE_MAX_STD', 50.0)
-        # Conceptually this should track whatever YELLOW_HSV_THRESHOLD_LOW's
-        # saturation floor is calibrated to for the current lighting -
-        # anything less saturated than "counts as yellow paint" is
-        # presumed genuinely low-chroma (white paint or bare pavement).
-        # 60 here is just a generic fallback if myconfig doesn't set one;
-        # set ADAPTIVE_MAX_SATURATION explicitly to keep it in sync.
         self.adaptive_max_saturation = _shape_param(cfg, color_name, 'ADAPTIVE_MAX_SATURATION', 60)
 
-        # Optional CLAHE contrast normalization before the adaptive
-        # threshold math (see module docstring point 4). Off by default -
-        # the min/max std guards above are the load-bearing fix; this is
-        # a complementary, more ambitious attempt to reduce how often a
-        # band's stats are split-lighting-contaminated in the first place.
-        # Only relevant in LAB_ADAPTIVE mode.
         self.use_clahe = _shape_param(cfg, color_name, 'ADAPTIVE_USE_CLAHE', False)
         self.clahe = None
         if self.use_clahe and color_space == 'LAB_ADAPTIVE':
@@ -342,20 +294,70 @@ class _LineTracker:
             tile_grid = _shape_param(cfg, color_name, 'ADAPTIVE_CLAHE_TILE_GRID', (8, 1))
             self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tuple(tile_grid))
 
-        self.max_jump_pixels = getattr(cfg, 'MAX_JUMP_PIXELS', 40)
+        # Kept with its original meaning - see class docstring for how the
+        # mechanism (full filter reset, not jump-gate relaxation) differs.
         self.reacquire_after_frames = getattr(cfg, 'REACQUIRE_AFTER_FRAMES', 15)
-        self.smoothing_alpha = getattr(cfg, 'POSITION_SMOOTHING_ALPHA', 0.4)
 
-        self.tracked_position = None
-        self.smoothed_position = None
+        # Kalman filter tuning, per-color overridable via the same
+        # _shape_param convention as everything else in this file (e.g.
+        # YELLOW_KALMAN_MEASUREMENT_VAR). See module docstring: process
+        # variance well below measurement variance biases the filter
+        # toward trusting the constant-velocity motion model between
+        # frames over any single noisy measurement - unvalidated starting
+        # guesses, not a calibration.
+        self.process_variance = _shape_param(cfg, color_name, 'KALMAN_PROCESS_VAR', 4.0)
+        self.measurement_variance = _shape_param(cfg, color_name, 'KALMAN_MEASUREMENT_VAR', 25.0)
+
+        # Simplified joint position/velocity correction: rather than
+        # deriving the full 2x2 covariance cross-terms, the velocity
+        # correction uses the same innovation and position Kalman gain but
+        # damped by this fixed fraction, so a single noisy measurement
+        # nudges the velocity estimate without letting it overshoot on
+        # that measurement alone. Not per-color configurable - this is a
+        # simplification-of-mechanism constant, not a tuning knob callers
+        # are expected to need to touch per color.
+        self.velocity_gain_factor = 0.5
+
+        # FIX (2026-07-24, after initial offline scoring): the first version
+        # had no decay or bound on velocity at all, so one ambiguous
+        # detection's innovation could leave the filter dead-reckoning
+        # further off-track on every subsequent miss instead of settling
+        # back toward the raw detections - measured directly: full-lock
+        # steering frequency roughly doubled on every one of 10 tubs
+        # uniformly (not just curve-heavy or low-light ones), which is the
+        # signature of a runaway state variable, not a strategy that simply
+        # didn't help. Two independent safety nets, both conservative
+        # starting guesses:
+        #   - velocity_decay: each predict step multiplies the carried-
+        #     forward velocity by this factor (<1), so an unconfirmed
+        #     velocity estimate bleeds back toward zero over a gap instead
+        #     of being trusted indefinitely - only a real, repeated
+        #     measurement (the correction step below) can sustain a
+        #     nonzero velocity.
+        #   - max_velocity_px: a hard clamp, independent of decay, so a
+        #     single large innovation (e.g. a brief misidentified blob)
+        #     can't set a velocity so large that even one predict step
+        #     shoots the position implausibly far.
+        self.velocity_decay = _shape_param(cfg, color_name, 'KALMAN_VELOCITY_DECAY', 0.8)
+        self.max_velocity_px = _shape_param(cfg, color_name, 'KALMAN_MAX_VELOCITY_PX', 15.0)
+
+        # Kalman filter state: None means cold-start (no track yet, or just
+        # reset after a sustained loss) - mirrors the old
+        # tracked_position/smoothed_position both starting at None.
+        self.position = None
+        self.velocity = 0.0
+        self.variance_position = None
         self.lost_frames = 0
-        self.just_reacquired = False
 
     def update(self, scan_line_rgb):
         '''
         input: scan_line_rgb, an RGB numpy array (one scan row's cropped band)
-        output: (smoothed_x, mask) if a plausible line was found this frame,
-                 else (None, mask)
+        output: (position, mask) - position is the Kalman filter's current
+                position estimate (predicted-through-gap if this frame had
+                no detection, corrected-by-measurement if it did), or None
+                if the filter is cold (no detection yet, or since the last
+                sustained-loss reset); mask is always returned for the
+                overlay regardless of detection status
         '''
         if self.color_space == 'HSV':
             scan_line = cv2.cvtColor(scan_line_rgb, cv2.COLOR_RGB2HSV)
@@ -371,64 +373,106 @@ class _LineTracker:
             kernel = np.ones((self.morph_kernel_size, self.morph_kernel_size), np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-        # Glare/overexposure guard - see __init__ comment and module
-        # docstring point 2. Checked here, before blob selection, since a
-        # diffuse frame-filling false positive isn't guaranteed to get
-        # broken into shape-filter-rejectable pieces by morphology alone.
+        # Kalman predict step, every frame. A cold-started tracker
+        # (self.position is None) has no state to predict from yet - it
+        # waits for a first detection to initialize on, same as the old
+        # tracked_position/smoothed_position pair starting at None.
+        if self.position is not None:
+            predicted_position = self.position + self.velocity
+            # Decay, not carry-forward - see __init__ comment on
+            # velocity_decay/max_velocity_px: an unconfirmed velocity
+            # estimate should bleed toward zero absent a corroborating
+            # measurement, not persist indefinitely.
+            predicted_velocity = self.velocity * self.velocity_decay
+            predicted_variance = self.variance_position + self.process_variance
+        else:
+            predicted_position = None
+            predicted_velocity = 0.0
+            predicted_variance = None
+
+        # Glare/overexposure guard - see __init__ comment. Checked here,
+        # before blob selection, since a diffuse frame-filling false
+        # positive isn't guaranteed to get broken into shape-filter-
+        # rejectable pieces by morphology alone. Treated identically to
+        # "no blob passed the shape filter" below - both are just "no
+        # usable measurement this frame."
         mask_fraction = np.count_nonzero(mask) / mask.size
         if mask_fraction > self.max_mask_fraction:
             if logger.isEnabledFor(logging.DEBUG):
                 tag = f"[{self.color_name}] " if self.color_name else ""
                 logger.debug(f"{tag}rejecting mask: {mask_fraction * 100:.1f}% of scan band matched "
                               f"(> {self.max_mask_fraction * 100:.0f}%) - likely glare/overexposure")
-            self.lost_frames += 1
-            self.just_reacquired = False
-            return None, mask
-
-        raw_x, _area = _select_line_blob(mask, self.min_area_px, self.max_width_px, self.min_aspect_ratio,
-                                          log_tag=self.color_name, preferred_x=self.tracked_position)
+            raw_x = None
+        else:
+            # predicted_position (not a fixed last value) anchors the
+            # proximity tiebreak - see class docstring and
+            # _select_line_blob's docstring.
+            raw_x, _area = _select_line_blob(mask, self.min_area_px, self.max_width_px, self.min_aspect_ratio,
+                                              log_tag=self.color_name, preferred_x=predicted_position)
 
         if raw_x is None:
             self.lost_frames += 1
-            self.just_reacquired = False
-            return None, mask
+            if predicted_position is not None:
+                # Dead reckoning: carry the motion model through the gap
+                # instead of freezing at the last value - this is expected
+                # to handle a normal dashed-line gap at least as gracefully
+                # as the old fixed exponential smoothing did, since
+                # velocity carries the trend forward rather than stalling.
+                self.position = predicted_position
+                self.velocity = predicted_velocity
+                self.variance_position = predicted_variance
+            # else: still cold, nothing to carry forward - self.position
+            # stays None.
 
-        if self.tracked_position is None or self.lost_frames > self.reacquire_after_frames:
-            # no track yet, or lost long enough that we stop waiting and
-            # re-acquire on whatever the strongest candidate is
-            accepted_x = raw_x
-            self.just_reacquired = True
-        elif abs(raw_x - self.tracked_position) <= self.max_jump_pixels:
-            accepted_x = raw_x
-            self.just_reacquired = False
+            if self.lost_frames > self.reacquire_after_frames:
+                # Sustained loss - reset the filter entirely rather than
+                # let it keep confidently extrapolating position further
+                # and further from reality with no correcting measurement.
+                # Mirrors the old reacquire behavior's intent (give up
+                # waiting and start fresh) even though the mechanism here
+                # is a hard reset rather than a gate relaxation.
+                self.position = None
+                self.velocity = 0.0
+                self.variance_position = None
+
+            return self.position, mask
+
+        # Detection this frame.
+        if predicted_position is None:
+            # Cold start (first-ever detection, or the first detection
+            # after a sustained-loss reset): initialize the filter
+            # directly on this measurement - no prior motion to blend
+            # against, so there's nothing a Kalman correction step would
+            # add over simply snapping, same as the old
+            # tracked_position/smoothed_position both snapping to the
+            # first raw_x.
+            self.position = raw_x
+            self.velocity = 0.0
+            self.variance_position = self.measurement_variance
         else:
-            # implausible jump (e.g. this row's blob filter picked up the
-            # *other* line, or track clutter) - treat this frame as a miss
-            if logger.isEnabledFor(logging.DEBUG):
-                tag = f"[{self.color_name}] " if self.color_name else ""
-                logger.debug(f"{tag}rejecting jump: raw_x={raw_x:.1f} vs tracked={self.tracked_position:.1f} "
-                              f"(delta={abs(raw_x - self.tracked_position):.1f} > max_jump={self.max_jump_pixels})")
-            self.lost_frames += 1
-            self.just_reacquired = False
-            return None, mask
+            innovation = raw_x - predicted_position
+            kalman_gain = predicted_variance / (predicted_variance + self.measurement_variance)
+            self.position = predicted_position + kalman_gain * innovation
+            # Simplified velocity correction - see __init__ comment on
+            # velocity_gain_factor. Clamped (see velocity_decay/
+            # max_velocity_px comment) so one large innovation can't set an
+            # implausibly large velocity outright.
+            self.velocity = predicted_velocity + kalman_gain * self.velocity_gain_factor * innovation
+            self.velocity = max(-self.max_velocity_px, min(self.max_velocity_px, self.velocity))
+            self.variance_position = (1 - kalman_gain) * predicted_variance
 
-        self.tracked_position = accepted_x
         self.lost_frames = 0
-
-        if self.smoothed_position is None or self.just_reacquired:
-            # fresh lock: snap instead of blending in slowly from a stale value
-            self.smoothed_position = accepted_x
-        else:
-            self.smoothed_position = (self.smoothing_alpha * accepted_x
-                                       + (1 - self.smoothing_alpha) * self.smoothed_position)
-
-        return self.smoothed_position, mask
+        return self.position, mask
 
 
 class LaneFollower:
     '''
-    OpenCV based lane-keeping controller - see this module's docstring for
-    the changelog of what's been merged into this file vs. lane_follower2.py.
+    OpenCV based lane-keeping controller - single-variable candidate forked
+    from lane_follower2.py. See this module's docstring for the one thing
+    that's different (a Kalman filter replaces the old jump-gate/reacquire/
+    smoothing trio inside _LineTracker); everything else, including this
+    docstring's description of the base behavior, is unchanged from that
+    file.
 
     LineFollower tracks one line with one horizontal scan row and one PID loop.
     This class instead tracks the pair of lines that bound a lane - a solid
@@ -451,14 +495,10 @@ class LaneFollower:
     smoothed off the primary scan row whenever both lines are visible
     together).
 
-    New in this file (see module docstring): the lateral pixel error handed
-    to the steering PID is soft-saturated (k*tanh(error/k)) instead of fed
-    raw, to reduce full-steering-lock overshoot on large momentary errors.
-
     Drop-in replacement for LineFollower (or lane_follower.py's/
-    lane_follower2.py's LaneFollower): same constructor signature (pid, cfg).
-    run(cam_img) returns a 6-tuple - (steering, throttle, image, yellow_x,
-    white_x, lane_width_px) - matching lane_follower.py's
+    lane_follower2.py's LaneFollower): same constructor signature (pid,
+    cfg). run(cam_img) returns a 6-tuple - (steering, throttle, image,
+    yellow_x, white_x, lane_width_px) - matching lane_follower.py's
     CV_CONTROLLER_OUTPUTS.
     '''
 
@@ -490,13 +530,6 @@ class LaneFollower:
 
         self.target_pixel = getattr(cfg, 'LANE_TARGET_PIXEL', None)
         self.target_threshold = getattr(cfg, 'LANE_TARGET_THRESHOLD', 10)
-
-        # The lateral pixel error (position - target_pixel) is soft-clipped
-        # through k*tanh(error/k) before being handed to the PID, where k is
-        # this value (see module docstring). 80px is a starting estimate
-        # (~image_width/5 for a 426px-wide frame), not a calibrated constant -
-        # watch real turning behavior on the car before trusting it further.
-        self.error_saturation_px = getattr(cfg, 'LANE_ERROR_SATURATION_PX', 80)
 
         self.steering = 0.0  # from -1 to 1
         self.throttle = cfg.THROTTLE_INITIAL  # from -1 to 1
@@ -611,17 +644,7 @@ class LaneFollower:
             # before the near row's detection would otherwise catch it
             position = sum(c * w for c, w in zip(row_centers, row_weights)) / sum(row_weights)
 
-            # Soft-saturate the lateral error before handing it to the PID
-            # (see module docstring): for small errors this is numerically
-            # ~identical to using position directly (tanh(x/k) ~= x/k near
-            # 0), but large errors are compressed instead of growing
-            # linearly, so a big momentary error is less likely to drive
-            # the proportional term straight to full steering lock.
-            error_px = position - self.target_pixel
-            k = self.error_saturation_px
-            soft_error_px = k * math.tanh(error_px / k)
-            pid_input = self.target_pixel + soft_error_px
-            self.steering = self.pid_st(pid_input)
+            self.steering = self.pid_st(position)
 
             if abs(position - self.target_pixel) > self.target_threshold:
                 # turning - slow down

@@ -1,86 +1,34 @@
 """
-lane_follower3.py
+lf3_soft_saturating_error.py
 
-Next-generation lane follower - built step by step on top of the lessons
-from lane_follower.py and lane_follower2.py (see CLAUDE.md's "Current
-focus" section and this project's memory notes for what those two
-established and where they hit a ceiling).
+Candidate variant of lane_follower2.py exploring one change: soft-saturate
+the lateral pixel error handed to the steering PID, instead of feeding it
+the raw lane-center position. Targets a specific failure mode - turns taken
+too tight and the car crossing a lane boundary - which shows up as large
+instantaneous position-vs-target errors on curves or when a line is briefly
+lost/reacquired far off-center. Today, the PID sees that raw error and its
+proportional term grows linearly with it, so a big error can drive the
+output straight to full steering lock and overshoot.
 
-Built via an offline candidate-testing pass (2026-07-24): five single-variable
-strategy candidates were each implemented as an isolated diff from
-lane_follower2.py and scored against donkeycar/tools/tub_eval.py across all
-10 recorded tubs (autonomous runs at varied lighting + the two manually-driven
-"stay centered" ground-truth tubs), compared against a lane_follower2.py
-baseline. See donkeycar/parts/_candidates/ for the full set and their
-individual results.
+The only change from lane_follower2.py: right before computing steering,
+the pixel error (position - target_pixel) is passed through
+k * tanh(error / k) before being added back to target_pixel and handed to
+the PID. For small errors (normal driving, error << k) tanh(x/k) ~= x/k, so
+this is numerically ~identical to today's behavior - it should not change
+steady-state lane-keeping. For large errors (tight turns, near-loss,
+reacquire-after-loss snaps) the tanh curve flattens instead of continuing
+to grow linearly, which should reduce how often the PID's proportional term
+alone is enough to slam steering to full lock and overshoot a boundary.
+This only reshapes the PID's *input*; the detection, continuity/shape
+filtering, smoothing, and PID/throttle machinery are all untouched from
+lane_follower2.py.
 
-Merged into this file so far:
-
-  1. Soft-saturating lateral error (from lf3_soft_saturating_error.py) -
-     targets "turns too tight / crosses lane boundary". The pixel error
-     handed to the steering PID is passed through k*tanh(error/k) instead of
-     fed raw. Small errors are numerically ~unchanged (tanh(x/k) ~= x/k near
-     zero); large errors (tight turns, post-loss reacquire snaps) compress
-     instead of growing linearly, so a big momentary error is less likely to
-     drive the PID's proportional term straight to full steering lock and
-     overshoot a boundary. Verified: full-lock-steering fraction dropped
-     roughly 10x worst-case (0.309 -> 0.026) across every one of the 10
-     tubs with zero regressions on any other metric (mean_abs_steering,
-     steering-vs-human-driving error on the two ground-truth tubs, sign-flip
-     rate, stopped fraction all flat or improved). k = LANE_ERROR_SATURATION_PX
-     (see myconfig.py), a starting estimate (~image_width/5), not yet
-     calibrated against real on-car turning behavior.
-
-Not yet merged - bugs found and fixed, but not yet good enough to adopt
-(see donkeycar/parts/_candidates/):
-
-  - boundary_margin_bias: an asymmetric steering bias meant to push away
-    from whichever lane edge is closer than a safety margin. First version
-    was a complete no-op - the two edge-margin correction terms cancel
-    exactly whenever LANE_SCAN_ROWS has only one row (today's config),
-    since position is then always exactly the primary row's midpoint.
-    Fixed (2026-07-24) to react to only the single nearer edge, verified
-    directly to now produce a real nonzero bias on real footage. Re-scored:
-    no regressions, but the effect is a small mixed wash (some tubs
-    marginally better, others marginally worse, all within tolerance) -
-    LANE_SAFETY_MARGIN_PX/LANE_MARGIN_BIAS_GAIN are still uncalibrated
-    starting guesses now that the mechanism actually works. Not adopted
-    yet - needs real tuning, not just a working mechanism, before it earns
-    a place in this file.
-  - kalman_position_tracker: replaces each line tracker's ad hoc
-    jump-gate/reacquire-frames/smoothing-alpha trio with a small
-    constant-velocity Kalman filter. First version regressed full-lock-
-    steering fraction on every tub uniformly - traced to the velocity term
-    accumulating from every detection's innovation with no decay or clamp.
-    Fixed (2026-07-24) with a velocity decay term and a hard magnitude
-    clamp, verified velocity no longer grows unbounded. Re-scored: the
-    worst-hit tub (two_outer_laps) improved dramatically (full-lock
-    30.9% -> 16.4%), but full-lock fraction still regressed on 5 of the
-    other 9 tubs - a more fundamental tuning issue (the constant-velocity
-    model likely overshooting through real curves) rather than the single
-    bug that's now fixed. Not adopted - needs real tuning work on the
-    process/measurement variance and velocity-gain-factor constants, not
-    further blind iteration on this offline dataset alone.
-
-Also tested, not yet merged (works, no regressions, but held back so this
-file's first on-car test isolates one change at a time rather than combining
-two behavioral changes before either has been driven):
-
-  - feedforward_speed_profile: continuous (not binary) throttle-vs-error law
-    plus a small steering feedforward term proportional to the lane-center's
-    frame-to-frame rate of change. Reduced full-lock fraction similarly to
-    the soft-saturating-error change, but raised sign-flip rate (steering
-    direction changes) on 7 of 9 non-ground-truth tubs - a plausible side
-    effect of the feedforward term amplifying detection jitter. Stayed
-    within the harness's regression tolerance everywhere, but worth its own
-    isolated on-car check given this project's known PID-wobble history,
-    rather than folding it in alongside the soft-saturating-error change.
-  - joint_edge_selection: jointly selects the (yellow, white) blob pair by
-    lane-width plausibility instead of each color picking independently.
-    Not shown to help OR hurt - the joint-selection condition (both colors
-    having a shape-passing candidate simultaneously on the primary row)
-    rarely triggers on this tub set, so it's essentially untested rather
-    than validated.
+k is exposed as LANE_ERROR_SATURATION_PX (see CFG_OVERRIDES below), a
+starting estimate of ~image_width/5 (426px wide image / 5 ~= 80), not a
+calibrated value - it has not been tuned against real tub footage yet and
+should be checked (e.g. does it visibly soften only the tail of the error
+distribution, or does it start reshaping errors seen during ordinary
+driving too) before trusting it on the car.
 """
 
 import logging
@@ -90,6 +38,8 @@ import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+CFG_OVERRIDES = {"LANE_ERROR_SATURATION_PX": 80}  # ~image_width/5 (426px wide image), an uncalibrated starting estimate
 
 
 def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag=None, preferred_x=None):
@@ -298,21 +248,21 @@ class _LineTracker:
         self.min_aspect_ratio = _shape_param(cfg, color_name, 'MIN_LINE_ASPECT_RATIO', 0.10)
         self.morph_kernel_size = getattr(cfg, 'MORPH_KERNEL_SIZE', 3)
 
-        # Glare/overexposure guard: a mask matching more than this fraction
-        # of the whole scan band is rejected outright as unreliable rather
-        # than handed to the shape filter - see module docstring's point 2.
-        # 0.25 is a starting guess (a real thin line should never come close
-        # to a quarter of the band), not a calibration - watch how often
-        # this actually fires on real footage.
+        # Glare/overexposure guard (new in this file): a mask matching more
+        # than this fraction of the whole scan band is rejected outright as
+        # unreliable rather than handed to the shape filter - see module
+        # docstring's point 2. 0.25 is a starting guess (a real thin line
+        # should never come close to a quarter of the band), not a
+        # calibration - watch how often this actually fires on real footage.
         self.max_mask_fraction = _shape_param(cfg, color_name, 'MAX_MASK_FRACTION', 0.25)
 
         # Only used when color_space == 'LAB_ADAPTIVE'; see _adaptive_lab_mask.
         self.adaptive_k_std = _shape_param(cfg, color_name, 'ADAPTIVE_K_STD', 1.5)
         self.adaptive_min_std = _shape_param(cfg, color_name, 'ADAPTIVE_MIN_STD', 5.0)
-        # Rejects a band whose L-channel stddev is implausibly high - not
-        # "some contrast to threshold against" but "this band spans two
-        # different lighting conditions" (see module docstring point 4 and
-        # _adaptive_lab_mask). Calibrated across tub_4/8/9/11/13/16/25:
+        # New: rejects a band whose L-channel stddev is implausibly high -
+        # not "some contrast to threshold against" but "this band spans
+        # two different lighting conditions" (see module docstring point
+        # 4 and _adaptive_lab_mask). Calibrated across tub_4/8/9/11/13/16/25:
         # normal bands run ~16-20 stddev, with occasional legitimate spikes
         # into the 30s-40s; tub_16 and tub_25 (the two tubs with a real
         # shadow/sun split within the band) average 30-50 with a long tail
@@ -329,7 +279,7 @@ class _LineTracker:
         # set ADAPTIVE_MAX_SATURATION explicitly to keep it in sync.
         self.adaptive_max_saturation = _shape_param(cfg, color_name, 'ADAPTIVE_MAX_SATURATION', 60)
 
-        # Optional CLAHE contrast normalization before the adaptive
+        # New: optional CLAHE contrast normalization before the adaptive
         # threshold math (see module docstring point 4). Off by default -
         # the min/max std guards above are the load-bearing fix; this is
         # a complementary, more ambitious attempt to reduce how often a
@@ -427,8 +377,11 @@ class _LineTracker:
 
 class LaneFollower:
     '''
-    OpenCV based lane-keeping controller - see this module's docstring for
-    the changelog of what's been merged into this file vs. lane_follower2.py.
+    OpenCV based lane-keeping controller - candidate fork of the LaneFollower
+    in lane_follower2.py. See this module's docstring for the one change
+    (a tanh soft-saturation on the PID's input error, see run()); everything
+    else, including this docstring's description of the base behavior, is
+    unchanged from that file.
 
     LineFollower tracks one line with one horizontal scan row and one PID loop.
     This class instead tracks the pair of lines that bound a lane - a solid
@@ -450,10 +403,6 @@ class LaneFollower:
     estimate of the lane's pixel width (self.lane_width_px, exponentially
     smoothed off the primary scan row whenever both lines are visible
     together).
-
-    New in this file (see module docstring): the lateral pixel error handed
-    to the steering PID is soft-saturated (k*tanh(error/k)) instead of fed
-    raw, to reduce full-steering-lock overshoot on large momentary errors.
 
     Drop-in replacement for LineFollower (or lane_follower.py's/
     lane_follower2.py's LaneFollower): same constructor signature (pid, cfg).
@@ -491,11 +440,11 @@ class LaneFollower:
         self.target_pixel = getattr(cfg, 'LANE_TARGET_PIXEL', None)
         self.target_threshold = getattr(cfg, 'LANE_TARGET_THRESHOLD', 10)
 
-        # The lateral pixel error (position - target_pixel) is soft-clipped
-        # through k*tanh(error/k) before being handed to the PID, where k is
-        # this value (see module docstring). 80px is a starting estimate
-        # (~image_width/5 for a 426px-wide frame), not a calibrated constant -
-        # watch real turning behavior on the car before trusting it further.
+        # New in this file (see module docstring): the lateral pixel error
+        # (position - target_pixel) is soft-clipped through k*tanh(error/k)
+        # before being handed to the PID, where k is this value. 80px is a
+        # starting estimate (~image_width/5 for a 426px-wide frame), not a
+        # calibrated constant - see CFG_OVERRIDES in this module.
         self.error_saturation_px = getattr(cfg, 'LANE_ERROR_SATURATION_PX', 80)
 
         self.steering = 0.0  # from -1 to 1

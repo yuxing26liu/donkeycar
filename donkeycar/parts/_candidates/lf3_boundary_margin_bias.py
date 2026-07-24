@@ -1,95 +1,53 @@
 """
-lane_follower3.py
+lf3_boundary_margin_bias.py
 
-Next-generation lane follower - built step by step on top of the lessons
-from lane_follower.py and lane_follower2.py (see CLAUDE.md's "Current
-focus" section and this project's memory notes for what those two
-established and where they hit a ceiling).
+Candidate fork of lane_follower2.py - single-variable change only. Targets
+two related failure modes reported from on-car testing: turns that come out
+tighter than intended, and the car occasionally crossing a lane boundary
+(the outer white solid edge or the yellow dashed centerline) instead of
+staying clear of it. lane_follower2.py's steering only ever targets the
+lane midpoint (or a one-sided offset estimate when only one line is
+visible) - there's no notion of "how close are we to actually leaving the
+lane right now," so a scan-row estimate that's a bit noisy or a curve that
+tightens faster than the lookahead rows anticipate can walk the car right
+up to (or past) an edge with nothing pushing back until the midpoint itself
+has shifted.
 
-Built via an offline candidate-testing pass (2026-07-24): five single-variable
-strategy candidates were each implemented as an isolated diff from
-lane_follower2.py and scored against donkeycar/tools/tub_eval.py across all
-10 recorded tubs (autonomous runs at varied lighting + the two manually-driven
-"stay centered" ground-truth tubs), compared against a lane_follower2.py
-baseline. See donkeycar/parts/_candidates/ for the full set and their
-individual results.
+The only change here: after computing the same weighted-average lane-center
+"position" lane_follower2.py already computes, add a bias term (in pixel
+space, before the PID call) that only activates when the primary scan row's
+near_yellow_x/near_white_x place either edge closer than
+LANE_SAFETY_MARGIN_PX - if so, it nudges the PID's target position away from
+that edge, proportional to how far inside the margin we are. When both
+edges are comfortably beyond the margin (the normal case), bias is exactly
+0.0 and behavior is identical to lane_follower2.py. Everything else -
+detection (LAB_ADAPTIVE white, HSV yellow), continuity tracking, smoothing,
+throttle logic, and the overlay - is untouched, copied as-is.
 
-Merged into this file so far:
+LANE_SAFETY_MARGIN_PX=40 and LANE_MARGIN_BIAS_GAIN=0.3 (see CFG_OVERRIDES
+below) are starting estimates, not calibrated against real footage yet -
+40px is a guess at "close enough to an edge to worry" at this track's
+426x240 CV resolution, and 0.3 is a small initial gain intended to nudge
+rather than dominate the existing midpoint-centering term. Both should be
+re-tuned against tub replays before trusting them.
 
-  1. Soft-saturating lateral error (from lf3_soft_saturating_error.py) -
-     targets "turns too tight / crosses lane boundary". The pixel error
-     handed to the steering PID is passed through k*tanh(error/k) instead of
-     fed raw. Small errors are numerically ~unchanged (tanh(x/k) ~= x/k near
-     zero); large errors (tight turns, post-loss reacquire snaps) compress
-     instead of growing linearly, so a big momentary error is less likely to
-     drive the PID's proportional term straight to full steering lock and
-     overshoot a boundary. Verified: full-lock-steering fraction dropped
-     roughly 10x worst-case (0.309 -> 0.026) across every one of the 10
-     tubs with zero regressions on any other metric (mean_abs_steering,
-     steering-vs-human-driving error on the two ground-truth tubs, sign-flip
-     rate, stopped fraction all flat or improved). k = LANE_ERROR_SATURATION_PX
-     (see myconfig.py), a starting estimate (~image_width/5), not yet
-     calibrated against real on-car turning behavior.
-
-Not yet merged - bugs found and fixed, but not yet good enough to adopt
-(see donkeycar/parts/_candidates/):
-
-  - boundary_margin_bias: an asymmetric steering bias meant to push away
-    from whichever lane edge is closer than a safety margin. First version
-    was a complete no-op - the two edge-margin correction terms cancel
-    exactly whenever LANE_SCAN_ROWS has only one row (today's config),
-    since position is then always exactly the primary row's midpoint.
-    Fixed (2026-07-24) to react to only the single nearer edge, verified
-    directly to now produce a real nonzero bias on real footage. Re-scored:
-    no regressions, but the effect is a small mixed wash (some tubs
-    marginally better, others marginally worse, all within tolerance) -
-    LANE_SAFETY_MARGIN_PX/LANE_MARGIN_BIAS_GAIN are still uncalibrated
-    starting guesses now that the mechanism actually works. Not adopted
-    yet - needs real tuning, not just a working mechanism, before it earns
-    a place in this file.
-  - kalman_position_tracker: replaces each line tracker's ad hoc
-    jump-gate/reacquire-frames/smoothing-alpha trio with a small
-    constant-velocity Kalman filter. First version regressed full-lock-
-    steering fraction on every tub uniformly - traced to the velocity term
-    accumulating from every detection's innovation with no decay or clamp.
-    Fixed (2026-07-24) with a velocity decay term and a hard magnitude
-    clamp, verified velocity no longer grows unbounded. Re-scored: the
-    worst-hit tub (two_outer_laps) improved dramatically (full-lock
-    30.9% -> 16.4%), but full-lock fraction still regressed on 5 of the
-    other 9 tubs - a more fundamental tuning issue (the constant-velocity
-    model likely overshooting through real curves) rather than the single
-    bug that's now fixed. Not adopted - needs real tuning work on the
-    process/measurement variance and velocity-gain-factor constants, not
-    further blind iteration on this offline dataset alone.
-
-Also tested, not yet merged (works, no regressions, but held back so this
-file's first on-car test isolates one change at a time rather than combining
-two behavioral changes before either has been driven):
-
-  - feedforward_speed_profile: continuous (not binary) throttle-vs-error law
-    plus a small steering feedforward term proportional to the lane-center's
-    frame-to-frame rate of change. Reduced full-lock fraction similarly to
-    the soft-saturating-error change, but raised sign-flip rate (steering
-    direction changes) on 7 of 9 non-ground-truth tubs - a plausible side
-    effect of the feedforward term amplifying detection jitter. Stayed
-    within the harness's regression tolerance everywhere, but worth its own
-    isolated on-car check given this project's known PID-wobble history,
-    rather than folding it in alongside the soft-saturating-error change.
-  - joint_edge_selection: jointly selects the (yellow, white) blob pair by
-    lane-width plausibility instead of each color picking independently.
-    Not shown to help OR hurt - the joint-selection condition (both colors
-    having a shape-passing candidate simultaneously on the primary row)
-    rarely triggers on this tub set, so it's essentially untested rather
-    than validated.
+FIX (2026-07-24, after initial offline scoring): the first version computed
+both edges' margin conditions independently and summed their corrections,
+which cancel exactly whenever position sits at the primary row's exact
+midpoint - which it always does with today's single-scan-row config, making
+the bias a complete no-op (measured ~1e-14 on every real trigger). Now reacts
+only to whichever single edge is nearer, which can't cancel this way. See
+run()'s inline comment for the full mechanism.
 """
 
 import logging
-import math
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+CFG_OVERRIDES = {"LANE_SAFETY_MARGIN_PX": 40, "LANE_MARGIN_BIAS_GAIN": 0.3}  # starting estimates, not yet calibrated
 
 
 def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag=None, preferred_x=None):
@@ -195,48 +153,31 @@ def _shape_param(cfg, color_name, key, default):
 def _adaptive_lab_mask(scan_line_rgb, k_std, min_std, max_std, max_saturation, clahe=None):
     '''
     Lighting-robust "brighter than the surrounding pavement" mask, used
-    for white instead of a fixed absolute RGB threshold (see module
-    docstring for why: tub_9_26-07-22 showed the fixed threshold
-    collapse to 0% hit-rate for multi-second stretches as shadows fell).
+    for white instead of a fixed absolute RGB threshold (see lane_follower2.py's
+    module docstring for why).
 
     Works in LAB's L channel (perceptual lightness - more shadow/
     highlight-invariant than raw RGB per-channel values) and thresholds
     relative to *this frame's own* scan-band brightness rather than a
-    constant: mean + k_std * stddev. That self-adjusts across both a
-    slow sunset fade and the faster shaded/sunlit swings a single lap
-    can have (tub_9's scan-band brightness bounced between ~80 and ~170
-    multiple times in one session, not a single monotonic fade - a
-    fixed threshold re-tuned for "evening" would still fail part of
-    that same lap).
+    constant: mean + k_std * stddev.
 
-    A near-uniform band (stddev below min_std - e.g. deep uniform
-    shadow, or a blown-out overexposed patch) has no reliable local
+    A near-uniform band (stddev below min_std) has no reliable local
     contrast to threshold against; below that floor there's nothing
     trustworthy to call "brighter than," so this returns an all-zero
     mask rather than manufacturing a threshold from noise. Symmetrically,
-    a band with stddev *above* max_std (see module docstring point 4) is
-    just as untrustworthy in the other direction - not "one lighting
-    condition with some contrast," but two different lighting conditions
-    (e.g. a hard shadow/sun boundary crossing the band), where "brighter
-    than this band's own mean" picks out sunlit bare pavement rather than
-    the real, shaded paint. Confirmed on tub_25_26-07-23: normal bands
-    run ~16-20 stddev; shadow/sun-split bands hit 55-65+.
+    a band with stddev *above* max_std is just as untrustworthy in the
+    other direction - two different lighting conditions rather than one
+    with some contrast - where "brighter than this band's own mean" picks
+    out sunlit bare pavement rather than the real, shaded paint.
 
     If clahe is given (an OpenCV CLAHE object), it's applied to the L
-    channel before any of the above - locally renormalizing contrast in
-    tiles across the band so a large-scale brightness gradient (like a
-    shadow/sun split) doesn't dominate the whole-band mean/std the way it
-    otherwise would, in principle letting real paint-vs-pavement contrast
-    stand out relative to its own local neighborhood on both sides of the
-    split rather than only the globally brightest region winning.
+    channel before any of the above.
 
     L-channel brightness alone can't tell a genuine white line from a
-    sunlit yellow dash (see module docstring point 3) - both are
-    "brighter than this frame's pavement." Real white paint and bare
-    pavement are both low-saturation, so any pixel that cleared the
-    brightness bar but is more saturated than max_saturation is dropped
-    from the mask - this is what actually excludes the yellow-dash false
-    positives without touching genuine white detections.
+    sunlit yellow dash - both are "brighter than this frame's pavement."
+    Real white paint and bare pavement are both low-saturation, so any
+    pixel that cleared the brightness bar but is more saturated than
+    max_saturation is dropped from the mask.
 
     input: scan_line_rgb, an RGB numpy array (one scan row's cropped band);
            max_saturation, HSV saturation (0-255) above which a pixel is
@@ -300,10 +241,9 @@ class _LineTracker:
 
         # Glare/overexposure guard: a mask matching more than this fraction
         # of the whole scan band is rejected outright as unreliable rather
-        # than handed to the shape filter - see module docstring's point 2.
-        # 0.25 is a starting guess (a real thin line should never come close
-        # to a quarter of the band), not a calibration - watch how often
-        # this actually fires on real footage.
+        # than handed to the shape filter. 0.25 is a starting guess (a real
+        # thin line should never come close to a quarter of the band), not a
+        # calibration - watch how often this actually fires on real footage.
         self.max_mask_fraction = _shape_param(cfg, color_name, 'MAX_MASK_FRACTION', 0.25)
 
         # Only used when color_space == 'LAB_ADAPTIVE'; see _adaptive_lab_mask.
@@ -311,15 +251,13 @@ class _LineTracker:
         self.adaptive_min_std = _shape_param(cfg, color_name, 'ADAPTIVE_MIN_STD', 5.0)
         # Rejects a band whose L-channel stddev is implausibly high - not
         # "some contrast to threshold against" but "this band spans two
-        # different lighting conditions" (see module docstring point 4 and
-        # _adaptive_lab_mask). Calibrated across tub_4/8/9/11/13/16/25:
-        # normal bands run ~16-20 stddev, with occasional legitimate spikes
-        # into the 30s-40s; tub_16 and tub_25 (the two tubs with a real
-        # shadow/sun split within the band) average 30-50 with a long tail
-        # to 70+. 50 sits above the normal tubs' occasional legitimate
-        # spikes (p99 up to ~58 on tub_9) but well below where a genuine
-        # split-lighting band sits - re-check against new tubs before
-        # assuming this is final, it's from one round of calibration.
+        # different lighting conditions" (see _adaptive_lab_mask). Calibrated
+        # across tub_4/8/9/11/13/16/25: normal bands run ~16-20 stddev, with
+        # occasional legitimate spikes into the 30s-40s; tub_16 and tub_25
+        # (the two tubs with a real shadow/sun split within the band) average
+        # 30-50 with a long tail to 70+. 50 sits above the normal tubs'
+        # occasional legitimate spikes (p99 up to ~58 on tub_9) but well
+        # below where a genuine split-lighting band sits.
         self.adaptive_max_std = _shape_param(cfg, color_name, 'ADAPTIVE_MAX_STD', 50.0)
         # Conceptually this should track whatever YELLOW_HSV_THRESHOLD_LOW's
         # saturation floor is calibrated to for the current lighting -
@@ -330,11 +268,10 @@ class _LineTracker:
         self.adaptive_max_saturation = _shape_param(cfg, color_name, 'ADAPTIVE_MAX_SATURATION', 60)
 
         # Optional CLAHE contrast normalization before the adaptive
-        # threshold math (see module docstring point 4). Off by default -
-        # the min/max std guards above are the load-bearing fix; this is
-        # a complementary, more ambitious attempt to reduce how often a
-        # band's stats are split-lighting-contaminated in the first place.
-        # Only relevant in LAB_ADAPTIVE mode.
+        # threshold math. Off by default - the min/max std guards above are
+        # the load-bearing fix; this is a complementary, more ambitious
+        # attempt to reduce how often a band's stats are split-lighting-
+        # contaminated in the first place. Only relevant in LAB_ADAPTIVE mode.
         self.use_clahe = _shape_param(cfg, color_name, 'ADAPTIVE_USE_CLAHE', False)
         self.clahe = None
         if self.use_clahe and color_space == 'LAB_ADAPTIVE':
@@ -371,10 +308,10 @@ class _LineTracker:
             kernel = np.ones((self.morph_kernel_size, self.morph_kernel_size), np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-        # Glare/overexposure guard - see __init__ comment and module
-        # docstring point 2. Checked here, before blob selection, since a
-        # diffuse frame-filling false positive isn't guaranteed to get
-        # broken into shape-filter-rejectable pieces by morphology alone.
+        # Glare/overexposure guard - see __init__ comment. Checked here,
+        # before blob selection, since a diffuse frame-filling false
+        # positive isn't guaranteed to get broken into shape-filter-
+        # rejectable pieces by morphology alone.
         mask_fraction = np.count_nonzero(mask) / mask.size
         if mask_fraction > self.max_mask_fraction:
             if logger.isEnabledFor(logging.DEBUG):
@@ -427,8 +364,10 @@ class _LineTracker:
 
 class LaneFollower:
     '''
-    OpenCV based lane-keeping controller - see this module's docstring for
-    the changelog of what's been merged into this file vs. lane_follower2.py.
+    OpenCV based lane-keeping controller - candidate fork of lane_follower2.py.
+    See this module's docstring for the one change (an asymmetric
+    boundary-margin steering bias); everything else, including this
+    docstring's description of the base behavior, is unchanged from that file.
 
     LineFollower tracks one line with one horizontal scan row and one PID loop.
     This class instead tracks the pair of lines that bound a lane - a solid
@@ -440,9 +379,8 @@ class LaneFollower:
 
     Yellow uses HSV (on-car testing showed the dashed line and this track's
     plain concrete surface are nearly the same RGB triplet under overcast
-    light and only really separate on saturation). White uses the
-    LAB_ADAPTIVE mode (see _adaptive_lab_mask) instead of a fixed RGB
-    threshold.
+    light and only really separate on saturation). White uses LAB_ADAPTIVE
+    mode (see _adaptive_lab_mask) instead of a fixed RGB threshold.
 
     When only one line is visible (e.g. the dashed line is mid-gap, or the
     solid line briefly leaves the scan band on a curve), the lane center is
@@ -451,15 +389,17 @@ class LaneFollower:
     smoothed off the primary scan row whenever both lines are visible
     together).
 
-    New in this file (see module docstring): the lateral pixel error handed
-    to the steering PID is soft-saturated (k*tanh(error/k)) instead of fed
-    raw, to reduce full-steering-lock overshoot on large momentary errors.
+    New in this file: before the midpoint-centered position is handed to the
+    steering PID, an additional bias term nudges it away from whichever edge
+    (white or yellow) is currently closer than LANE_SAFETY_MARGIN_PX on the
+    primary scan row - see run() and the module docstring. This is additive,
+    not a replacement: with both edges outside the margin (the common case)
+    the bias is 0.0 and this file behaves identically to lane_follower2.py.
 
     Drop-in replacement for LineFollower (or lane_follower.py's/
     lane_follower2.py's LaneFollower): same constructor signature (pid, cfg).
     run(cam_img) returns a 6-tuple - (steering, throttle, image, yellow_x,
-    white_x, lane_width_px) - matching lane_follower.py's
-    CV_CONTROLLER_OUTPUTS.
+    white_x, lane_width_px) - matching lane_follower.py's CV_CONTROLLER_OUTPUTS.
     '''
 
     def __init__(self, pid, cfg):
@@ -491,12 +431,14 @@ class LaneFollower:
         self.target_pixel = getattr(cfg, 'LANE_TARGET_PIXEL', None)
         self.target_threshold = getattr(cfg, 'LANE_TARGET_THRESHOLD', 10)
 
-        # The lateral pixel error (position - target_pixel) is soft-clipped
-        # through k*tanh(error/k) before being handed to the PID, where k is
-        # this value (see module docstring). 80px is a starting estimate
-        # (~image_width/5 for a 426px-wide frame), not a calibrated constant -
-        # watch real turning behavior on the car before trusting it further.
-        self.error_saturation_px = getattr(cfg, 'LANE_ERROR_SATURATION_PX', 80)
+        # New: asymmetric boundary-margin bias (see module docstring). When
+        # the primary row's white or yellow edge is closer than
+        # safety_margin_px, the steering target is nudged away from that
+        # edge proportional to how far inside the margin it is. Both are
+        # starting estimates (see CFG_OVERRIDES at top of file), not yet
+        # calibrated against real footage.
+        self.safety_margin_px = getattr(cfg, 'LANE_SAFETY_MARGIN_PX', 40)
+        self.margin_bias_gain = getattr(cfg, 'LANE_MARGIN_BIAS_GAIN', 0.3)
 
         self.steering = 0.0  # from -1 to 1
         self.throttle = cfg.THROTTLE_INITIAL  # from -1 to 1
@@ -583,7 +525,8 @@ class LaneFollower:
 
             if i == 0:
                 # the primary (nearest) row is authoritative for the
-                # published lane geometry and the lane-width estimate below
+                # published lane geometry, the lane-width estimate below,
+                # and the boundary-margin bias below
                 near_yellow_x, near_white_x = yellow_x, white_x
 
             center = self._lane_center(yellow_x, white_x)
@@ -611,17 +554,55 @@ class LaneFollower:
             # before the near row's detection would otherwise catch it
             position = sum(c * w for c, w in zip(row_centers, row_weights)) / sum(row_weights)
 
-            # Soft-saturate the lateral error before handing it to the PID
-            # (see module docstring): for small errors this is numerically
-            # ~identical to using position directly (tanh(x/k) ~= x/k near
-            # 0), but large errors are compressed instead of growing
-            # linearly, so a big momentary error is less likely to drive
-            # the proportional term straight to full steering lock.
-            error_px = position - self.target_pixel
-            k = self.error_saturation_px
-            soft_error_px = k * math.tanh(error_px / k)
-            pid_input = self.target_pixel + soft_error_px
-            self.steering = self.pid_st(pid_input)
+            # Boundary-margin bias (new in this file - see module docstring):
+            # only computed when both of the primary row's edges are visible
+            # this frame, since it needs both to know how close position is
+            # to each. white_right_of_yellow determines which edge is at
+            # larger vs. smaller pixel x, so margin_white/margin_yellow are
+            # each "distance from position to that edge, positive when
+            # position is still on the inside of it." When the margin is
+            # smaller than the safety threshold, bias is pushed in whichever
+            # direction moves position back toward the middle - i.e. away
+            # from that edge - proportional to how far inside the margin we
+            # are; this operates purely on the same pixel-space position
+            # that already feeds self.pid_st below, so it inherits whatever
+            # sign convention the PID/steering output already uses without
+            # needing to be re-derived here.
+            bias = 0.0
+            if near_yellow_x is not None and near_white_x is not None:
+                if self.white_right_of_yellow:
+                    margin_white = near_white_x - position
+                    margin_yellow = position - near_yellow_x
+                else:
+                    margin_white = position - near_white_x
+                    margin_yellow = near_yellow_x - position
+
+                # React to whichever edge is CLOSER only - not both margin
+                # conditions independently. Bug found during offline scoring
+                # (2026-07-24): margin_white + margin_yellow always equals
+                # the constant lane width, so whenever position sits at the
+                # exact midpoint (which it always does with today's single
+                # scan-row config, since position IS that row's midpoint
+                # then - see LANE_SCAN_ROWS in myconfig.py) margin_white
+                # equals margin_yellow, both conditions trip together, and
+                # the two corrections (one subtracting, one adding) cancel
+                # exactly - measured bias of ~1e-14 on every trip, a
+                # complete no-op. Reacting only to the single nearer edge
+                # can't cancel this way, and is also the more correct
+                # behavior anyway (if you're closer to white, push away
+                # from white - being simultaneously "not that close" to
+                # yellow shouldn't partially undo that).
+                if margin_white < margin_yellow and margin_white < self.safety_margin_px:
+                    # closer to the white edge - push away from it
+                    # (toward the yellow side)
+                    bias -= self.margin_bias_gain * (self.safety_margin_px - margin_white)
+                elif margin_yellow <= margin_white and margin_yellow < self.safety_margin_px:
+                    # closer to the yellow edge - push away from it
+                    # (toward the white side)
+                    bias += self.margin_bias_gain * (self.safety_margin_px - margin_yellow)
+
+            biased_position = position + bias
+            self.steering = self.pid_st(biased_position)
 
             if abs(position - self.target_pixel) > self.target_threshold:
                 # turning - slow down
