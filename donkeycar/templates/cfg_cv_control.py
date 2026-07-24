@@ -600,26 +600,45 @@ PID_D_DELTA = 0.00005 # amount the inc/dec function will change the D value
 OVERLAY_IMAGE = True  # True to draw computer vision overlay on camera image in web ui
                       # NOTE: this does not affect what is saved to the data
 
-# ObstacleAvoider - Phase 1: blue-tape cone-marker detection (see
+# ObstacleAvoider - Phase 1: cone detection by color, either its blue-tape
+# ground marker or its own orange body (see
 # project_doc/obstacle_avoidance.md for the full design and current status).
-# Detection-only for now -- does not change pilot/steering or pilot/throttle.
-# Requires CV_CONTROLLER_CLASS = "LaneFollower" (lane/yellow_x, lane/white_x,
-# lane/width_px must be populated) to do anything useful; with LineFollower
-# those inputs stay None and the cone is never considered "in our lane".
-HAVE_OBSTACLE_AVOIDANCE = False
+# Detection-only for now -- does not change pilot/steering or pilot/throttle,
+# so this is safe to leave on. Requires CV_CONTROLLER_CLASS = "LaneFollower"
+# (lane/yellow_x, lane/white_x, lane/width_px must be populated) to do
+# anything useful; with LineFollower those inputs stay None and the cone is
+# never considered "in our lane" (it's still detected and logged, just never
+# latches obstacle/cone_detected). On by default: this is the project's
+# current focus (see CLAUDE.md) and detection-only means it can't affect
+# driving even if left on for a track/config that doesn't use it.
+HAVE_OBSTACLE_AVOIDANCE = True
 
 CONE_SCAN_Y = 60        # num pixels from the top to start the cone scan slice
                         # (higher up / farther ahead than SCAN_Y, for lead time to react)
 CONE_SCAN_HEIGHT = 30   # num pixels high to grab from the cone scan slice
 
-# HSV range for the blue tape marker. Guessed, not yet tuned on hardware --
-# same workflow as COLOR_THRESHOLD_LOW/HIGH above: run with LOGLEVEL=DEBUG
-# and re-tune with scripts/hsv_picker.py against real footage of the tape.
+# HSV range for the cone's own orange body. Calibrated against real cone
+# pixels sampled from two different frames of tub_33_26-07-24 (on-car
+# footage), saturation-filtered to exclude the cone's white reflective
+# stripe and cast shadow -- unlike BLUE_HSV_THRESHOLD below, this is a
+# measurement, not a guess. Still verify against your own lighting before
+# trusting it (run with LOGLEVEL=DEBUG and scripts/hsv_picker.py).
+ORANGE_HSV_THRESHOLD_LOW = (0, 90, 60)
+ORANGE_HSV_THRESHOLD_HIGH = (18, 255, 255)
+
+# HSV range for a blue tape ground marker, if one is used at the cone's
+# spot instead of (or in addition to) relying on the cone's own color.
+# Guessed, not yet tuned on hardware -- tub_33_26-07-24 (the only footage
+# checked so far) had no tape marker on the track at all, only background
+# blue clutter (a recycling bin, a kiosk sign) that this threshold matched
+# instead. Kept wired up per project_doc's Decision 1 option C ("union of
+# masks") in case a tape marker is used on some other track/lap; re-tune
+# against real tape footage with scripts/hsv_picker.py before relying on it.
 BLUE_HSV_THRESHOLD_LOW = (95, 100, 60)
 BLUE_HSV_THRESHOLD_HIGH = (130, 255, 255)
 
-CONE_MIN_AREA_PX = 80     # smallest pixel area (in the scan slice) counted as the tape marker
-CONE_MAX_WIDTH_PX = 250   # widest pixel width (in the scan slice) counted as the tape marker
+CONE_MIN_AREA_PX = 80     # smallest pixel area (in the scan slice) counted as the cone/marker
+CONE_MAX_WIDTH_PX = 250   # widest pixel width (in the scan slice) counted as the cone/marker
 
 LANE_SHIFT_MARGIN_PX = 10  # margin added to our lane's pixel bounds when testing
                             # whether a detection falls inside it

@@ -10,6 +10,8 @@ IMAGE_W = 426
 IMAGE_H = 240
 GRAY = (120, 120, 120)   # stand-in for plain concrete
 BLUE = (0, 0, 255)       # RGB pure blue -> HSV hue ~120 on OpenCV's 0..179 scale
+ORANGE = (255, 90, 0)    # RGB traffic-cone orange -> HSV hue ~10 on OpenCV's 0..179 scale
+                          # (matches real cone pixels sampled from tub_33_26-07-24)
 GREEN = (34, 139, 34)    # stand-in for a leaf / other debris on the track
 WHITE = (230, 230, 230)
 YELLOW = (230, 200, 40)
@@ -20,6 +22,8 @@ class _Cfg:
     CONE_SCAN_HEIGHT = 30
     BLUE_HSV_THRESHOLD_LOW = (95, 100, 60)
     BLUE_HSV_THRESHOLD_HIGH = (130, 255, 255)
+    ORANGE_HSV_THRESHOLD_LOW = (0, 90, 60)
+    ORANGE_HSV_THRESHOLD_HIGH = (18, 255, 255)
     CONE_MIN_AREA_PX = 80
     CONE_MAX_WIDTH_PX = 250
     WHITE_RIGHT_OF_YELLOW = True
@@ -166,6 +170,69 @@ class TestObstacleAvoiderConeDetection:
         assert out_cv_img.shape == img.shape
 
 
+class TestObstacleAvoiderOrangeConeDetection:
+    '''
+    Mirrors TestObstacleAvoiderConeDetection's key cases for the orange-cone
+    detector, added after tub_33_26-07-24 (real on-car footage) showed the
+    cones on this track have no blue tape marker at all - see class
+    docstring in obstacle_avoider.py.
+    '''
+
+    def _run_n(self, avoider, cam_img, n):
+        result = None
+        for _ in range(n):
+            result = avoider.run(cam_img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        return result
+
+    def test_orange_cone_in_our_lane_latches_after_trigger_frames(self):
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(210, 230, 65, 85, ORANGE)])  # centered ~220, inside [200,260]
+
+        _s, _t, _cv, detected = avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        assert detected is False
+        assert avoider.cone_in_our_lane is True
+        assert avoider.cone_color == 'orange cone'
+
+        _s, _t, _cv, detected = avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        assert detected is True
+        assert avoider.cone_x == pytest.approx(220, abs=3)
+
+    def test_orange_cone_in_other_lane_is_ignored(self):
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(150, 170, 65, 85, ORANGE)])
+        _s, _t, _cv, detected = self._run_n(avoider, img, 5)
+        assert detected is False
+        assert avoider.cone_x is not None
+        assert avoider.cone_in_our_lane is False
+
+    def test_orange_outside_scan_band_is_ignored(self):
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(210, 230, 150, 170, ORANGE)])
+        _s, _t, _cv, detected = self._run_n(avoider, img, 5)
+        assert detected is False
+        assert avoider.cone_x is None
+
+    def test_tiny_orange_speck_below_min_area_ignored(self):
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(220, 223, 65, 68, ORANGE)])  # 3x3 px, well under CONE_MIN_AREA_PX=80
+        _s, _t, _cv, detected = self._run_n(avoider, img, 5)
+        assert detected is False
+
+    def test_larger_blob_wins_when_both_colors_present(self):
+        # a big orange cone in our lane and a small blue speck (below
+        # CONE_MIN_AREA_PX, e.g. background glare) elsewhere in the band:
+        # only the orange blob should pass the shape filter at all, so it
+        # wins regardless of the area-comparison tiebreak.
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([
+            (210, 230, 65, 85, ORANGE),   # 20x20 = 400px, well over CONE_MIN_AREA_PX
+            (10, 13, 65, 68, BLUE),       # 3x3 = 9px, rejected by shape filter
+        ])
+        _s, _t, _cv, detected = avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        assert avoider.cone_color == 'orange cone'
+        assert avoider.cone_x == pytest.approx(220, abs=3)
+
+
 class TestObstacleAvoiderDiagnostics:
     '''
     Terminal-output checks for on-car verification: a raw blue-blob
@@ -192,6 +259,24 @@ class TestObstacleAvoiderDiagnostics:
         # band, not averaged over the whole scan band height)
         hue = int(color_logs[0].split('HSV=(')[1].split(',')[0])
         assert hue == pytest.approx(120, abs=5)
+
+    def test_orange_raw_detection_logs_sampled_color(self, caplog):
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(210, 230, 65, 85, ORANGE)])
+        with caplog.at_level(logging.INFO, logger='donkeycar.parts.obstacle_avoider'):
+            avoider.run(img, None, None, LANE_WIDTH_PX, 0.0, 0.2)
+        messages = [r.message for r in caplog.records]
+        color_logs = [m for m in messages if 'orange cone candidate at' in m]
+        assert len(color_logs) == 1
+        hue = int(color_logs[0].split('HSV=(')[1].split(',')[0])
+        assert hue == pytest.approx(10, abs=5)
+
+    def test_startup_line_logs_both_color_thresholds(self, caplog):
+        with caplog.at_level(logging.INFO, logger='donkeycar.parts.obstacle_avoider'):
+            ObstacleAvoider(_Cfg())
+        messages = [r.message for r in caplog.records]
+        assert any('ObstacleAvoider active' in m and 'blue tape' in m and 'orange cone' in m
+                    for m in messages)
 
     def test_raw_detection_log_clears_on_loss(self, caplog):
         avoider = ObstacleAvoider(_Cfg())

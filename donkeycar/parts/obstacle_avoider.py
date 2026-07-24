@@ -52,13 +52,19 @@ class ObstacleAvoider:
     status - this class is being built incrementally, one detector at a time,
     before any steering override is wired up.
 
-    Phase 1 (this increment): detect the traffic cone's position by its
-    ground marker - a blue tape square laid down at the cone's spot on the
-    track (see the reference track photos) - rather than the cone itself.
-    A large flat tape square is a far more reliable classical-CV target at
-    camera resolution/distance than a small cone silhouette would be, and
-    its color doesn't collide with anything else in play here (gray
-    concrete, white line, yellow dashed line). This phase is detection-only:
+    Phase 1 (this increment): detect the traffic cone's position by color -
+    either its ground marker (a blue tape square laid down at the cone's
+    spot, per the original design in project_doc/obstacle_avoidance.md
+    Decision 1) or the cone's own orange body. Both color-keyed detectors
+    run every frame; whichever produces the larger valid blob wins (see
+    detect_cone). Orange detection was added after tub_33_26-07-24 (real
+    on-car footage) showed cones placed on the track with **no** blue tape
+    marker under them at all - the recorded frames only ever matched blue
+    on background clutter (a recycling bin and a kiosk sign at the image
+    edges), never on the track surface - while the cones themselves are
+    clearly, consistently orange. BLUE_HSV_THRESHOLD_LOW/HIGH stays wired
+    up (project_doc's Decision 1 option C, "union of masks") in case a
+    tape marker is used on some other track/lap. This phase is detection-only:
     run() always passes pilot/steering and pilot/throttle through unchanged.
     The car's driving behavior is unaffected even when this part is enabled
     - it only reports what it sees (self.cone_detected / self.cone_x, plus
@@ -81,12 +87,13 @@ class ObstacleAvoider:
     and reusing its `_select_line_blob` connected-component shape filter
     for its own color-blob detection instead of a second implementation.
 
-    Detection method: color-keyed in HSV (BLUE_HSV_THRESHOLD_LOW/HIGH),
-    the same technique lane_follower.py's yellow _LineTracker uses and for
-    the same reason - a solid, saturated color is a far more reliable
-    signal than shape alone, and a positive color match (vs. e.g. "anything
-    not already known") is naturally robust to background clutter like
-    leaves/debris on the track, which won't be blue. Restricted to a single
+    Detection method: color-keyed in HSV (BLUE_HSV_THRESHOLD_LOW/HIGH and
+    ORANGE_HSV_THRESHOLD_LOW/HIGH), the same technique lane_follower.py's
+    yellow _LineTracker uses and for the same reason - a solid, saturated
+    color is a far more reliable signal than shape alone, and a positive
+    color match (vs. e.g. "anything not already known") is naturally robust
+    to background clutter like leaves/debris on the track, which won't be
+    blue or orange. Restricted to a single
     forward scan band (CONE_SCAN_Y/CONE_SCAN_HEIGHT) - the same slice-based
     approach every CV part in this codebase uses - both so a blob is only
     ever evaluated against the track's actual pixel-x extent at that row
@@ -114,6 +121,11 @@ class ObstacleAvoider:
 
         self.blue_low = np.asarray(getattr(cfg, 'BLUE_HSV_THRESHOLD_LOW', (95, 100, 60)))
         self.blue_high = np.asarray(getattr(cfg, 'BLUE_HSV_THRESHOLD_HIGH', (130, 255, 255)))
+        # calibrated against real cone pixels sampled from tub_33_26-07-24
+        # (two cones, two frames, saturation-filtered) - not a blind guess
+        # like BLUE_HSV_THRESHOLD above; see class docstring
+        self.orange_low = np.asarray(getattr(cfg, 'ORANGE_HSV_THRESHOLD_LOW', (0, 90, 60)))
+        self.orange_high = np.asarray(getattr(cfg, 'ORANGE_HSV_THRESHOLD_HIGH', (18, 255, 255)))
         self.cone_min_area_px = getattr(cfg, 'CONE_MIN_AREA_PX', 80)
         self.cone_max_width_px = getattr(cfg, 'CONE_MAX_WIDTH_PX', 250)
 
@@ -126,6 +138,8 @@ class ObstacleAvoider:
         # public detection state - what a future avoidance maneuver (or a
         # test) reads; updated every run() call
         self.cone_x = None              # raw detected x this frame (any lane), or None
+        self.cone_color = None          # 'blue tape' or 'orange cone' - which detector
+                                         # won this frame, or None if cone_x is None
         self.cone_in_our_lane = False   # raw in-our-lane test this frame, pre-debounce
         self.cone_detected = False      # debounced: True once cone_in_our_lane has held
                                          # for cone_trigger_frames consecutive frames
@@ -134,9 +148,24 @@ class ObstacleAvoider:
         # diagnostic-logging state only (see _log_raw_detection /
         # _warn_if_lane_geometry_missing) - not used for detection itself
         self._was_raw_detected = False
+        self._was_raw_color = None
         self._frame_count = 0
         self._warned_no_lane_geometry = False
         self._warned_no_cam_img = False
+
+        # one-time startup line - confirms this part is actually alive and
+        # scanning as soon as `python manage.py drive` constructs it,
+        # independent of whether anything is detected yet. Added because the
+        # prior silent failure mode (HAVE_OBSTACLE_AVOIDANCE=False, or an
+        # out-of-date manage.py that never wires this part in at all) is
+        # otherwise indistinguishable from "wired in but nothing detected
+        # yet" - see project_doc/obstacle_avoidance.md.
+        logger.info(
+            f"[cone_tape] ObstacleAvoider active - scanning rows "
+            f"[{self.scan_y},{self.scan_y + self.scan_height}) for blue tape "
+            f"HSV={tuple(self.blue_low.tolist())}-{tuple(self.blue_high.tolist())} or "
+            f"orange cone HSV={tuple(self.orange_low.tolist())}-{tuple(self.orange_high.tolist())}"
+        )
 
     def _open(self, mask):
         if self.morph_kernel_size > 1:
@@ -147,52 +176,76 @@ class ObstacleAvoider:
     def detect_cone(self, band_hsv):
         '''
         input: band_hsv, HSV numpy array of the forward scan band
-        output: (x, mask) - x position in pixels of the blue tape marker's blob
-                centroid (or None), and the binary color mask used to find it
-                (returned for _describe_mask's diagnostics below, so the mask
-                isn't recomputed twice per frame)
-        '''
-        mask = self._open(cv2.inRange(band_hsv, self.blue_low, self.blue_high))
-        x, _area = _select_line_blob(mask, self.cone_min_area_px, self.cone_max_width_px,
-                                      min_aspect_ratio=0.0, log_tag='cone_tape')
-        return x, mask
+        output: (x, color_label, blue_mask, orange_mask) - x position in
+                pixels of the winning blob's centroid (or None if neither
+                color produced one), color_label is 'blue tape' or
+                'orange cone' (whichever won) or None, and both binary color
+                masks (returned for _describe_mask's diagnostics below, so
+                they aren't recomputed twice per frame)
 
-    def _describe_mask(self, mask):
+        Runs both color detectors every frame - a real cone should only ever
+        match one of them, so this isn't "wasted" work, it's just not
+        assuming in advance which marking this particular track/lap uses.
+        If both somehow produce a valid blob in the same frame (e.g. a
+        tape-marked cone), the larger one by area wins - same "biggest blob
+        wins" contract _select_line_blob already uses within a single mask.
+        '''
+        blue_mask = self._open(cv2.inRange(band_hsv, self.blue_low, self.blue_high))
+        orange_mask = self._open(cv2.inRange(band_hsv, self.orange_low, self.orange_high))
+
+        blue_x, blue_area = _select_line_blob(blue_mask, self.cone_min_area_px, self.cone_max_width_px,
+                                               min_aspect_ratio=0.0, log_tag='cone_tape_blue')
+        orange_x, orange_area = _select_line_blob(orange_mask, self.cone_min_area_px, self.cone_max_width_px,
+                                                    min_aspect_ratio=0.0, log_tag='cone_tape_orange')
+
+        candidates = [(area, x, label) for area, x, label in
+                      ((blue_area, blue_x, 'blue tape'), (orange_area, orange_x, 'orange cone'))
+                      if x is not None]
+        if not candidates:
+            return None, None, blue_mask, orange_mask
+        _area, x, color_label = max(candidates)
+        return x, color_label, blue_mask, orange_mask
+
+    def _describe_mask(self, blue_mask, orange_mask):
         '''
         Diagnostics-only, independent of the shape filter in _select_line_blob:
         that function only logs *why* a blob was rejected (too small/too wide)
         when the root logger is at DEBUG - which on this car would also spam
         LaneFollower's own per-frame yellow/white rejections. This reports the
-        same thing for the cone-tape mask alone, at the default INFO level, so
-        "why isn't it detecting the tape" is answerable from a normal `python
-        manage.py drive` run: was the color threshold ever matched at all
+        same thing for both cone-color masks, at the default INFO level, so
+        "why isn't it detecting the cone" is answerable from a normal `python
+        manage.py drive` run: was either color threshold ever matched at all
         (raw_pixel_count), and if so, did the largest blob fail the shape
         filter and why.
 
-        output: (raw_pixel_count, reasons) - reasons is a list of strings
-                describing why the largest raw blob (if any) was rejected by
-                the shape filter, or [] if either no blob exists or one passed
+        output: {'blue tape': (raw_pixel_count, reasons), 'orange cone': (...)}
+                reasons is a list of strings describing why that color's
+                largest raw blob (if any) was rejected by the shape filter,
+                or [] if either no blob exists or one passed
         '''
-        raw_pixel_count = int(np.count_nonzero(mask))
-        if raw_pixel_count == 0:
-            return raw_pixel_count, []
+        def describe(mask):
+            raw_pixel_count = int(np.count_nonzero(mask))
+            if raw_pixel_count == 0:
+                return raw_pixel_count, []
 
-        num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        best_label, best_area = None, 0
-        for label in range(1, num_labels):
-            area = stats[label, cv2.CC_STAT_AREA]
-            if area > best_area:
-                best_area, best_label = area, label
-        if best_label is None:
-            return raw_pixel_count, []
+            num_labels, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            best_label, best_area = None, 0
+            for label in range(1, num_labels):
+                area = stats[label, cv2.CC_STAT_AREA]
+                if area > best_area:
+                    best_area, best_label = area, label
+            if best_label is None:
+                return raw_pixel_count, []
 
-        width = stats[best_label, cv2.CC_STAT_WIDTH]
-        reasons = []
-        if best_area < self.cone_min_area_px:
-            reasons.append(f"largest blob area {best_area}px < CONE_MIN_AREA_PX {self.cone_min_area_px}")
-        if width > self.cone_max_width_px:
-            reasons.append(f"largest blob width {width}px > CONE_MAX_WIDTH_PX {self.cone_max_width_px}")
-        return raw_pixel_count, reasons
+            width = stats[best_label, cv2.CC_STAT_WIDTH]
+            reasons = []
+            if best_area < self.cone_min_area_px:
+                reasons.append(f"largest blob area {best_area}px < CONE_MIN_AREA_PX {self.cone_min_area_px}")
+            if width > self.cone_max_width_px:
+                reasons.append(f"largest blob width {width}px > CONE_MAX_WIDTH_PX {self.cone_max_width_px}")
+            return raw_pixel_count, reasons
+
+        return {'blue tape': describe(blue_mask), 'orange cone': describe(orange_mask)}
 
     def _decide_action(self):
         '''
@@ -203,13 +256,13 @@ class ObstacleAvoider:
         that maneuver is built.
         '''
         if self.cone_detected:
-            return "SWERVE - cone confirmed in our lane, steer toward other lane"
+            return f"SWERVE - {self.cone_color} confirmed in our lane, steer toward other lane"
         if self.cone_in_our_lane:
-            return (f"cone candidate in our lane, confirming "
+            return (f"{self.cone_color} candidate in our lane, confirming "
                      f"({self._pending_frames}/{self.cone_trigger_frames} frames) - hold lane for now")
         if self.cone_x is not None:
-            return "blue blob seen but not in our lane - hold lane"
-        return "no blue tape visible - hold lane"
+            return f"{self.cone_color} blob seen but not in our lane - hold lane"
+        return "no cone (blue tape or orange) visible - hold lane"
 
     def _x_in_bounds(self, x, bounds):
         lo, hi = bounds
@@ -238,28 +291,30 @@ class ObstacleAvoider:
         mean_rgb = band_rgb[y0:y1, x0:x1].reshape(-1, 3).mean(axis=0)
         return mean_hsv, mean_rgb
 
-    def _log_raw_detection(self, band_rgb, band_hsv, mask):
+    def _log_raw_detection(self, band_rgb, band_hsv, blue_mask, orange_mask):
         '''
         Terminal diagnostics, separate from run()'s in-lane/debounce gating
         (already settled by the time this runs, see run()): prints whenever
-        a blue blob enters/leaves the scan band, with
+        a blue-tape or orange-cone blob enters/leaves the scan band, with
         the actually-sampled HSV/RGB color value - what to watch when tuning
-        BLUE_HSV_THRESHOLD_LOW/HIGH or CONE_SCAN_Y/HEIGHT against the real
-        tape on the car. It fires regardless of whether lane geometry is
-        available, so it still confirms the color detector itself is working
-        even if lane/yellow_x etc. turn out not to be wired (see
+        BLUE_HSV_THRESHOLD_LOW/HIGH, ORANGE_HSV_THRESHOLD_LOW/HIGH, or
+        CONE_SCAN_Y/HEIGHT against the real cone/tape on the car. It fires
+        regardless of whether lane geometry is available, so it still
+        confirms the color detectors themselves are working even if
+        lane/yellow_x etc. turn out not to be wired (see
         _warn_if_lane_geometry_missing).
 
         Also prints a heartbeat every CONE_LOG_INTERVAL_FRAMES frames
         *regardless* of whether anything is detected, so `python manage.py
         drive`'s terminal always shows current status + recommended action
-        (this is the actual per-run() answer to "is it seeing the tape and
+        (this is the actual per-run() answer to "is it seeing a cone and
         what would it do about it") - and, when nothing passes the shape
-        filter, *why* (see _describe_mask): raw_pixel_count==0 means the
-        color threshold itself never matched anything (tune
-        BLUE_HSV_THRESHOLD_LOW/HIGH), while a nonzero count with rejection
-        reasons means a blue blob exists but is the wrong size/shape (tune
-        CONE_MIN_AREA_PX/CONE_MAX_WIDTH_PX or check CONE_SCAN_Y/HEIGHT).
+        filter, *why*, for both colors independently (see _describe_mask):
+        raw_pixel_count==0 for a color means its threshold never matched
+        anything this frame (tune that color's HSV bounds), while a nonzero
+        count with rejection reasons means a blob of that color exists but
+        is the wrong size/shape (tune CONE_MIN_AREA_PX/CONE_MAX_WIDTH_PX or
+        check CONE_SCAN_Y/HEIGHT).
         '''
         raw_detected = self.cone_x is not None
         action = self._decide_action()
@@ -270,31 +325,35 @@ class ObstacleAvoider:
             mean_hsv, mean_rgb = self._sample_color(band_rgb, band_hsv, self.cone_x)
             lane_note = "IN our lane" if self.cone_in_our_lane else "NOT in our lane (or lane unknown)"
             logger.info(
-                f"[cone_tape] blue tape candidate at x={self.cone_x:.1f}, scan_y={self.scan_y} - "
+                f"[cone_tape] {self.cone_color} candidate at x={self.cone_x:.1f}, scan_y={self.scan_y} - "
                 f"sampled color HSV=({mean_hsv[0]:.0f},{mean_hsv[1]:.0f},{mean_hsv[2]:.0f}) "
                 f"RGB=({mean_rgb[0]:.0f},{mean_rgb[1]:.0f},{mean_rgb[2]:.0f}) - {lane_note} - "
                 f"ACTION: {action}"
             )
         elif not raw_detected and self._was_raw_detected:
-            logger.info(f"[cone_tape] blue tape no longer visible in scan band - ACTION: {action}")
+            logger.info(f"[cone_tape] {self._was_raw_color} no longer visible in scan band - ACTION: {action}")
         elif heartbeat_due:
             if raw_detected:
                 mean_hsv, mean_rgb = self._sample_color(band_rgb, band_hsv, self.cone_x)
                 logger.info(
-                    f"[cone_tape] blue tape still at x={self.cone_x:.1f} "
+                    f"[cone_tape] {self.cone_color} still at x={self.cone_x:.1f} "
                     f"HSV=({mean_hsv[0]:.0f},{mean_hsv[1]:.0f},{mean_hsv[2]:.0f}) - ACTION: {action}"
                 )
             else:
-                raw_pixel_count, reasons = self._describe_mask(mask)
-                if raw_pixel_count == 0:
-                    detail = "no pixels matched BLUE_HSV_THRESHOLD_LOW/HIGH in scan band"
-                elif reasons:
-                    detail = f"{raw_pixel_count}px matched color but rejected: " + "; ".join(reasons)
-                else:
-                    detail = f"{raw_pixel_count}px matched color, no blob"
-                logger.info(f"[cone_tape] no blue tape detected ({detail}) - ACTION: {action}")
+                masks_desc = self._describe_mask(blue_mask, orange_mask)
+                details = []
+                for label, (raw_pixel_count, reasons) in masks_desc.items():
+                    if raw_pixel_count == 0:
+                        details.append(f"{label}: no pixels matched")
+                    elif reasons:
+                        details.append(f"{label}: {raw_pixel_count}px matched but rejected ({'; '.join(reasons)})")
+                    else:
+                        details.append(f"{label}: {raw_pixel_count}px matched, no blob")
+                logger.info(f"[cone_tape] no cone detected ({'; '.join(details)}) - ACTION: {action}")
 
         self._was_raw_detected = raw_detected
+        if raw_detected:
+            self._was_raw_color = self.cone_color
 
     def _warn_if_lane_geometry_missing(self, yellow_x, white_x):
         if yellow_x is not None or white_x is not None or self._warned_no_lane_geometry:
@@ -343,7 +402,7 @@ class ObstacleAvoider:
 
         our_lane = _lane_bounds(yellow_x, white_x, lane_width_px, self.white_right_of_yellow, other_lane=False)
 
-        self.cone_x, mask = self.detect_cone(band_hsv)
+        self.cone_x, self.cone_color, blue_mask, orange_mask = self.detect_cone(band_hsv)
         self.cone_in_our_lane = self._x_in_bounds(self.cone_x, our_lane)
 
         if self.cone_in_our_lane:
@@ -358,12 +417,12 @@ class ObstacleAvoider:
         was_detected = self.cone_detected
         self.cone_detected = self._pending_frames >= self.cone_trigger_frames
         if self.cone_detected and not was_detected:
-            logger.info(f"cone marker detected in our lane at x={self.cone_x:.1f} "
+            logger.info(f"cone marker ({self.cone_color}) detected in our lane at x={self.cone_x:.1f} "
                          f"(held {self._pending_frames} frames) - ACTION: {self._decide_action()}")
         elif was_detected and not self.cone_detected:
             logger.info(f"cone marker no longer in our lane - ACTION: {self._decide_action()}")
 
-        self._log_raw_detection(band_rgb, band_hsv, mask)
+        self._log_raw_detection(band_rgb, band_hsv, blue_mask, orange_mask)
         self._warn_if_lane_geometry_missing(yellow_x, white_x)
 
         if self.overlay_image and cv_img is not None:
@@ -377,6 +436,7 @@ class ObstacleAvoider:
             color = (255, 140, 0) if self.cone_in_our_lane else (150, 150, 150)
             cv2.rectangle(cv_img, (int(self.cone_x) - 8, y0), (int(self.cone_x) + 8, y1),
                           color=color, thickness=2)
-        cv2.putText(cv_img, f"CONE:{self.cone_detected}", org=(10, cv_img.shape[0] - 5),
+        label = f"CONE:{self.cone_detected}" + (f" ({self.cone_color})" if self.cone_color else "")
+        cv2.putText(cv_img, label, org=(10, cv_img.shape[0] - 5),
                     fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.4, color=(0, 0, 0))
         return cv_img

@@ -32,13 +32,25 @@ through design:
 
 | Option | Pros | Cons |
 |---|---|---|
-| **A. Detect the blue tape square (chosen)** | Large, flat, high-saturation ground marking — a much more reliable classical-CV target at camera resolution/distance than a small cone silhouette; blue doesn't collide with anything else in play (gray concrete, white line, yellow dashes); doesn't require knowing the cone's own paint color. | It's a proxy for the cone's *position*, not the cone itself — if a cone is ever placed off its tape mark, this misses it. |
+| A. Detect the blue tape square (originally chosen) | Large, flat, high-saturation ground marking — a much more reliable classical-CV target at camera resolution/distance than a small cone silhouette; blue doesn't collide with anything else in play (gray concrete, white line, yellow dashes); doesn't require knowing the cone's own paint color. | It's a proxy for the cone's *position*, not the cone itself — if a cone is ever placed off its tape mark, this misses it. |
 | B. Detect the cone's own color | Detects the real obstacle, not a proxy. | Cone's actual color unconfirmed; a small object is a weaker blob than a tape square at the same distance. |
-| C. Both (union of masks) | Most robust. | More tuning surface for marginal benefit right now; blue also appears on the (off-track, background) recycling bin in the reference photos. |
+| **C. Both (union of masks) — current** | Most robust; each detector is a strict positive-color match, so having both doesn't add false-positive risk over having either alone. | More tuning surface; blue also appears on the (off-track, background) recycling bin and a kiosk sign in the reference photos/footage. |
 
-Chose **A**. Kept swappable — B or C is a config change (a second HSV
-threshold + mask union), not a redesign, if it turns out cones aren't
-reliably placed on their tape marks.
+Revised from **A** to **C** after checking real on-car footage
+(`data/tub_33_26-07-24`, 6463 frames): the blue tape marker described in
+option A **does not appear anywhere in that recording** — every blue match
+in the whole tub, at any position, traced back to the recycling bin or
+kiosk sign at the image edges, never the track surface. The obstacles
+actually on the track are plain orange cones with no ground marker at all.
+Rather than assume every future track uses tape, `ObstacleAvoider.detect_cone`
+now runs both the blue-tape and orange-cone HSV detectors every frame and
+picks whichever produces the larger valid blob (see
+`donkeycar/parts/obstacle_avoider.py`) — this was already anticipated as
+"a config change, not a redesign" and reduces to option A's original
+behavior if a track's tape marker is what's actually placed.
+`ORANGE_HSV_THRESHOLD_LOW/HIGH` (unlike `BLUE_HSV_THRESHOLD_LOW/HIGH`,
+which is still an untuned guess) was calibrated against real cone pixels
+sampled directly from two frames of `tub_33_26-07-24`.
 
 ### Decision 2 — How to detect the oncoming car (not yet implemented)
 
@@ -91,10 +103,12 @@ maneuver (which depends on decisions 2-5 above) is built on top of it.
    `CONE_SCAN_HEIGHT` — the same slice-based approach every CV part in this
    codebase uses (`LineFollower`, `LaneFollower`'s per-color trackers, the
    unmerged `ObjectAvoider` prototype on `origin/estella`).
-2. Convert to HSV and threshold on `BLUE_HSV_THRESHOLD_LOW/HIGH` to find the
-   tape's blob, reusing `_select_line_blob` from `lane_follower.py` (the
-   same connected-component shape/size filter the line trackers use) rather
-   than writing a second implementation.
+2. Convert to HSV and threshold on both `BLUE_HSV_THRESHOLD_LOW/HIGH` (tape
+   marker) and `ORANGE_HSV_THRESHOLD_LOW/HIGH` (the cone's own body) to find
+   a blob of either color, reusing `_select_line_blob` from
+   `lane_follower.py` (the same connected-component shape/size filter the
+   line trackers use) rather than writing a second implementation. If both
+   colors produce a valid blob in the same frame, the larger one wins.
 3. Compute our lane's pixel bounds (`_lane_bounds`, a small helper in this
    file — see "Why lane_follower.py wasn't touched" below) from
    `lane/yellow_x`, `lane/white_x`, `lane/width_px`, which `LaneFollower`
@@ -110,27 +124,39 @@ maneuver (which depends on decisions 2-5 above) is built on top of it.
 
 ### Terminal diagnostics (what to watch when verifying on the car)
 
-With `cv_control.py`'s default logging (`--log=INFO`, no flag needed), two
-things print to the terminal, independent of each other and of whether a
-maneuver would trigger:
+With `cv_control.py`'s default logging (`--log=INFO`, no flag needed),
+three things print to the terminal, independent of each other and of
+whether a maneuver would trigger:
 
-- **Whenever the blue tape enters/leaves the scan band**, one line with the
-  actually-sampled color at the detection, e.g.:
+- **Once, at startup** (when `V.add(ObstacleAvoider(cfg), ...)` constructs
+  the part), a line confirming the part is actually alive and what it's
+  scanning for, e.g.:
   ```
-  [cone_tape] blue tape candidate at x=219.5, scan_y=60 - sampled color HSV=(120,255,255) RGB=(0,0,255) - IN our lane
+  [cone_tape] ObstacleAvoider active - scanning rows [60,90) for blue tape HSV=(95, 100, 60)-(130, 255, 255) or orange cone HSV=(0, 90, 60)-(18, 255, 255)
+  ```
+  This is the direct answer to "is this part even wired in" — its absence
+  means either `HAVE_OBSTACLE_AVOIDANCE` is `False` or `ObstacleAvoider`
+  was never added to `V` at all (e.g. a `manage.py` that predates this
+  wiring — see "Does this actually run" below), as opposed to "wired in but
+  nothing detected yet", which prints nothing else until a cone appears.
+- **Whenever a blue-tape or orange-cone blob enters/leaves the scan band**,
+  one line naming which color matched, with the actually-sampled color at
+  the detection, e.g.:
+  ```
+  [cone_tape] orange cone candidate at x=219.5, scan_y=60 - sampled color HSV=(8,200,190) RGB=(230,95,15) - IN our lane
   ```
   This repeats every `CONE_LOG_INTERVAL_FRAMES` frames (default 10, ~0.5s at
-  20Hz) while the tape stays in view, so it's usable for live tuning — move
-  the car/tape and watch the HSV number track. Fires regardless of lane
-  geometry, so it confirms the color detector itself works even before
+  20Hz) while the cone stays in view, so it's usable for live tuning — move
+  the car/cone and watch the HSV number track. Fires regardless of lane
+  geometry, so it confirms the color detectors themselves work even before
   `lane/*` is wired correctly (see the gotcha below). The sampled patch is
   centered on the scan band's vertical midline, not averaged over the whole
-  band height — if the tape doesn't fill `CONE_SCAN_HEIGHT`, a full-height
+  band height — if the marker doesn't fill `CONE_SCAN_HEIGHT`, a full-height
   average would blend in the gray track and under-report saturation/value;
   this was caught by `test_raw_detection_logs_sampled_color_even_without_lane_geometry`
   actually failing (hue landed near 80, not blue's ~120) before the fix.
 - **`obstacle/cone_detected` transitions** (a separate, debounced line) once
-  the tape has been in our lane for `CONE_TRIGGER_FRAMES` consecutive
+  a cone has been in our lane for `CONE_TRIGGER_FRAMES` consecutive
   frames, and again when it clears.
 
 ### Known gotcha: `CV_CONTROLLER_OUTPUTS` must include the `lane/*` keys
@@ -202,7 +228,10 @@ in sync if the lane-geometry model ever changes.
 
 `donkeycar/templates/cv_control.py`, added after the CV controller
 (`LaneFollower`) and before recording, opt-in via
-`HAVE_OBSTACLE_AVOIDANCE` (default `False`):
+`HAVE_OBSTACLE_AVOIDANCE` (default `True` as of this project's current
+focus — was `False`; flipped because detection-only means it's safe to
+leave on, and leaving it off was the reason no terminal output was ever
+observed on the car despite the code being correct):
 
 ```python
 if getattr(cfg, 'HAVE_OBSTACLE_AVOIDANCE', False):
@@ -239,10 +268,28 @@ Traced through, not assumed:
   in `Memory` — same loop tick, no staleness — by the time `ObstacleAvoider`
   reads them).
 - The one thing this trace can't confirm from inside this repo is whether
-  `myconfig.py` on the Pi actually has `HAVE_OBSTACLE_AVOIDANCE = True` (the
-  part is opt-in, off by default in the shared template) and the full
-  `CV_CONTROLLER_OUTPUTS` list from the gotcha above — both live outside
-  this repo and need to be checked directly on the car.
+  `myconfig.py` on the Pi overrides `HAVE_OBSTACLE_AVOIDANCE` back to
+  `False`, and whether it sets the full `CV_CONTROLLER_OUTPUTS` list from
+  the gotcha above — both live outside this repo and need to be checked
+  directly on the car.
+- **A real gap found via `data/tub_33_26-07-24`'s `manifest.json`**: that
+  tub's declared schema is only `["cam/image_array", "steering", "throttle"]`
+  — not the 6-field list `cv_control.py`'s `TubWriter` always declares
+  (adding `lane/yellow_x`, `lane/white_x`, `lane/width_px`), regardless of
+  `CV_CONTROLLER_CLASS`. `Manifest._read_contents()`
+  (`donkeycar/parts/datastore_v2.py`) hard-asserts an existing tub's
+  declared schema matches the constructor's `inputs` exactly, and would
+  crash on mismatch — since this tub recorded 6463 frames without crashing,
+  whatever produced it declared exactly those 3 fields the whole time. That
+  means it wasn't running this repo's current `cv_control.py` at all. Since
+  `donkey createcar` *copies* a template into the car project's `manage.py`
+  rather than importing it live (per `CLAUDE.md`), the likely explanation is
+  that `/home/pi/mycar/manage.py` is a stale copy predating the
+  `ObstacleAvoider` wiring block entirely — meaning no config change in this
+  repo (including flipping `HAVE_OBSTACLE_AVOIDANCE`) will take effect until
+  `manage.py` is regenerated/re-copied from the current `cv_control.py` on
+  the car. **This needs to be checked directly on the Pi** — not verifiable
+  or fixable from this repo.
 
 ### Configuration
 
@@ -251,16 +298,19 @@ All in `donkeycar/templates/cfg_cv_control.py`, overridable per-car in
 — see `CLAUDE.md`):
 
 ```python
-HAVE_OBSTACLE_AVOIDANCE = False   # opt-in; detection-only regardless
+HAVE_OBSTACLE_AVOIDANCE = True   # detection-only regardless, so safe to leave on
 
 CONE_SCAN_Y = 60         # top of the forward scan slice, in pixels
 CONE_SCAN_HEIGHT = 30    # height of the scan slice, in pixels
 
+ORANGE_HSV_THRESHOLD_LOW = (0, 90, 60)      # calibrated against real cone pixels
+ORANGE_HSV_THRESHOLD_HIGH = (18, 255, 255)  # sampled from tub_33_26-07-24 - see Decision 1
+
 BLUE_HSV_THRESHOLD_LOW = (95, 100, 60)     # guessed, not yet tuned on hardware
 BLUE_HSV_THRESHOLD_HIGH = (130, 255, 255)  # -- see "Testing / tuning" below
 
-CONE_MIN_AREA_PX = 80    # smallest pixel area (in the scan slice) counted as the marker
-CONE_MAX_WIDTH_PX = 250  # widest pixel width (in the scan slice) counted as the marker
+CONE_MIN_AREA_PX = 80    # smallest pixel area (in the scan slice) counted as the cone/marker
+CONE_MAX_WIDTH_PX = 250  # widest pixel width (in the scan slice) counted as the cone/marker
 
 LANE_SHIFT_MARGIN_PX = 10  # margin added to our lane's bounds when testing membership
 CONE_TRIGGER_FRAMES = 2    # consecutive in-lane frames required before latching
@@ -277,7 +327,7 @@ against real tape under the car's actual lighting.
 
 ## Testing performed
 
-`donkeycar/tests/test_obstacle_avoider.py`, 21 tests, all passing (run with
+`donkeycar/tests/test_obstacle_avoider.py`, 28 tests, all passing (run with
 `conda activate donkey && python -m pytest donkeycar/tests/test_obstacle_avoider.py -v`
 — this repo's dev tooling lives in the `donkey` conda environment, not the
 system Python). All synthetic-image tests (no camera/hardware needed):
@@ -286,11 +336,14 @@ system Python). All synthetic-image tests (no camera/hardware needed):
   each direction, the mirrored "other lane" calculation, and the
   `white_right_of_yellow=False` (left-lane) sign flip.
 - Cone detected in our lane latches `cone_detected` after
-  `CONE_TRIGGER_FRAMES` consecutive frames, at approximately the right x.
+  `CONE_TRIGGER_FRAMES` consecutive frames, at approximately the right x —
+  for both the blue-tape and orange-cone detectors independently.
 - Cone detected in the *other* lane is found but correctly not counted as
-  "in our lane" (never latches).
-- A blue patch outside the scan band, or too small
+  "in our lane" (never latches) — both colors.
+- A blue or orange patch outside the scan band, or too small
   (`< CONE_MIN_AREA_PX`), is ignored.
+- When both colors produce a candidate in the same frame, the one that
+  actually passes the shape filter wins (`test_larger_blob_wins_when_both_colors_present`).
 - **Robustness / "ignore the background" checks:** a green (leaf-colored)
   patch in our lane doesn't trigger; a white line + yellow line drawn
   through the scan band don't trigger; a single detected frame followed by
@@ -298,16 +351,35 @@ system Python). All synthetic-image tests (no camera/hardware needed):
 - `cam_img=None` and the overlay path both pass through cleanly without
   altering `steering`/`throttle`.
 - **Diagnostics:** a raw detection logs its sampled HSV/RGB color even with
-  no lane geometry available, and that logged hue is asserted close to true
-  blue's ~120 (this test caught the vertical-averaging bug described in
-  "Terminal diagnostics" above — it originally logged ~80 before the fix);
-  the log clears on loss; the missing-lane-geometry warning fires exactly
-  once across repeated frames, and never fires when geometry is present.
+  no lane geometry available, tagged with which color matched, and the
+  logged hue is asserted close to true blue's ~120 / orange's ~10 (this
+  test caught the vertical-averaging bug described in "Terminal
+  diagnostics" above — it originally logged ~80 before the fix); the log
+  clears on loss; a one-time startup line names both configured color
+  ranges; the missing-lane-geometry warning fires exactly once across
+  repeated frames, and never fires when geometry is present.
 
-**Not yet tested/verified:** real camera footage. The HSV thresholds and
-scan-row placement are guesses (see above) and need to be checked against
-an actual frame of the taped track before relying on this on the car — same
-caveat every other CV threshold in this codebase carries.
+**Also validated against real camera footage** (`data/tub_33_26-07-24`,
+6463 frames) — not a substitute for on-car verification, but stronger than
+synthetic images alone:
+
+- Sampled real cone pixels from two separate frames (saturation-filtered to
+  exclude the cone's white reflective stripe and cast shadow) to calibrate
+  `ORANGE_HSV_THRESHOLD_LOW/HIGH`, rather than guessing.
+- Ran the actual `detect_cone()` over every 5th frame of the tub: the
+  orange detector fires at the frames independently confirmed (by eye) to
+  contain a cone, and stays quiet on frames without one.
+- Ran the old blue-only detector the same way first, *before* adding
+  orange: confirmed the blue tape marker from Decision 1's original design
+  does not appear anywhere in this recording — every blue match traced to
+  the recycling bin or kiosk sign at the image edges. This is what drove
+  the Decision 1 revision and the orange detector's addition.
+
+**Still not verified:** `BLUE_HSV_THRESHOLD_LOW/HIGH` remains an untuned
+guess (no tape marker was present in the only footage checked so far), and
+neither threshold has been checked against footage from a different
+lighting condition or camera than `tub_33_26-07-24`. Same caveat every
+other CV threshold in this codebase carries.
 
 ## Next steps
 
