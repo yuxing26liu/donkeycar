@@ -63,6 +63,50 @@ Merged into this file so far:
      laps (steering error vs. human), not derived from first principles.
      0.0 disables the bias entirely.
 
+  4. Dash-gap coasting (added after tub_53_26-07-24, the first drive with
+     changes 2-3 - user feedback: visibly staggered steering during turns).
+     Measured on tub_53: |dSteering| at yellow detect-state transitions ran
+     7.8x the everyday level, and 42% of all big steering jumps coincided
+     with one - the dashed line blinking in and out of the scan band flips
+     the lane-center estimate between the two-line midpoint and the
+     one-line width-offset fallback. Fix: LINE_COAST_FRAMES (per-color
+     overridable) - a tracker briefly keeps returning its last smoothed
+     position through a short miss instead of None. See
+     _LineTracker.coast_frames.
+
+  5. Multi-row scanning, reintroduced deliberately (config change - the
+     machinery always supported it; see LANE_SCAN_ROWS in myconfig.py).
+     The 2026-07-23 attempt failed because its lookahead row (scan_y=110)
+     was high enough to stare into planter beds; this version keeps every
+     row in the bottom third (scan_y 200/184/168, height 12, lower rows
+     weighted more). Row positions chosen by measuring per-row and joint
+     yellow coverage across tub_53 + both manual-lap tubs: the best single
+     row sees a yellow dash on only 31-37% of frames (worst tub), the
+     chosen triplet lifts at-least-one-row coverage to ~56% worst-case /
+     72% mean. Paired with cross-row outlier rejection
+     (LANE_ROW_OUTLIER_PX, see run()): with 3+ row centers, a row whose
+     estimate deviates from the rows' median by more than the threshold is
+     dropped - a rock/pebble/expansion-joint false positive corrupts one
+     row, and one corrupted row now contributes nothing. Known residual
+     limitation: a bright low-saturation object large enough to span
+     multiple rows near the expected line position (e.g. a long pale
+     pavement seam parallel to the lane) can still pass; the per-row jump
+     gates and the yellow-side min-separation bound are the remaining
+     defenses there.
+
+  6. Confidence-aware speed policy (added after tub_53_26-07-24; the old
+     binary law kept the car at THROTTLE_MIN 75%+ of the time on the inner
+     loop, while the human-driven reference laps barely slow for turns at
+     all - throttle 0.38 turning vs 0.40 straight, vs the autopilot's
+     0.15/0.30). Three stages: most rows blind this frame -> crawl at
+     THROTTLE_MIN; confident -> continuous interpolation from THROTTLE_MAX
+     (centered) to LANE_THROTTLE_TURN_MIN (hard turn) by |steering|; both
+     lines lost -> unchanged sustained-loss decay. See the __init__
+     comment and myconfig.py's LANE_THROTTLE_* block. NOT validated on the
+     car yet - speed changes cannot be validated by offline replay at all
+     (recorded frames don't respond to different throttle), flagged
+     explicitly for the next physical test.
+
 Not yet merged - bugs found and fixed, but not yet good enough to adopt
 (see donkeycar/parts/_candidates/):
 
@@ -406,10 +450,45 @@ class _LineTracker:
         self.reacquire_after_frames = getattr(cfg, 'REACQUIRE_AFTER_FRAMES', 15)
         self.smoothing_alpha = getattr(cfg, 'POSITION_SMOOTHING_ALPHA', 0.4)
 
+        # Dash-gap coasting (added after tub_53_26-07-24): on a miss, keep
+        # returning the last tracked position for up to this many frames
+        # instead of returning None immediately. A dashed line vanishing
+        # from the scan band between segments is EXPECTED, not a loss - but
+        # returning None flips LaneFollower's lane-center estimate between
+        # the two-line midpoint and the one-line width-offset fallback,
+        # which measured out as the dominant stagger source on tub_53
+        # (|dSteering| at yellow detect-state flips was 7.8x the everyday
+        # level, and 42% of all big steering jumps coincided with one).
+        # Coasting holds the estimate steady across a short gap; the value
+        # goes stale by roughly the line's per-frame image motion (a few px
+        # per frame mid-turn), which is far smaller than the fallback jump
+        # it replaces. lost_frames still accumulates during a coast, so the
+        # reacquire window and LaneFollower's sustained-loss handling are
+        # unaffected - after coast_frames consecutive misses the tracker
+        # reverts to honest None returns. 0 disables (pre-feature behavior).
+        self.coast_frames = _shape_param(cfg, color_name, 'LINE_COAST_FRAMES', 0)
+
         self.tracked_position = None
         self.smoothed_position = None
         self.lost_frames = 0
         self.just_reacquired = False
+
+    def _register_miss(self, mask):
+        '''Shared bookkeeping for every no-usable-detection path in
+        update(): count the miss, then either coast (return the last
+        tracked position, see coast_frames in __init__) or report an
+        honest miss (None).'''
+        self.lost_frames += 1
+        self.just_reacquired = False
+        if (self.tracked_position is not None
+                and self.lost_frames <= self.coast_frames):
+            # return the smoothed position (same value the normal detected
+            # path returns) so a coast frame is indistinguishable downstream
+            # from a steady detection, rather than stepping to the raw
+            # tracked value and back
+            coasted = self.smoothed_position if self.smoothed_position is not None else self.tracked_position
+            return coasted, mask
+        return None, mask
 
     def update(self, scan_line_rgb, x_min=None, x_max=None):
         '''
@@ -450,18 +529,14 @@ class _LineTracker:
                 tag = f"[{self.color_name}] " if self.color_name else ""
                 logger.debug(f"{tag}rejecting mask: {mask_fraction * 100:.1f}% of scan band matched "
                               f"(> {self.max_mask_fraction * 100:.0f}%) - likely glare/overexposure")
-            self.lost_frames += 1
-            self.just_reacquired = False
-            return None, mask
+            return self._register_miss(mask)
 
         raw_x, _area = _select_line_blob(mask, self.min_area_px, self.max_width_px, self.min_aspect_ratio,
                                           log_tag=self.color_name, preferred_x=self.tracked_position,
                                           x_min=x_min, x_max=x_max)
 
         if raw_x is None:
-            self.lost_frames += 1
-            self.just_reacquired = False
-            return None, mask
+            return self._register_miss(mask)
 
         if self.tracked_position is None or self.lost_frames > self.reacquire_after_frames:
             # no track yet, or lost long enough that we stop waiting and
@@ -478,9 +553,7 @@ class _LineTracker:
                 tag = f"[{self.color_name}] " if self.color_name else ""
                 logger.debug(f"{tag}rejecting jump: raw_x={raw_x:.1f} vs tracked={self.tracked_position:.1f} "
                               f"(delta={abs(raw_x - self.tracked_position):.1f} > max_jump={self.max_jump_pixels})")
-            self.lost_frames += 1
-            self.just_reacquired = False
-            return None, mask
+            return self._register_miss(mask)
 
         self.tracked_position = accepted_x
         self.lost_frames = 0
@@ -557,6 +630,14 @@ class LaneFollower:
         self.white_right_of_yellow = getattr(cfg, 'WHITE_RIGHT_OF_YELLOW', True)
         self.lane_width_px = getattr(cfg, 'LANE_WIDTH_PX', 150)
         self.lane_width_smoothing_alpha = getattr(cfg, 'LANE_WIDTH_SMOOTHING_ALPHA', 0.1)
+        # Per-row lane-width estimates (see _lane_center's docstring for why
+        # a single shared width dithers the multi-row average): each row
+        # self-corrects its own width whenever it sees both lines together,
+        # exactly like the old single shared estimate did. All start from
+        # the same LANE_WIDTH_PX initial guess; self.lane_width_px above
+        # stays as the PRIMARY row's estimate (published to the tub and
+        # returned from run(), unchanged contract).
+        self.row_lane_width_px = [float(self.lane_width_px) for _ in self.scan_rows]
 
         self.target_pixel = getattr(cfg, 'LANE_TARGET_PIXEL', None)
         self.target_threshold = getattr(cfg, 'LANE_TARGET_THRESHOLD', 10)
@@ -568,11 +649,92 @@ class LaneFollower:
         # watch real turning behavior on the car before trusting it further.
         self.error_saturation_px = getattr(cfg, 'LANE_ERROR_SATURATION_PX', 80)
 
+        # Cross-row outlier rejection (added after tub_53_26-07-24, only
+        # meaningful with 3+ scan rows): a real lane line intersects every
+        # scan row at a roughly consistent lane-center estimate, while a
+        # rock/pebble/expansion-joint false positive corrupts the one row it
+        # happens to fall in. When 3+ rows produce a center this frame, any
+        # row whose center sits more than this many px from the rows' median
+        # is dropped before the weighted average - a single corrupted row
+        # then contributes nothing at all, instead of dragging the average
+        # by its weight share. Deliberately does nothing with 1-2 rows
+        # (median of 2 can't identify which one is wrong). Applied to the
+        # offset-corrected centers (below), so mid-curve the median is
+        # comparing like with like.
+        self.row_outlier_px = getattr(cfg, 'LANE_ROW_OUTLIER_PX', 40)
+
+        # Per-row center offsets relative to the primary row (found while
+        # debugging the first multi-row eval: overall steering jerk DOUBLED
+        # despite better yellow coverage). Root cause: the combined estimate
+        # was a weighted mean over whichever rows happened to detect this
+        # frame, but different rows legitimately disagree about the lane
+        # center mid-curve (the lane bends across the image - at y=168 the
+        # center can sit tens of px from where it sits at y=200), so every
+        # row joining or leaving the detected set stepped the average by its
+        # weight share of that disagreement - hundreds of extra
+        # |dSteer|>0.1 frames on tub_53. Fix: track a slow EMA of each
+        # row's center minus the primary row's center (updated only when
+        # both are visible), and combine offset-CORRECTED centers - every
+        # contribution is then expressed in the primary row's coordinate
+        # frame, so membership churn no longer moves the average. Curve
+        # anticipation survives in the transient: when a curve begins, a
+        # far row's corrected center deviates before the near row moves,
+        # and the slow alpha (default 0.05) lets that early signal through
+        # rather than absorbing it.
+        self.row_center_offset = [0.0 for _ in self.scan_rows]
+        self.row_offset_alpha = getattr(cfg, 'LANE_ROW_OFFSET_ALPHA', 0.05)
+        # Offsets are only learned from TWO-LINE centers on both sides
+        # (instrumenting tub_53 caught the EMA absorbing a -421px "offset" -
+        # a one-line fallback center built on a corrupted width estimate is
+        # not evidence of row geometry), and are clamped to the range real
+        # perspective/curvature can produce between rows this close
+        # together.
+        self.row_offset_clamp_px = getattr(cfg, 'LANE_ROW_OFFSET_CLAMP_PX', 60)
+
+        # Rate limiter on the combined lane-center estimate (found via the
+        # same tub_53 instrumentation): every full-lock steering swing
+        # coincided with one of the six trackers reacquiring after a long
+        # loss and snapping the weighted average in a single frame - the
+        # per-tracker "snap on reacquire" behavior is correct for the
+        # tracker itself, but the *combined* estimate feeding the PID (and
+        # its derivative term) must not step half the image at once. The
+        # limit bounds position change per frame; 25px/frame = 500px/s at
+        # 20Hz, far faster than any real lane drift, so normal driving
+        # never hits it - only snap events get slewed over a few frames
+        # instead of one. Reset (fresh snap allowed) after a genuine
+        # sustained full loss, so re-engaging a newly-found lane far away
+        # doesn't slew from a stale anchor. 0 disables.
+        self.position_rate_limit_px = getattr(cfg, 'LANE_POSITION_RATE_LIMIT_PX', 25)
+        self._last_position = None
+
         self.steering = 0.0  # from -1 to 1
         self.throttle = cfg.THROTTLE_INITIAL  # from -1 to 1
         self.delta_th = cfg.THROTTLE_STEP
         self.throttle_max = cfg.THROTTLE_MAX
         self.throttle_min = cfg.THROTTLE_MIN
+
+        # Confidence-aware speed policy (added after tub_53_26-07-24; the
+        # old law was binary: any |position-target| beyond a threshold
+        # ramped throttle to THROTTLE_MIN, which left the car at minimum
+        # throttle 75%+ of the time on the inner loop while the human
+        # driver's recorded laps barely slow for turns at all - see
+        # myconfig.py's LANE_THROTTLE_TURN_MIN comment for the measured
+        # reference numbers). Three stages:
+        #   - detection confidence below LANE_THROTTLE_CONF_OK (fraction of
+        #     scan rows contributing a lane-center estimate this frame):
+        #     crawl at THROTTLE_MIN - speed is only earned by perception
+        #     actually working, not by optimism;
+        #   - confident: throttle target interpolates from THROTTLE_MAX
+        #     (steering centered) down to LANE_THROTTLE_TURN_MIN (|steering|
+        #     at LANE_THROTTLE_STEER_SCALE or beyond) - a continuous law,
+        #     so gentle curves no longer pay the full turn penalty;
+        #   - both lines lost everywhere: the existing sustained-loss decay
+        #     path below is unchanged (ease to a stop).
+        # The ramp toward the target keeps using THROTTLE_STEP per frame,
+        # same as before - only what it ramps TOWARD changed.
+        self.throttle_turn_min = getattr(cfg, 'LANE_THROTTLE_TURN_MIN', cfg.THROTTLE_MIN)
+        self.throttle_steer_scale = getattr(cfg, 'LANE_THROTTLE_STEER_SCALE', 0.6)
+        self.throttle_conf_ok = getattr(cfg, 'LANE_THROTTLE_CONF_OK', 0.5)
 
         self.max_lost_frames = getattr(cfg, 'MAX_LOST_FRAMES', 40)
         self.lost_steering_decay = getattr(cfg, 'LOST_STEERING_DECAY', 0.85)
@@ -593,6 +755,16 @@ class LaneFollower:
         # white tracker that has latched onto something wrong can't veto
         # correct yellow detections while it recovers.
         self.min_separation_px = getattr(cfg, 'LANE_MIN_SEPARATION_PX', 50)
+        # Symmetric upper bound (added after reviewing tub_53 overlays: with
+        # the real white line forbidden by the min-separation bound - it was
+        # on yellow's wrong side - the white tracker latched onto a sunlit
+        # bright patch at the far image edge instead, implying a 375px lane
+        # width when real widths at these scan rows run ~150-250px). White
+        # candidates further than this from the yellow reference are just as
+        # geometrically impossible as ones on the wrong side. Wide enough to
+        # never clip a genuine width, tight enough to exclude
+        # edge-of-frame glare. 0 disables.
+        self.max_separation_px = getattr(cfg, 'LANE_MAX_SEPARATION_PX', 280)
 
         # Outer-line turn bias (new after tub_51_26-07-24): shift the
         # steering target toward the OUTSIDE line of the current turn -
@@ -620,27 +792,33 @@ class LaneFollower:
         # why this must be set on the pid object, not clipped post-hoc.
         self.pid_st.output_limits = (-1.0, 1.0)
 
-    def _lane_center(self, yellow_x, white_x):
+    def _lane_center(self, yellow_x, white_x, lane_width_px):
         '''
         Combine whichever of the two lines is visible into a single "center of
         our lane" pixel position.
 
         When only one line is visible, the other's position is estimated as an
-        offset of self.lane_width_px using WHITE_RIGHT_OF_YELLOW - the only
+        offset of lane_width_px using WHITE_RIGHT_OF_YELLOW - the only
         signal available, since (per this track's 2-line design) there is no
         second boundary line on the far side of the road to measure against
-        directly. This assumes the lane is roughly the same pixel width at
-        this scan row every frame, which self.lane_width_px's continuous
-        re-estimation (see run()) keeps reasonably current.
+        directly. lane_width_px must be THIS ROW's width estimate (see
+        self.row_lane_width_px in run()), not a single shared value:
+        perspective makes the same physical lane span meaningfully more
+        pixels in a lower scan row (y=200) than a higher one (y=168), so a
+        shared width put every non-primary row's one-line fallback center
+        systematically off - and rows flipping between two-line and fallback
+        modes then dithered the combined average. Found when the first
+        multi-row eval regressed sign-flip rate (5.3%->7.6% on
+        two_inner_laps) before this per-row split.
         '''
         if yellow_x is not None and white_x is not None:
             return (yellow_x + white_x) / 2.0
 
         sign = 1.0 if self.white_right_of_yellow else -1.0
         if yellow_x is not None:
-            return yellow_x + sign * self.lane_width_px / 2.0
+            return yellow_x + sign * lane_width_px / 2.0
         if white_x is not None:
-            return white_x - sign * self.lane_width_px / 2.0
+            return white_x - sign * lane_width_px / 2.0
         return None
 
     def run(self, cam_img):
@@ -664,6 +842,8 @@ class LaneFollower:
 
         row_centers = []
         row_weights = []
+        row_indexes = []
+        row_two_line = []
         near_yellow_x = None
         near_white_x = None
         overlay_rows = []
@@ -703,8 +883,12 @@ class LaneFollower:
             if yellow_ref is not None:
                 if self.white_right_of_yellow:
                     white_x_min = yellow_ref + self.min_separation_px
+                    if self.max_separation_px > 0:
+                        white_x_max = yellow_ref + self.max_separation_px
                 else:
                     white_x_max = yellow_ref - self.min_separation_px
+                    if self.max_separation_px > 0:
+                        white_x_min = yellow_ref - self.max_separation_px
 
             white_x, white_mask = self.white_trackers[i].update(scan_line,
                                                                  x_min=white_x_min, x_max=white_x_max)
@@ -712,20 +896,46 @@ class LaneFollower:
 
             if i == 0:
                 # the primary (nearest) row is authoritative for the
-                # published lane geometry and the lane-width estimate below
+                # published lane geometry and self.lane_width_px below
                 near_yellow_x, near_white_x = yellow_x, white_x
 
-            center = self._lane_center(yellow_x, white_x)
+            # each row keeps its own width estimate current whenever it
+            # sees both lines together - see row_lane_width_px in __init__
+            if yellow_x is not None and white_x is not None:
+                measured_width = abs(white_x - yellow_x)
+                self.row_lane_width_px[i] = (
+                    self.lane_width_smoothing_alpha * measured_width
+                    + (1 - self.lane_width_smoothing_alpha) * self.row_lane_width_px[i])
+
+            center = self._lane_center(yellow_x, white_x, self.row_lane_width_px[i])
             if center is not None:
                 row_centers.append(center)
                 row_weights.append(weight)
+                row_indexes.append(i)
+                row_two_line.append(yellow_x is not None and white_x is not None)
 
-        # keep the lane-width estimate current off the primary row only -
-        # perspective makes a farther row's apparent width less reliable
-        if near_yellow_x is not None and near_white_x is not None:
-            measured_width = abs(near_white_x - near_yellow_x)
-            self.lane_width_px = (self.lane_width_smoothing_alpha * measured_width
-                                   + (1 - self.lane_width_smoothing_alpha) * self.lane_width_px)
+        # the published/returned lane width stays the primary row's estimate
+        # (unchanged contract with the tub recording / downstream parts)
+        self.lane_width_px = self.row_lane_width_px[0]
+
+        # Offset-correct every row's center into the primary row's frame -
+        # see row_center_offset in __init__ for why (membership churn in a
+        # raw weighted mean was the dominant jerk source on tub_53). Learn
+        # offsets ONLY from frames where both this row's and the primary
+        # row's centers are true two-line measurements, and clamp - see
+        # row_offset_clamp_px in __init__ for the poisoned-EMA incident
+        # this guards against.
+        if row_centers:
+            if 0 in row_indexes and row_two_line[row_indexes.index(0)]:
+                primary_center = row_centers[row_indexes.index(0)]
+                for c, idx, two_line in zip(row_centers, row_indexes, row_two_line):
+                    if idx != 0 and two_line:
+                        new_off = (self.row_offset_alpha * (c - primary_center)
+                                    + (1 - self.row_offset_alpha) * self.row_center_offset[idx])
+                        self.row_center_offset[idx] = max(-self.row_offset_clamp_px,
+                                                           min(self.row_offset_clamp_px, new_off))
+            row_centers = [c - self.row_center_offset[idx]
+                           for c, idx in zip(row_centers, row_indexes)]
 
         if near_yellow_x is not None:
             self.last_yellow_x = near_yellow_x
@@ -735,10 +945,36 @@ class LaneFollower:
         if row_centers:
             self.lost_frames = 0
 
-            # weighted average across scan rows: the near row keeps the car
-            # centered right now, farther rows anticipate an upcoming curve
-            # before the near row's detection would otherwise catch it
-            position = sum(c * w for c, w in zip(row_centers, row_weights)) / sum(row_weights)
+            # Cross-row outlier rejection - see LANE_ROW_OUTLIER_PX in
+            # __init__. Only defined for 3+ centers; the median of 3 is a
+            # real row's value, so a single rock-corrupted row can never be
+            # the median and always gets dropped when it deviates enough.
+            kept_centers, kept_weights = row_centers, row_weights
+            if len(row_centers) >= 3:
+                med = sorted(row_centers)[len(row_centers) // 2]
+                kept = [(c, w) for c, w in zip(row_centers, row_weights)
+                        if abs(c - med) <= self.row_outlier_px]
+                if kept:  # can't be empty (median keeps itself), but stay safe
+                    kept_centers = [c for c, _ in kept]
+                    kept_weights = [w for _, w in kept]
+
+            # weighted average across (surviving) scan rows: the near row
+            # keeps the car centered right now, farther rows anticipate an
+            # upcoming curve before the near row's detection would
+            # otherwise catch it
+            position = sum(c * w for c, w in zip(kept_centers, kept_weights)) / sum(kept_weights)
+
+            # Rate-limit the combined estimate - see position_rate_limit_px
+            # in __init__ (a tracker reacquire snapping the average half the
+            # image in one frame was the direct cause of every full-lock
+            # steering swing found on tub_53). Slews big steps over a few
+            # frames; never engages during normal driving.
+            if self.position_rate_limit_px > 0 and self._last_position is not None:
+                step = position - self._last_position
+                if abs(step) > self.position_rate_limit_px:
+                    position = (self._last_position
+                                 + math.copysign(self.position_rate_limit_px, step))
+            self._last_position = position
 
             # Outer-line turn bias (see LANE_OUTER_BIAS_GAIN_PX in __init__):
             # shift the effective target toward the outside of the current
@@ -762,12 +998,23 @@ class LaneFollower:
             pid_input = self.target_pixel + soft_error_px
             self.steering = self.pid_st(pid_input)
 
-            if abs(position - self.target_pixel) > self.target_threshold:
-                # turning - slow down
-                self.throttle = max(self.throttle - self.delta_th, self.throttle_min)
+            # Confidence-aware speed policy - see the __init__ comment for
+            # the staged design and myconfig.py for the measured human
+            # reference this replaces the old binary slow-down law with.
+            confidence = len(row_centers) / len(self.scan_rows)
+            if confidence >= self.throttle_conf_ok:
+                turn_factor = min(abs(self.steering) / self.throttle_steer_scale, 1.0)
+                throttle_target = (self.throttle_max
+                                    - (self.throttle_max - self.throttle_turn_min) * turn_factor)
             else:
-                # straight - speed up
-                self.throttle = min(self.throttle + self.delta_th, self.throttle_max)
+                # perception is genuinely shaky this frame (most rows see
+                # nothing) - crawl, don't coast on optimism
+                throttle_target = self.throttle_min
+
+            if self.throttle < throttle_target:
+                self.throttle = min(self.throttle + self.delta_th, throttle_target)
+            else:
+                self.throttle = max(self.throttle - self.delta_th, throttle_target)
         else:
             # neither line visible in any scan row this frame - a genuine
             # loss, not just the dashed line's expected per-frame gap (that's
@@ -777,6 +1024,12 @@ class LaneFollower:
             # real-tub-replay motivation for this behavior.
             self.lost_frames += 1
             self.steering *= self.lost_steering_decay
+            if self.lost_frames > 15:
+                # after a genuine sustained loss, drop the rate-limiter
+                # anchor so re-engaging a newly-found lane snaps fresh
+                # instead of slewing from a stale position - see
+                # position_rate_limit_px in __init__
+                self._last_position = None
             if self.lost_frames > self.max_lost_frames:
                 if self.lost_frames == self.max_lost_frames + 1:
                     logger.warning(
