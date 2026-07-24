@@ -360,9 +360,9 @@ def _summarize(tub_dir, n_frames, n_errors, first_error,
     return metrics
 
 
-def evaluate_across_tubs(candidate_spec, tubs_dir=DEFAULT_TUBS_DIR,
+def evaluate_across_tubs(candidate_spec, tubs_dir=None,
                           myconfig_path=DEFAULT_MYCONFIG, overrides=None,
-                          ground_truth_tubs=DEFAULT_GROUND_TRUTH_TUBS,
+                          ground_truth_tubs=None,
                           tub_names=None, hz=DEFAULT_HZ, max_frames=None):
     candidate_cls, module_overrides = load_candidate(candidate_spec)
     # candidate's own CFG_OVERRIDES apply first; anything passed explicitly
@@ -371,6 +371,24 @@ def evaluate_across_tubs(candidate_spec, tubs_dir=DEFAULT_TUBS_DIR,
     merged_overrides.update(overrides or {})
     overrides = merged_overrides
     overrides.setdefault("OVERLAY_IMAGE", False)  # not needed for scoring, only slows replay down
+
+    # Validation scope comes from myconfig.py (EVAL_TUBS_DIR / EVAL_TUBS /
+    # EVAL_GROUND_TRUTH_TUBS) unless overridden by an explicit argument/CLI
+    # flag. Decided 2026-07-24: the older autonomous tubs (tub_4..tub_31)
+    # were all recorded under earlier, faulty lane-follower iterations, so
+    # they no longer gate anything - the trusted validation set is the two
+    # human-driven lap recordings (ground truth for steering) plus the most
+    # recent on-car tub as a limited reference. With no EVAL_TUBS configured
+    # anywhere, falls back to scanning every folder in the tubs dir, the old
+    # behavior.
+    scope_cfg = load_cfg(myconfig_path, overrides)
+    if tubs_dir is None:
+        tubs_dir = getattr(scope_cfg, "EVAL_TUBS_DIR", DEFAULT_TUBS_DIR)
+    if tub_names is None:
+        tub_names = getattr(scope_cfg, "EVAL_TUBS", None)
+    if ground_truth_tubs is None:
+        ground_truth_tubs = set(getattr(scope_cfg, "EVAL_GROUND_TRUTH_TUBS",
+                                         DEFAULT_GROUND_TRUTH_TUBS))
 
     if tub_names is None:
         tub_names = sorted(
@@ -469,10 +487,12 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--tubs-dir", default=DEFAULT_TUBS_DIR)
+    common.add_argument("--tubs-dir", default=None,
+                         help="Override EVAL_TUBS_DIR from myconfig (fallback: Desktop/tubs)")
     common.add_argument("--myconfig", default=DEFAULT_MYCONFIG)
     common.add_argument("--tub", action="append", dest="tub_names",
-                         help="Limit to this tub name (repeatable); default = every tub in --tubs-dir")
+                         help="Limit to this tub name (repeatable); default = EVAL_TUBS from "
+                              "myconfig, else every tub in the tubs dir")
     common.add_argument("--max-frames", type=int, default=None,
                          help="Cap frames per tub, for a quick smoke test")
     common.add_argument("--output", help="Write the full JSON report here")

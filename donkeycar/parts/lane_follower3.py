@@ -29,7 +29,39 @@ Merged into this file so far:
      steering-vs-human-driving error on the two ground-truth tubs, sign-flip
      rate, stopped fraction all flat or improved). k = LANE_ERROR_SATURATION_PX
      (see myconfig.py), a starting estimate (~image_width/5), not yet
-     calibrated against real on-car turning behavior.
+     calibrated against real on-car turning behavior. CONFIRMED ON CAR
+     (tub_51_26-07-24, first real drive): full-lock steering 0.1% of frames,
+     zero sustained full-lock runs - the mechanism works as designed.
+
+  2. Geometric plausibility constraint (added after tub_51_26-07-24's
+     on-car feedback). The two most common failures on that drive: the
+     white tracker picking the SAME physical line as the yellow tracker,
+     and picking a white line on the WRONG side of yellow (the opposite
+     lane's outer edge, chosen when this lane's white line left the frame
+     during a sharp turn). Both are geometrically impossible viewed from
+     inside the right lane - white is always to the right of the yellow
+     centerline (WHITE_RIGHT_OF_YELLOW), and the two lines never share an
+     x position. Fix: white's blob candidates are hard-bounded to
+     x >= yellow_ref + LANE_MIN_SEPARATION_PX (mirrored when
+     WHITE_RIGHT_OF_YELLOW is False), where yellow_ref is this frame's
+     yellow detection or its recently-tracked position. Enforced inside
+     blob selection itself, so it holds even when the impossible candidate
+     is the only candidate - the case the proximity/area rules can't help
+     with, and the reason the earlier joint_edge_selection candidate
+     (which needed candidates from both colors to compare) never fired on
+     exactly these failures. Deliberately one-directional (yellow bounds
+     white, never the reverse) - see the __init__ comment.
+
+  3. Outer-line turn bias, config-gated (added after the same drive; user
+     observation: even with detection working, a lane-midpoint target
+     leaves no margin toward the inside of a turn, so the car clips the
+     inside line - the target should sit closer to whichever line is on
+     the OUTSIDE of the turn). The effective steering target is shifted by
+     LANE_OUTER_BIAS_GAIN_PX * (previous frame's steering output); the
+     gain's sign maps "outside of the turn" onto an image direction and
+     was selected by offline sweep against the human-driven ground-truth
+     laps (steering error vs. human), not derived from first principles.
+     0.0 disables the bias entirely.
 
 Not yet merged - bugs found and fixed, but not yet good enough to adopt
 (see donkeycar/parts/_candidates/):
@@ -92,7 +124,8 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag=None, preferred_x=None):
+def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag=None, preferred_x=None,
+                       x_min=None, x_max=None):
     '''
     Pick the best line-shaped connected component in a binary mask.
 
@@ -119,10 +152,27 @@ def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag
     within a single blob, it fixes *choosing between two true positives*, which
     the area rule was never meant to arbitrate.
 
+    x_min/x_max (optional) are HARD plausibility bounds on the winning blob's
+    centroid x, applied before the preferred_x/area pick: a candidate outside
+    them is discarded outright, even if it's the only candidate. Added after
+    tub_51_26-07-24 (the first real lane_follower3 drive): the two most
+    common on-car failures were the white tracker picking the *same* physical
+    line as the yellow tracker, and picking a white line to the LEFT of the
+    yellow centerline (the opposite lane's outer edge) when this lane's white
+    line left the frame during a sharp turn - both geometrically impossible
+    for the real lane being driven (white is always to the right of yellow
+    from the right lane, and the two lines are never at the same x). The
+    proximity/area rules can't reject these - when the true line is out of
+    frame, the impossible candidate is often the only one - so the caller
+    passes bounds derived from the *other* color's position, and this filter
+    makes the impossible pick structurally unavailable rather than merely
+    unlikely.
+
     input: mask, binary (0/255) uint8 image; log_tag, optional label (e.g. color
            name) used to identify which tracker a rejection log line came from;
            preferred_x, optional last-known x position - when given, breaks ties
-           by proximity instead of area
+           by proximity instead of area;
+           x_min/x_max, optional hard bounds on plausible centroid x
     output: (x, area) of the winning blob's centroid x and pixel area, or (None, 0)
     '''
     num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -161,7 +211,17 @@ def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag
                 rejected.append(f"aspect={aspect:.2f}<{min_aspect_ratio} (w={width},h={height})")
             continue
 
-        candidates.append((float(centroids[label][0]), int(area)))
+        cx = float(centroids[label][0])
+        if x_min is not None and cx < x_min:
+            if log_rejections:
+                rejected.append(f"x={cx:.1f}<x_min={x_min:.1f} (geometric plausibility bound)")
+            continue
+        if x_max is not None and cx > x_max:
+            if log_rejections:
+                rejected.append(f"x={cx:.1f}>x_max={x_max:.1f} (geometric plausibility bound)")
+            continue
+
+        candidates.append((cx, int(area)))
 
     if not candidates:
         if rejected:
@@ -351,9 +411,18 @@ class _LineTracker:
         self.lost_frames = 0
         self.just_reacquired = False
 
-    def update(self, scan_line_rgb):
+    def update(self, scan_line_rgb, x_min=None, x_max=None):
         '''
-        input: scan_line_rgb, an RGB numpy array (one scan row's cropped band)
+        input: scan_line_rgb, an RGB numpy array (one scan row's cropped band);
+               x_min/x_max, optional hard plausibility bounds on the detected
+               x, forwarded to _select_line_blob (see its docstring) - used by
+               LaneFollower.run to keep the two colors' picks geometrically
+               consistent with each other (white right of yellow, minimum
+               separation). A frame whose only candidates violate the bounds
+               counts as a miss, same as any other no-detection frame - and if
+               the tracker had previously latched onto a now-out-of-bounds
+               line, the normal sustained-loss reacquire path is what recovers
+               it onto a legal candidate.
         output: (smoothed_x, mask) if a plausible line was found this frame,
                  else (None, mask)
         '''
@@ -386,7 +455,8 @@ class _LineTracker:
             return None, mask
 
         raw_x, _area = _select_line_blob(mask, self.min_area_px, self.max_width_px, self.min_aspect_ratio,
-                                          log_tag=self.color_name, preferred_x=self.tracked_position)
+                                          log_tag=self.color_name, preferred_x=self.tracked_position,
+                                          x_min=x_min, x_max=x_max)
 
         if raw_x is None:
             self.lost_frames += 1
@@ -508,6 +578,38 @@ class LaneFollower:
         self.lost_steering_decay = getattr(cfg, 'LOST_STEERING_DECAY', 0.85)
         self.lost_frames = 0
 
+        # Geometric plausibility constraint (new after tub_51_26-07-24, the
+        # first on-car drive of this file - see module docstring): the white
+        # tracker's candidates are hard-bounded to sit at least this many
+        # pixels on WHITE_RIGHT_OF_YELLOW's side of the yellow line, so
+        # "white and yellow picked the same physical line" and "white picked
+        # on the wrong side of yellow" (both observed repeatedly on that
+        # drive, both geometrically impossible from inside the lane) are
+        # structurally unavailable rather than merely unlikely. One-
+        # directional by design: yellow (HSV saturation, historically the
+        # reliable detector here) constrains white (LAB-adaptive, the known
+        # weak point, and the side both observed failures were on) - a
+        # white-constrains-yellow bound is deliberately NOT applied, so a
+        # white tracker that has latched onto something wrong can't veto
+        # correct yellow detections while it recovers.
+        self.min_separation_px = getattr(cfg, 'LANE_MIN_SEPARATION_PX', 50)
+
+        # Outer-line turn bias (new after tub_51_26-07-24): shift the
+        # steering target toward the OUTSIDE line of the current turn -
+        # user-observed failure mode is crossing the inside line mid-turn
+        # even with detection working, because a midpoint target leaves no
+        # margin for the unseen blind zone between the camera's scan row
+        # and the car. Bias is proportional to the previous frame's
+        # steering output (already smoothed, cheap turn-direction signal):
+        # bias_px = LANE_OUTER_BIAS_GAIN_PX * self.steering. The gain's
+        # SIGN encodes which image direction "outside of the turn" is for
+        # this camera/steering polarity - it was chosen by offline sweep
+        # against the human-driven ground-truth laps, not derived from
+        # first principles; if the drivetrain's steering polarity ever
+        # changes, this sign must be re-checked. 0.0 disables the bias
+        # entirely (behavior identical to before this feature existed).
+        self.outer_bias_gain_px = getattr(cfg, 'LANE_OUTER_BIAS_GAIN_PX', 0.0)
+
         self.last_yellow_x = None
         self.last_white_x = None
 
@@ -578,7 +680,34 @@ class LaneFollower:
                 continue
 
             yellow_x, yellow_mask = self.yellow_trackers[i].update(scan_line)
-            white_x, white_mask = self.white_trackers[i].update(scan_line)
+
+            # Geometric plausibility bound for white, derived from yellow -
+            # see the LANE_MIN_SEPARATION_PX comment in __init__. Prefer this
+            # frame's fresh yellow detection; fall back to yellow's tracked
+            # position while it's only briefly lost (a normal dashed-line
+            # gap), since the line hasn't plausibly moved far in that time.
+            # No yellow reference at all (cold start, or yellow lost past its
+            # reacquire window) -> no bound; the constraint can only be as
+            # available as the line it's derived from.
+            yellow_tracker = self.yellow_trackers[i]
+            if yellow_x is not None:
+                yellow_ref = yellow_x
+            elif (yellow_tracker.tracked_position is not None
+                    and yellow_tracker.lost_frames <= yellow_tracker.reacquire_after_frames):
+                yellow_ref = yellow_tracker.tracked_position
+            else:
+                yellow_ref = None
+
+            white_x_min = None
+            white_x_max = None
+            if yellow_ref is not None:
+                if self.white_right_of_yellow:
+                    white_x_min = yellow_ref + self.min_separation_px
+                else:
+                    white_x_max = yellow_ref - self.min_separation_px
+
+            white_x, white_mask = self.white_trackers[i].update(scan_line,
+                                                                 x_min=white_x_min, x_max=white_x_max)
             overlay_rows.append((scan_y, yellow_mask, white_mask, yellow_x, white_x))
 
             if i == 0:
@@ -611,13 +740,23 @@ class LaneFollower:
             # before the near row's detection would otherwise catch it
             position = sum(c * w for c, w in zip(row_centers, row_weights)) / sum(row_weights)
 
+            # Outer-line turn bias (see LANE_OUTER_BIAS_GAIN_PX in __init__):
+            # shift the effective target toward the outside of the current
+            # turn, using the previous frame's steering output as the turn
+            # signal. Applied to the target rather than the measurement so
+            # the soft-saturation below still operates on the true remaining
+            # error. self.steering here is last frame's value - by the time
+            # it's overwritten below, the bias for THIS frame is already
+            # baked into pid_input.
+            effective_target = self.target_pixel + self.outer_bias_gain_px * self.steering
+
             # Soft-saturate the lateral error before handing it to the PID
             # (see module docstring): for small errors this is numerically
             # ~identical to using position directly (tanh(x/k) ~= x/k near
             # 0), but large errors are compressed instead of growing
             # linearly, so a big momentary error is less likely to drive
             # the proportional term straight to full steering lock.
-            error_px = position - self.target_pixel
+            error_px = position - effective_target
             k = self.error_saturation_px
             soft_error_px = k * math.tanh(error_px / k)
             pid_input = self.target_pixel + soft_error_px
