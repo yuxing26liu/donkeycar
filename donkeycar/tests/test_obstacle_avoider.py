@@ -33,6 +33,20 @@ class _Cfg:
     OVERLAY_IMAGE = False
     CONE_LOG_INTERVAL_FRAMES = 10
 
+    # avoidance maneuver (Phase 2) - same values as cfg_cv_control.py's
+    # defaults for the constants it reuses (PID_P/I/D, THROTTLE_*,
+    # MAX_LOST_FRAMES, LOST_STEERING_DECAY), spelled out explicitly here so
+    # test behavior doesn't depend on ObstacleAvoider's internal fallbacks
+    PID_P = -0.01
+    PID_I = 0.0
+    PID_D = -0.0001
+    LANE_TARGET_THRESHOLD = 10
+    THROTTLE_STEP = 0.05
+    THROTTLE_MIN = 0.1
+    THROTTLE_MAX = 0.3
+    MAX_LOST_FRAMES = 40
+    LOST_STEERING_DECAY = 0.85
+
 
 def _make_frame(patches=()):
     '''patches: iterable of (x0, x1, y0, y1, rgb_color) rectangles to paint
@@ -231,6 +245,83 @@ class TestObstacleAvoiderOrangeConeDetection:
         _s, _t, _cv, detected = avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
         assert avoider.cone_color == 'orange cone'
         assert avoider.cone_x == pytest.approx(220, abs=3)
+
+
+class TestObstacleAvoiderAvoidanceManeuver:
+    '''
+    Phase 2: once a cone latches as detected, ObstacleAvoider must actually
+    override steering/throttle to swerve toward the other lane, and must
+    NOT swerve back to the original lane afterward - the maneuver latches
+    permanently (see class docstring in obstacle_avoider.py and the
+    "don't return to the original lane" decision behind it).
+    '''
+
+    def _trigger(self, avoider, cone_patch=(210, 230, 65, 85, ORANGE)):
+        img = _make_frame([cone_patch])
+        for _ in range(2):  # CONE_TRIGGER_FRAMES=2
+            result = avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        return result
+
+    def test_avoidance_triggers_and_overrides_steering(self):
+        avoider = ObstacleAvoider(_Cfg())
+        steering, throttle, _cv, detected = self._trigger(avoider)
+
+        assert detected is True
+        assert avoider.avoiding is True
+        # no longer plain passthrough (0.0) now that the maneuver is active
+        assert steering != 0.0
+
+    def test_avoidance_steers_toward_other_lane_center(self):
+        # other lane center = yellow_x - lane_width_px/2 = 200 - 30 = 170,
+        # which is left of image center (426/2 = 213) - the PID should
+        # therefore command a nonzero correction, not hold at 0
+        avoider = ObstacleAvoider(_Cfg())
+        self._trigger(avoider)
+        assert avoider.avoid_target_pixel == pytest.approx(IMAGE_W / 2.0)
+        assert avoider.avoid_pid.setpoint == pytest.approx(IMAGE_W / 2.0)
+
+    def test_avoidance_does_not_return_to_original_lane_once_cone_clears(self):
+        avoider = ObstacleAvoider(_Cfg())
+        self._trigger(avoider)
+        assert avoider.avoiding is True
+
+        without_cone = _make_frame()
+        for _ in range(10):
+            steering, throttle, _cv, detected = avoider.run(
+                without_cone, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+
+        # cone_detected clears (it's no longer visible/in-lane), but the
+        # maneuver itself must stay latched and keep steering toward the
+        # other lane's center, not revert to passthrough/original-lane
+        assert detected is False
+        assert avoider.avoiding is True
+        assert steering != 0.0
+
+    def test_avoidance_holds_last_steering_when_lane_geometry_lost(self):
+        avoider = ObstacleAvoider(_Cfg())
+        self._trigger(avoider)
+        steering_before = avoider.avoid_steering
+
+        img = _make_frame()
+        steering, throttle, _cv, _detected = avoider.run(img, None, None, LANE_WIDTH_PX, 0.0, 0.2)
+
+        # passive fallback (Decision 3): decay the last steering rather
+        # than guess off missing geometry, and don't raise
+        assert steering == pytest.approx(steering_before * avoider.lost_steering_decay)
+
+    def test_no_trigger_leaves_passthrough_unaffected(self):
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame()
+        steering, throttle, _cv, detected = self._run_plain(avoider, img)
+        assert detected is False
+        assert avoider.avoiding is False
+        assert steering == 0.0 and throttle == 0.2
+
+    def _run_plain(self, avoider, img, n=5):
+        result = None
+        for _ in range(n):
+            result = avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        return result
 
 
 class TestObstacleAvoiderDiagnostics:

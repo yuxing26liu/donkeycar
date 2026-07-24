@@ -6,8 +6,10 @@ done and working) -> **two-way road navigation**, this document. On the
 right-lane track (one white outer edge + one dashed yellow centerline, see
 the reference photos in `CLAUDE.md`), the car must additionally:
 
-1. Swerve around a **traffic cone** placed in our own lane, then return to
-   our lane once past it.
+1. Swerve around a **traffic cone** placed in our own lane, and stay in
+   whichever lane that leaves us in for the rest of the drive rather than
+   swerving back (see Decision 1.5 - revised from the original "return"
+   plan).
 2. Watch for an **oncoming car** in the opposite lane: ignore it while it
    stays in its own lane, swerve away if it crosses into ours.
 3. Do both while ignoring background clutter (leaves/debris on the track,
@@ -15,8 +17,9 @@ the reference photos in `CLAUDE.md`), the car must additionally:
    losing lane-keeping.
 
 This is being built incrementally, one detector at a time, verified before
-the next piece is layered on. **Only step 1's detector (below) is
-implemented so far.**
+the next piece is layered on. **Step 1's detector and the cone avoidance
+maneuver (Phase 2, below) are implemented; the oncoming-car detector is
+not.**
 
 ## Design decisions
 
@@ -63,6 +66,20 @@ sampled directly from two frames of `tub_33_26-07-24`.
 Plan: **A**, with **C** as a documented fallback if the seam/shadow proves to
 be a recurring false trigger during testing.
 
+### Decision 1.5 — Return to the original lane after clearing the cone? (revised, implemented)
+
+| Option | Pros | Cons |
+|---|---|---|
+| A. Swerve to the other lane, then swerve back once the cone is behind us (original plan) | Spends the least time in the "wrong" lane (matters once the oncoming-car detector exists). | A second maneuver = a second place to get the trigger condition wrong (when is the cone safely "cleared"?); on a short test track with only one cone, the extra complexity wasn't buying much. |
+| **B. Swerve once, stay in the new lane for the rest of the drive (current, implemented)** | One maneuver, not two - nothing to get wrong about *when* to swerve back. Lower risk of clipping the cone on a premature return. | Wrong-lane for the remainder of the drive - only acceptable because the oncoming-car detector (Decision 2) isn't built yet; revisit once it is. |
+
+Changed from A to B per direct instruction: once `ObstacleAvoider.avoiding`
+latches (a cone confirmed in our lane), it never un-latches -
+`ObstacleAvoider._avoid_step` steers toward the other lane's center
+(`_other_lane_center`) for the rest of the drive, regardless of whether the
+cone is still visible. The priority is staying on the track, not restoring
+the original lane.
+
 ### Decision 3 — Losing the lane / uncertain geometry mid-maneuver (design settled, applies once a maneuver exists)
 
 | Option | Pros | Cons |
@@ -86,17 +103,27 @@ Once a maneuver is active for one obstacle type, ignore triggers of the
 other type until back to cruising — a single steering actuator can't react
 to both at once, and first-detected wins.
 
-## What's implemented now: Phase 1, the cone's blue-tape marker
+## What's implemented now: Phase 1 (cone detection) + Phase 2 (avoidance maneuver)
 
 `donkeycar/parts/obstacle_avoider.py`, class `ObstacleAvoider`.
 
-**Detection-only.** `pilot/steering` and `pilot/throttle` pass straight
-through unchanged — this part currently *reports* what it sees, it doesn't
-drive yet. That's deliberate: it lets the detector be tuned and verified
-against real camera footage/tub recordings on the car before any avoidance
-maneuver (which depends on decisions 2-5 above) is built on top of it.
+**Phase 1 is detection**, exactly as below. **Phase 2 (new) is the actual
+maneuver**: once a cone latches as detected (`self.cone_detected` held for
+`CONE_TRIGGER_FRAMES` consecutive frames), `self.avoiding` latches `True`
+*permanently* and `ObstacleAvoider._avoid_step` overrides `pilot/steering`/
+`pilot/throttle` for the rest of the drive - steering toward the other
+lane's center (`_other_lane_center`, a `_lane_bounds(..., other_lane=True)`-style
+mirror off `lane/yellow_x`) using a dedicated PID (`self.avoid_pid`, kept
+separate from `LaneFollower`'s own `pid_st` so the two loops' integral
+state can't corrupt each other). It does **not** swerve back to the
+original lane once the cone is behind us - see Decision 1.5 above.
 
-### How it works
+If lane geometry (`lane/yellow_x`) is lost mid-maneuver, `_avoid_step` holds
+the last steering value and decays it (`LOST_STEERING_DECAY`, reusing
+`LaneFollower`'s own sustained-loss constants) rather than guessing off
+stale/missing data - Decision 3's passive fallback, applied here too.
+
+### How detection works
 
 1. Take a horizontal slice of the raw camera frame (`cam/image_array`, not
    whatever `LaneFollower` drew on `cv/image_array`) at `CONE_SCAN_Y` /
@@ -387,15 +414,15 @@ other CV threshold in this codebase carries.
    the cone's tape is detected now: a second color-keyed detector, its own
    scan row (Decision 4), reporting `obstacle/car_in_our_lane` — still
    detection-only at first, verified the same way before wiring in control.
-2. Build the actual avoidance maneuver: while either "cone in our lane" or
-   "car crossing into our lane" is latched, retarget steering toward the
-   *other* lane's center (`_lane_bounds(..., other_lane=True)`, already
-   implemented) using a dedicated PID (kept separate from `LaneFollower`'s
-   own `pid_st` so the two can't corrupt each other's integral state), then
-   release back to `LaneFollower`'s normal output once clear. Apply
-   Decisions 3 and 5 (passive fallback on lost lane geometry; one
-   maneuver at a time) here.
-3. Verify all of the above on the car, tune every guessed constant against
-   real footage, and update this document with what changed and why (same
-   as `CLAUDE.md`'s standing instruction to treat every CV threshold here as
-   provisional until checked against hardware).
+2. Decide how the car detector interacts with the cone maneuver once it
+   exists: since the cone maneuver (Decision 1.5) no longer releases back to
+   `LaneFollower`, a car crossing into our (post-swerve) lane needs its own
+   trigger logic layered on top rather than the "one maneuver, first wins"
+   model Decision 5 originally assumed for two *returning* maneuvers.
+3. Verify the avoidance maneuver (Phase 2, implemented) and every guessed
+   constant (`AVOID_PID_P/I/D`, still just copied from the main steering
+   PID) against real on-car footage - so far only checked against synthetic
+   images in `donkeycar/tests/test_obstacle_avoider.py`, not a real cone/lane.
+   Update this document with what changed and why (same as `CLAUDE.md`'s
+   standing instruction to treat every CV/PID constant here as provisional
+   until checked against hardware).

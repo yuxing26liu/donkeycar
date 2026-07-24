@@ -2,6 +2,7 @@ import logging
 
 import cv2
 import numpy as np
+from simple_pid import PID
 
 from donkeycar.parts.lane_follower import _select_line_blob
 
@@ -43,20 +44,39 @@ def _lane_bounds(yellow_x, white_x, lane_width_px, white_right_of_yellow, other_
     return None, None
 
 
+def _other_lane_center(yellow_x, lane_width_px, white_right_of_yellow):
+    '''
+    The other lane's center pixel - the steering target once a cone
+    avoidance maneuver is underway (see ObstacleAvoider._avoid_step).
+
+    Mirrors LaneFollower._lane_center's single-anchor extrapolation, and
+    only ever derives from yellow_x, same as _lane_bounds(..., other_lane=True)
+    above: yellow is the one line shared by both lanes, so it's the only
+    reliable anchor for the far lane's position (white_x is our own lane's
+    *outer* edge - two extrapolation hops removed from the other lane's
+    center, so it's not used here even when visible). Returns None if
+    yellow_x isn't visible - see Decision 3 in project_doc/obstacle_avoidance.md:
+    no reliable anchor means no maneuver steering this frame, not a guess.
+    '''
+    if yellow_x is None:
+        return None
+    sign = 1.0 if white_right_of_yellow else -1.0
+    return yellow_x - sign * lane_width_px / 2.0
+
+
 class ObstacleAvoider:
     '''
     Obstacle avoidance layered on top of LaneFollower (donkeycar/parts/lane_follower.py)
     for the "two-way road navigation" mission (see CLAUDE.md). See
     project_doc/obstacle_avoidance.md for the full decision-by-decision design
     (detection strategy for each obstacle type, and why) and current build
-    status - this class is being built incrementally, one detector at a time,
-    before any steering override is wired up.
+    status - this class is being built incrementally, one detector at a time.
 
-    Phase 1 (this increment): detect the traffic cone's position by color -
-    either its ground marker (a blue tape square laid down at the cone's
-    spot, per the original design in project_doc/obstacle_avoidance.md
-    Decision 1) or the cone's own orange body. Both color-keyed detectors
-    run every frame; whichever produces the larger valid blob wins (see
+    Phase 1: detect the traffic cone's position by color - either its
+    ground marker (a blue tape square laid down at the cone's spot, per
+    the original design in project_doc/obstacle_avoidance.md Decision 1)
+    or the cone's own orange body. Both color-keyed detectors run every
+    frame; whichever produces the larger valid blob wins (see
     detect_cone). Orange detection was added after tub_33_26-07-24 (real
     on-car footage) showed cones placed on the track with **no** blue tape
     marker under them at all - the recorded frames only ever matched blue
@@ -64,21 +84,25 @@ class ObstacleAvoider:
     edges), never on the track surface - while the cones themselves are
     clearly, consistently orange. BLUE_HSV_THRESHOLD_LOW/HIGH stays wired
     up (project_doc's Decision 1 option C, "union of masks") in case a
-    tape marker is used on some other track/lap. This phase is detection-only:
-    run() always passes pilot/steering and pilot/throttle through unchanged.
-    The car's driving behavior is unaffected even when this part is enabled
-    - it only reports what it sees (self.cone_detected / self.cone_x, plus
-    the 'obstacle/cone_detected' output and, if OVERLAY_IMAGE is set, a box
-    drawn on cv/image_array) so the detector can be tuned and verified
-    against real camera footage on the car before any avoidance maneuver is
-    built on top of it.
+    tape marker is used on some other track/lap.
+
+    Phase 2: once a cone is confirmed in our lane (self.cone_detected
+    holding for CONE_TRIGGER_FRAMES consecutive frames), steer toward the
+    other lane's center (_other_lane_center) using a dedicated PID
+    (self.avoid_pid - never LaneFollower's own pid_st, so the two loops'
+    integral state can't corrupt each other) instead of passing
+    pilot/steering/pilot/throttle through unchanged - see _avoid_step.
+    The maneuver latches permanently once triggered (self.avoiding): by
+    this project's current design the car does **not** swerve back to its
+    original lane once the cone is cleared, it just keeps driving centered
+    in whichever lane it ends up in for the rest of the drive - simpler
+    and lower-risk than a return maneuver, and this track only has the one
+    cone to clear. See _avoid_step for the passive fallback if lane
+    geometry is lost mid-maneuver.
 
     Not yet implemented (see project_doc/obstacle_avoidance.md "Next steps"):
     detecting the oncoming car (planned: color-key its black wheels/front,
-    decision 2 in the design doc) and the actual avoidance maneuver (swerve
-    to the other lane's center, then return - decision the design doc
-    already worked out: a dedicated PID retargeting to
-    _lane_bounds(..., other_lane=True)'s center).
+    decision 2 in the design doc).
 
     Zero changes to lane_follower.py: this part is purely downstream of it,
     reusing its already-published per-frame outputs (lane/yellow_x,
@@ -134,6 +158,38 @@ class ObstacleAvoider:
         self.cone_trigger_frames = getattr(cfg, 'CONE_TRIGGER_FRAMES', 2)
 
         self.log_interval_frames = getattr(cfg, 'CONE_LOG_INTERVAL_FRAMES', 10)
+
+        # Avoidance maneuver (Phase 2, see class docstring): a dedicated PID,
+        # never LaneFollower's own pid_st, so the two loops' integral state
+        # can't corrupt each other. Defaults to the same gains as the main
+        # steering PID (cfg.PID_P/I/D) since it's steering the same physical
+        # car/camera toward a target pixel - only override AVOID_PID_* if
+        # on-car testing shows the maneuver needs different gains.
+        self.avoid_pid = PID(
+            Kp=getattr(cfg, 'AVOID_PID_P', getattr(cfg, 'PID_P', -0.01)),
+            Ki=getattr(cfg, 'AVOID_PID_I', getattr(cfg, 'PID_I', 0.0)),
+            Kd=getattr(cfg, 'AVOID_PID_D', getattr(cfg, 'PID_D', -0.0001)),
+        )
+        self.avoid_pid.output_limits = (-1.0, 1.0)
+        # reuse LaneFollower's own turning/straight throttle scheme
+        # (cfg.LANE_TARGET_THRESHOLD/THROTTLE_STEP/THROTTLE_MIN/THROTTLE_MAX)
+        # rather than inventing new tuning knobs - see _avoid_step
+        self.avoid_target_threshold = getattr(cfg, 'LANE_TARGET_THRESHOLD', 10)
+        self.throttle_step = getattr(cfg, 'THROTTLE_STEP', 0.05)
+        self.throttle_min = getattr(cfg, 'THROTTLE_MIN', 0.1)
+        self.throttle_max = getattr(cfg, 'THROTTLE_MAX', 0.3)
+        # reuse LaneFollower's own sustained-loss handling constants for the
+        # same passive fallback (Decision 3) applied to the avoid maneuver
+        self.max_lost_frames = getattr(cfg, 'MAX_LOST_FRAMES', 40)
+        self.lost_steering_decay = getattr(cfg, 'LOST_STEERING_DECAY', 0.85)
+
+        self.avoiding = False           # latches True permanently once a cone
+                                         # avoidance triggers - see class docstring
+        self.avoid_target_pixel = None  # resolved to image center on first use
+        self.avoid_throttle = None      # seeded from the pass-through throttle
+                                         # the frame avoidance begins
+        self.avoid_steering = 0.0
+        self.avoid_lost_frames = 0
 
         # public detection state - what a future avoidance maneuver (or a
         # test) reads; updated every run() call
@@ -249,12 +305,12 @@ class ObstacleAvoider:
 
     def _decide_action(self):
         '''
-        Human-readable recommended action for the terminal diagnostics below.
-        Phase 1 is detection-only (see class docstring) - this never actually
-        changes steering/throttle, it just states what a future avoidance
-        maneuver *would* do, so the detector can be verified end-to-end before
-        that maneuver is built.
+        Human-readable recommended action for the terminal diagnostics below -
+        describes what run() actually does this frame (see _avoid_step),
+        not a hypothetical.
         '''
+        if self.avoiding:
+            return f"AVOIDING - steering toward other lane (triggered by {self.cone_color or 'cone'}, stays this way for the rest of the drive)"
         if self.cone_detected:
             return f"SWERVE - {self.cone_color} confirmed in our lane, steer toward other lane"
         if self.cone_in_our_lane:
@@ -377,10 +433,13 @@ class ObstacleAvoider:
                white_x, lane_width_px - LaneFollower's own published lane
                geometry (lane/yellow_x, lane/white_x, lane/width_px);
                steering, throttle - LaneFollower's pilot output, passed
-               through unchanged (see class docstring: Phase 1 is
-               detection-only); cv_img, the already-annotated display image
-               to optionally draw the detection on top of.
-        output: steering, throttle (unchanged), cv_img, cone_detected
+               through unchanged until a cone avoidance triggers (see class
+               docstring: Phase 2), after which _avoid_step's output
+               overrides them, permanently, for the rest of the drive;
+               cv_img, the already-annotated display image to optionally
+               draw the detection on top of.
+        output: steering, throttle (overridden while self.avoiding), cv_img,
+                cone_detected
         '''
         if cam_img is None:
             # cam/image_array not populated yet (e.g. camera part hasn't
@@ -416,11 +475,19 @@ class ObstacleAvoider:
         # one frame behind it.
         was_detected = self.cone_detected
         self.cone_detected = self._pending_frames >= self.cone_trigger_frames
-        if self.cone_detected and not was_detected:
-            logger.info(f"cone marker ({self.cone_color}) detected in our lane at x={self.cone_x:.1f} "
-                         f"(held {self._pending_frames} frames) - ACTION: {self._decide_action()}")
+        if self.cone_detected and not self.avoiding:
+            self.avoiding = True
+            logger.info(
+                f"[cone_tape] cone confirmed in our lane at x={self.cone_x:.1f} "
+                f"(held {self._pending_frames} frames) - beginning avoidance maneuver "
+                f"toward the other lane; will NOT return to the original lane "
+                f"afterward (see class docstring)"
+            )
         elif was_detected and not self.cone_detected:
             logger.info(f"cone marker no longer in our lane - ACTION: {self._decide_action()}")
+
+        if self.avoiding:
+            steering, throttle = self._avoid_step(cam_img, yellow_x, lane_width_px, throttle)
 
         self._log_raw_detection(band_rgb, band_hsv, blue_mask, orange_mask)
         self._warn_if_lane_geometry_missing(yellow_x, white_x)
@@ -430,6 +497,59 @@ class ObstacleAvoider:
 
         return steering, throttle, cv_img, self.cone_detected
 
+    def _avoid_step(self, cam_img, yellow_x, lane_width_px, throttle):
+        '''
+        One frame of the avoidance maneuver, called every run() once
+        self.avoiding has latched True (see class docstring - it never
+        un-latches). Mirrors LaneFollower.run()'s own steering scheme
+        exactly: the PID's setpoint is the fixed image-center pixel, and
+        the *detected* position - here, the other lane's estimated center
+        (_other_lane_center) instead of our own lane's - is fed in as the
+        process variable, so the PID steers to bring that position under
+        the image's centerline, i.e. centers the car in the other lane the
+        same way LaneFollower centers it in our own.
+
+        input: cam_img, this frame's raw RGB camera frame (used only to
+               resolve the image-center setpoint on first use); yellow_x,
+               lane_width_px - LaneFollower's published lane geometry (the
+               same near-field values LaneFollower itself steers from);
+               throttle - LaneFollower's pass-through throttle this frame,
+               used only to seed self.avoid_throttle the first frame the
+               maneuver is active
+        output: (steering, throttle) to actually drive with this frame
+        '''
+        if self.avoid_target_pixel is None:
+            self.avoid_target_pixel = cam_img.shape[1] / 2.0
+            self.avoid_pid.setpoint = self.avoid_target_pixel
+        if self.avoid_throttle is None:
+            self.avoid_throttle = throttle
+
+        other_center = _other_lane_center(yellow_x, lane_width_px, self.white_right_of_yellow)
+
+        if other_center is None:
+            # no yellow line to steer against right now - passive fallback
+            # (Decision 3, project_doc/obstacle_avoidance.md): hold/decay
+            # the last known steering rather than guess off stale/missing
+            # geometry, same caution LaneFollower's own sustained-loss
+            # handling uses for its own lane.
+            self.avoid_lost_frames += 1
+            self.avoid_steering *= self.lost_steering_decay
+            if self.avoid_lost_frames > self.max_lost_frames:
+                self.avoid_throttle = max(self.avoid_throttle - self.throttle_step, 0.0)
+            return self.avoid_steering, self.avoid_throttle
+
+        self.avoid_lost_frames = 0
+        self.avoid_steering = self.avoid_pid(other_center)
+
+        if abs(other_center - self.avoid_target_pixel) > self.avoid_target_threshold:
+            # turning hard toward the other lane - slow down, same rule
+            # LaneFollower uses for its own lane-keeping
+            self.avoid_throttle = max(self.avoid_throttle - self.throttle_step, self.throttle_min)
+        else:
+            self.avoid_throttle = min(self.avoid_throttle + self.throttle_step, self.throttle_max)
+
+        return self.avoid_steering, self.avoid_throttle
+
     def overlay_display(self, cv_img):
         y0, y1 = self.scan_y, self.scan_y + self.scan_height
         if self.cone_x is not None:
@@ -437,6 +557,8 @@ class ObstacleAvoider:
             cv2.rectangle(cv_img, (int(self.cone_x) - 8, y0), (int(self.cone_x) + 8, y1),
                           color=color, thickness=2)
         label = f"CONE:{self.cone_detected}" + (f" ({self.cone_color})" if self.cone_color else "")
+        if self.avoiding:
+            label += " AVOIDING"
         cv2.putText(cv_img, label, org=(10, cv_img.shape[0] - 5),
                     fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.4, color=(0, 0, 0))
         return cv_img
