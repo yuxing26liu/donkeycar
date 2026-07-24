@@ -337,7 +337,10 @@ BLUE_HSV_THRESHOLD_LOW = (95, 100, 60)     # guessed, not yet tuned on hardware
 BLUE_HSV_THRESHOLD_HIGH = (130, 255, 255)  # -- see "Testing / tuning" below
 
 CONE_MIN_AREA_PX = 80    # smallest pixel area (in the scan slice) counted as the cone/marker
-CONE_MAX_WIDTH_PX = 250  # widest pixel width (in the scan slice) counted as the cone/marker
+CONE_MAX_WIDTH_PX = 400  # widest pixel width (in the scan slice) counted as the cone/marker -
+                          # raised from 250 after tub_41_26-07-24 showed a close, centered
+                          # cone's own blob measuring 278-295px wide and getting rejected
+                          # outright, right when avoidance mattered most (see below)
 
 LANE_SHIFT_MARGIN_PX = 10  # margin added to our lane's bounds when testing membership
 CONE_TRIGGER_FRAMES = 2    # consecutive in-lane frames required before latching
@@ -407,6 +410,37 @@ guess (no tape marker was present in the only footage checked so far), and
 neither threshold has been checked against footage from a different
 lighting condition or camera than `tub_33_26-07-24`. Same caveat every
 other CV threshold in this codebase carries.
+
+**On-car run, `tub_41_26-07-24` (terminal log, no frames recorded — see
+"Does this actually run" below for why tubs from this session are empty):**
+surfaced two real problems, not one:
+
+1. **The car still drove straight into the cone even though the log showed
+   repeated `SWERVE` triggers.** The traceback at the end of the log names
+   `/home/pi/mycar/manage2.py`, and every trigger in the log prints the
+   *old*, pre-avoidance-maneuver `_decide_action` text
+   (`"SWERVE - ... confirmed in our lane, steer toward other lane"`) —
+   never the current code's `"beginning avoidance maneuver ... will NOT
+   return to the original lane"` / `"AVOIDING"` text, and `cone_detected`
+   visibly un-latches and re-latches repeatedly (impossible once `avoiding`
+   is set, since it never un-latches in the current code). This means the
+   Pi was still running a stale copy of `obstacle_avoider.py` from before
+   the avoidance maneuver existed — detection-only, exactly like Phase 1.
+   **Not fixable from this repo**; the updated `donkeycar/parts/obstacle_avoider.py`
+   needs to actually be deployed to `/home/pi/mycar`/the Pi's installed
+   `donkeycar` package before any steering-override change here takes
+   effect on the car.
+2. **`CONE_MAX_WIDTH_PX=250` rejected the cone at exactly the range that
+   matters most.** Repeated log lines like `"orange cone: 8654px matched
+   but rejected (largest blob width 294px > CONE_MAX_WIDTH_PX 250)"` show
+   a large, unambiguous orange blob (~65% of the whole scan band) being
+   thrown out purely for being wide — precisely when the cone was close
+   and centered. The width cap makes sense for the line tracker it was
+   borrowed from (rejecting a wide sunlit patch of pavement pretending to
+   be a paint stripe) but not for a real 3D cone, which legitimately fills
+   much of the frame up close; since orange is a strong, exclusive color
+   match on this track, a wide orange blob is stronger evidence of a real
+   cone, not weaker. Fixed by raising `CONE_MAX_WIDTH_PX` to 400 (see above).
 
 ## Next steps
 

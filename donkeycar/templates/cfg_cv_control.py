@@ -638,7 +638,19 @@ BLUE_HSV_THRESHOLD_LOW = (95, 100, 60)
 BLUE_HSV_THRESHOLD_HIGH = (130, 255, 255)
 
 CONE_MIN_AREA_PX = 80     # smallest pixel area (in the scan slice) counted as the cone/marker
-CONE_MAX_WIDTH_PX = 250   # widest pixel width (in the scan slice) counted as the cone/marker
+# Widest pixel width (in the scan slice) counted as the cone/marker. Raised
+# from 250 after tub_41_26-07-24 (real on-car footage) showed a close,
+# centered cone's own orange blob repeatedly measured 278-295px wide and
+# got rejected outright by the old 250px cap - right when the cone was
+# closest and avoidance mattered most. Unlike a line tracker's width cap
+# (rejecting a wide sunlit patch of pavement pretending to be a paint
+# stripe), a cone is a real 3D object that legitimately fills much of the
+# frame up close, and orange is a strong, exclusive color match on this
+# track - a wide orange blob is stronger evidence of a real cone, not
+# weaker. 400 leaves comfortable margin above the observed 295px while
+# still well under IMAGE_W so a genuine full-frame anomaly (e.g. total
+# sensor blowout) is still rejected.
+CONE_MAX_WIDTH_PX = 400
 
 LANE_SHIFT_MARGIN_PX = 10  # margin added to our lane's pixel bounds when testing
                             # whether a detection falls inside it
