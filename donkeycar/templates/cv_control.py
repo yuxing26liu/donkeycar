@@ -108,6 +108,17 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
                       cfg.CV_CONTROLLER_OUTPUTS,
                       cfg.CV_CONTROLLER_CONDITION)
 
+    #
+    # Depth-sensor verification probe (obstacle-avoidance roadmap Phase 2) -
+    # read-only: logs/records the OAK-D depth signal, never touches
+    # steering/throttle. Gated behind HAVE_DEPTH_PROBE so cars without a
+    # depth-capable camera pay no cost for it.
+    #
+    if getattr(cfg, 'HAVE_DEPTH_PROBE', False):
+        from donkeycar.parts.depth_probe import DepthProbe
+        V.add(DepthProbe(cfg), inputs=['cam/depth_array'],
+              outputs=['depth/nearest_col', 'depth/nearest_dist_mm'])
+
     recording_control = ToggleRecording(cfg.AUTO_RECORD_ON_THROTTLE, cfg.RECORD_DURING_AI)
     V.add(recording_control, inputs=['user/mode', "recording"], outputs=["recording"])
 
@@ -187,11 +198,20 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
     #
     # add tub to save data
     #
+    # cam/depth_array, depth/nearest_col, depth/nearest_dist_mm are only
+    # ever populated when HAVE_DEPTH_PROBE/OAKD_DEPTH are both enabled (see
+    # depth_probe.py) - Memory.get() returns None for a key nothing has
+    # written, and Tub.write_record() skips None values, so this is a no-op
+    # otherwise. cam/depth_array is recorded as a 16-bit PNG (gray16_array)
+    # so a tub can be analyzed for the raw depth signal offline, not just
+    # the derived nearest-object columns.
     inputs=['cam/image_array',
-            'steering', 'throttle']
+            'steering', 'throttle',
+            'cam/depth_array', 'depth/nearest_col', 'depth/nearest_dist_mm']
 
     types=['image_array',
-           'float', 'float']
+           'float', 'float',
+           'gray16_array', 'float', 'float']
 
     #
     # Create data storage part

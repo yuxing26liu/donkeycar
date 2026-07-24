@@ -535,6 +535,27 @@ REALSENSE_D435_ID = None        # serial number of camera or None if you only ha
 
 
 #
+# Luxonis OAK-D depth sensing camera (see donkeycar/parts/oak_d.py)
+#
+OAKD_RGB = True       # True to capture RGB image -> cam/image_array
+OAKD_DEPTH = False    # True to capture depth as image array -> cam/depth_array
+OAKD_ID = None        # serial number of camera or None if you only have one camera (it will autodetect)
+
+
+#
+# Depth-sensor verification probe (donkeycar/parts/depth_probe.py) --
+# obstacle-avoidance roadmap Phase 2. Read-only: never touches
+# steering/throttle, just logs/records the depth signal so it can be
+# confirmed sane before anything is built to steer off it.
+#
+HAVE_DEPTH_PROBE = False    # set True (with OAKD_DEPTH also True) to enable
+DEPTH_SCAN_Y = 100          # num pixels from the top to start the horiz depth scan
+DEPTH_SCAN_HEIGHT = 40      # num pixels high to grab from the horiz depth scan
+DEPTH_MIN_VALID_MM = 200    # ignore readings nearer than this (lens-adjacent noise)
+DEPTH_LOG_EVERY_N_FRAMES = 40  # how often to log shape/min/max sanity stats at INFO level
+
+
+#
 # Stop Sign Detector
 #
 STOP_SIGN_DETECTOR = False
