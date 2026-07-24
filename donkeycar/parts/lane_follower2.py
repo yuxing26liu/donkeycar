@@ -100,7 +100,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag=None):
+def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag=None, preferred_x=None):
     '''
     Pick the best line-shaped connected component in a binary mask.
 
@@ -108,17 +108,35 @@ def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag
     runs connected-components on the mask and rejects blobs that don't look like a
     line cross-section - too small (noise/gravel/glare), too wide (a sunlit patch of
     pavement or a wall), or too flat relative to their width (same wide-patch case,
-    but resolution-independent). Of what's left, the largest by area wins.
+    but resolution-independent).
+
+    Of what's left: if preferred_x is given, the candidate *closest* to it wins;
+    otherwise (cold start, no prior position) the largest by area wins. Added
+    after tub_31_26-07-24 showed the old "largest always wins" rule flip-flopping
+    between two simultaneously-visible real line-shaped blobs (this track's two
+    solid edges, both in frame on a wide section) whenever their areas happened
+    to be close - confirmed directly: frame 3448 had a real, correctly-tracked
+    line at x=331.8 (area 364, matching the last several frames' smooth position)
+    and an unrelated line-shaped blob at x=127.8 (area 382) that won by 18px of
+    area, for 16 consecutive frames, before the tracker gave up waiting for a
+    close-enough candidate and snapped hard to whatever was biggest by then -
+    a full steering-lock swerve. Preferring proximity to the last tracked
+    position (passed in by the caller, typically _LineTracker.tracked_position)
+    picks the correct blob directly instead of relying on the continuity gate
+    to reject the wrong one after the fact - it doesn't reduce false positives
+    within a single blob, it fixes *choosing between two true positives*, which
+    the area rule was never meant to arbitrate.
 
     input: mask, binary (0/255) uint8 image; log_tag, optional label (e.g. color
-           name) used to identify which tracker a rejection log line came from
+           name) used to identify which tracker a rejection log line came from;
+           preferred_x, optional last-known x position - when given, breaks ties
+           by proximity instead of area
     output: (x, area) of the winning blob's centroid x and pixel area, or (None, 0)
     '''
     num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
-    best_label = None
-    best_area = 0
-    rejected = []  # only populated when best_label stays None and DEBUG is on
+    candidates = []  # (x, area) for every blob that passes the shape filter
+    rejected = []  # only populated when candidates stays empty and DEBUG is on
     log_rejections = log_tag is not None and logger.isEnabledFor(logging.DEBUG)
 
     if log_rejections and num_labels <= 1:
@@ -151,16 +169,20 @@ def _select_line_blob(mask, min_area_px, max_width_px, min_aspect_ratio, log_tag
                 rejected.append(f"aspect={aspect:.2f}<{min_aspect_ratio} (w={width},h={height})")
             continue
 
-        if area > best_area:
-            best_area = area
-            best_label = label
+        candidates.append((float(centroids[label][0]), int(area)))
 
-    if best_label is None:
+    if not candidates:
         if rejected:
             logger.debug(f"[{log_tag}] no blob passed shape filter; candidates rejected by "
                           f"{', '.join(rejected)}")
         return None, 0
-    return float(centroids[best_label][0]), int(best_area)
+
+    if preferred_x is not None:
+        best_x, best_area = min(candidates, key=lambda c: abs(c[0] - preferred_x))
+    else:
+        best_x, best_area = max(candidates, key=lambda c: c[1])
+
+    return best_x, best_area
 
 
 def _shape_param(cfg, color_name, key, default):
@@ -372,7 +394,7 @@ class _LineTracker:
             return None, mask
 
         raw_x, _area = _select_line_blob(mask, self.min_area_px, self.max_width_px, self.min_aspect_ratio,
-                                          log_tag=self.color_name)
+                                          log_tag=self.color_name, preferred_x=self.tracked_position)
 
         if raw_x is None:
             self.lost_frames += 1
