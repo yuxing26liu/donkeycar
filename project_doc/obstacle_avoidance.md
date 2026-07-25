@@ -442,6 +442,58 @@ surfaced two real problems, not one:
    match on this track, a wide orange blob is stronger evidence of a real
    cone, not weaker. Fixed by raising `CONE_MAX_WIDTH_PX` to 400 (see above).
 
+## On-car feedback (2026-07-25): overshoot off the track + false trigger on noisy lane width
+
+Testing surfaced two more real problems, both traced to the same root
+cause: `LaneFollower`'s published `lane/width_px` swung far faster than a
+real lane can change width - e.g. 150 -> 217 -> 243 -> 150 -> 133 -> 392 ->
+284 across a handful of frames of overlay logs during a maneuver, most
+visibly right as the car turned hard. Both `_lane_bounds` (in-our-lane test)
+and `_other_lane_center` (the avoid maneuver's steering target) derive
+directly from this value, so both consumed the noise:
+
+1. **The avoid maneuver overshot hard enough to leave the track entirely** -
+   steering held near +-0.8 for many consecutive frames while
+   `_other_lane_center` (derived from `yellow_x` and the noisy width) jumped
+   around underneath the PID, well past `AVOID_TARGET_THRESHOLD`, with
+   nothing to stop a single frame's jump from driving the P term straight to
+   full lock - unlike `LaneFollower`, which already has two defenses against
+   exactly this (see `lane_follower.py`'s module docstring: soft-saturating
+   `tanh` error and `position_rate_limit_px`).
+2. **A cone that was not actually on the track (e.g. past the white edge, in
+   the planter/breezeway) still counted as "in our lane"** whenever the
+   width estimate happened to be spiking wide at that moment, extrapolating
+   `_lane_bounds`' far edge well past the real lane.
+
+Fixed in `ObstacleAvoider`, without touching `LaneFollower`:
+
+- `_smoothed_lane_width` - an EMA (`CONE_LANE_WIDTH_SMOOTHING_ALPHA`, default
+  0.1) over a clamped (`CONE_LANE_WIDTH_MIN_PX`/`CONE_LANE_WIDTH_MAX_PX`,
+  default 80/300) copy of `lane/width_px`, kept entirely inside this file.
+  Computed every `run()` call (not just while avoiding), so it's already
+  settled by the time a maneuver starts, and used in place of the raw value
+  everywhere `lane_width_px` is consumed (`_lane_bounds`, `_avoid_step`).
+- `_avoid_step` now mirrors `LaneFollower.run()`'s own two defenses,
+  reusing the same technique and (by default) the same constants: the
+  target position (`other_center`) is rate-limited per frame
+  (`AVOID_POSITION_RATE_LIMIT_PX`, falls back to `LANE_POSITION_RATE_LIMIT_PX`,
+  then 25px), and the remaining error is soft-saturated via `k*tanh(error/k)`
+  (`AVOID_ERROR_SATURATION_PX`, falls back to `LANE_ERROR_SATURATION_PX`,
+  then 80px) before reaching `self.avoid_pid`. The rate-limiter's anchor
+  resets after a sustained lane-geometry loss (>15 frames, same threshold
+  `LaneFollower` uses), so reacquiring snaps fresh instead of slewing from a
+  stale position.
+
+Covered by `donkeycar/tests/test_obstacle_avoider.py`:
+`test_avoid_target_position_is_rate_limited` and
+`test_single_wide_reading_does_not_widen_lane_bounds_immediately`. Like
+every other constant in this file, the smoothing alpha/clamp bounds and the
+reused rate-limit/saturation defaults are starting estimates copied from
+`lane_follower.py`'s already-tuned values, not yet independently verified
+against real on-car footage of the avoid maneuver itself - next on-car test
+should watch `lane/width_px` and `avoid_steering` directly to confirm the
+overshoot is actually gone, not just less noisy in isolation.
+
 ## Next steps
 
 1. Detect the car's black wheels/front (Decision 2, option A) the same way

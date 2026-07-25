@@ -272,9 +272,12 @@ class TestObstacleAvoiderAvoidanceManeuver:
         assert steering != 0.0
 
     def test_avoidance_steers_toward_other_lane_center(self):
-        # other lane center = yellow_x - lane_width_px/2 = 200 - 30 = 170,
-        # which is left of image center (426/2 = 213) - the PID should
-        # therefore command a nonzero correction, not hold at 0
+        # other lane center = yellow_x - (smoothed/clamped lane width)/2 =
+        # 200 - 80/2 = 160 (LANE_WIDTH_PX=60 is below CONE_LANE_WIDTH_MIN_PX's
+        # default 80px floor, so _smoothed_lane_width clamps it up - see
+        # test_avoid_target_position_is_rate_limited), which is left of image
+        # center (426/2 = 213) either way - the PID should therefore command
+        # a nonzero correction, not hold at 0
         avoider = ObstacleAvoider(_Cfg())
         self._trigger(avoider)
         assert avoider.avoid_target_pixel == pytest.approx(IMAGE_W / 2.0)
@@ -317,11 +320,64 @@ class TestObstacleAvoiderAvoidanceManeuver:
         assert avoider.avoiding is False
         assert steering == 0.0 and throttle == 0.2
 
+    def test_avoid_target_position_is_rate_limited(self):
+        # a real on-car run showed the avoid maneuver's target
+        # (_other_lane_center, derived from yellow_x/lane_width_px) jump far
+        # enough in one frame to slam the PID to full steering lock and
+        # swerve off the track. yellow_x snapping from 200 to 400 in a
+        # single frame (e.g. a misdetection or tracker reacquire) should be
+        # slewed at avoid_position_rate_limit_px per frame, not applied raw.
+        avoider = ObstacleAvoider(_Cfg())
+        self._trigger(avoider)
+        # NOT 200 - 60/2 = 170: LANE_WIDTH_PX=60 is below
+        # CONE_LANE_WIDTH_MIN_PX's default floor of 80, so _smoothed_lane_width
+        # clamps it up to 80 first - 200 - 80/2 = 160. Read the live value
+        # rather than hardcoding it, since the exact number depends on both
+        # this test's fixture and that clamp.
+        prev_position = avoider._avoid_last_position
+        assert prev_position == pytest.approx(160.0)
+
+        avoider.run(_make_frame(), 400.0, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+
+        assert avoider._avoid_last_position == pytest.approx(
+            prev_position + avoider.avoid_position_rate_limit_px)
+
     def _run_plain(self, avoider, img, n=5):
         result = None
         for _ in range(n):
             result = avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
         return result
+
+
+class TestObstacleAvoiderLaneWidthSmoothing:
+    '''
+    lane/width_px (published by LaneFollower) was observed on a real drive
+    swinging from ~150px to ~390px and back within a handful of frames -
+    faster than a real lane's width can change. Unsmoothed, that noise fed
+    directly into both the in-our-lane test (_lane_bounds) and the avoid
+    maneuver's steering target (_other_lane_center). ObstacleAvoider now
+    keeps its own EMA-smoothed, clamped copy (see _smoothed_lane_width) -
+    these tests check that a single noisy wide reading can't, by itself,
+    make a cone well outside the real lane count as "in our lane".
+    '''
+
+    def test_single_wide_reading_does_not_widen_lane_bounds_immediately(self):
+        avoider = ObstacleAvoider(_Cfg())
+        # establish a stable, narrow baseline lane width over several frames
+        # (only yellow visible, so bounds are extrapolated from lane width)
+        stable_img = _make_frame()
+        for _ in range(20):
+            avoider.run(stable_img, 200.0, None, 100.0, 0.0, 0.2)
+
+        # single-frame width spike (400) + a cone at x=350: well outside the
+        # real ~100px-wide lane, but inside [200, 600] if the raw spike were
+        # used unsmoothed
+        cone_img = _make_frame([(340, 360, 65, 85, ORANGE)])
+        _steering, _throttle, _cv, detected = avoider.run(
+            cone_img, 200.0, None, 400.0, 0.0, 0.2)
+
+        assert avoider.cone_in_our_lane is False
+        assert detected is False
 
 
 class TestObstacleAvoiderDiagnostics:

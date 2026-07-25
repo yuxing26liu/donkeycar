@@ -1,4 +1,5 @@
 import logging
+import math
 
 import cv2
 import numpy as np
@@ -157,6 +158,20 @@ class ObstacleAvoider:
         self.lane_margin_px = getattr(cfg, 'LANE_SHIFT_MARGIN_PX', 10)
         self.cone_trigger_frames = getattr(cfg, 'CONE_TRIGGER_FRAMES', 2)
 
+        # lane/width_px (published by LaneFollower) swung 150->392->133px
+        # across a handful of frames during on-car avoidance testing - real
+        # lane width can't change that fast, so both the "is this cone in
+        # our lane" test and the avoid-maneuver's steering target (both
+        # derived from this value, see _lane_bounds/_other_lane_center)
+        # were reacting to noise, not real geometry. Re-smoothed and
+        # clamped here, independently of whatever smoothing LaneFollower
+        # already does internally (zero changes to lane_follower.py) -
+        # see _smoothed_lane_width.
+        self.lane_width_smoothing_alpha = getattr(cfg, 'CONE_LANE_WIDTH_SMOOTHING_ALPHA', 0.1)
+        self.lane_width_min_px = getattr(cfg, 'CONE_LANE_WIDTH_MIN_PX', 80)
+        self.lane_width_max_px = getattr(cfg, 'CONE_LANE_WIDTH_MAX_PX', 300)
+        self.smoothed_lane_width_px = None
+
         self.log_interval_frames = getattr(cfg, 'CONE_LOG_INTERVAL_FRAMES', 10)
 
         # Avoidance maneuver (Phase 2, see class docstring): a dedicated PID,
@@ -171,6 +186,21 @@ class ObstacleAvoider:
             Kd=getattr(cfg, 'AVOID_PID_D', getattr(cfg, 'PID_D', -0.0001)),
         )
         self.avoid_pid.output_limits = (-1.0, 1.0)
+        # Mirrors LaneFollower's own two defenses against a single noisy
+        # frame driving the PID straight to full steering lock (see
+        # lane_follower.py's module docstring, points 1 and the
+        # position_rate_limit_px comment in its __init__) - added here after
+        # on-car testing showed the avoid maneuver swerving hard enough to
+        # leave the track entirely. other_center (the avoid target, derived
+        # from yellow_x/lane_width_px - see _other_lane_center) can jump
+        # between frames the same way LaneFollower's own lane-center
+        # estimate can; without either defense the raw jump goes straight
+        # into the P term.
+        self.avoid_error_saturation_px = getattr(cfg, 'AVOID_ERROR_SATURATION_PX',
+                                                  getattr(cfg, 'LANE_ERROR_SATURATION_PX', 80))
+        self.avoid_position_rate_limit_px = getattr(cfg, 'AVOID_POSITION_RATE_LIMIT_PX',
+                                                     getattr(cfg, 'LANE_POSITION_RATE_LIMIT_PX', 25))
+        self._avoid_last_position = None
         # reuse LaneFollower's own turning/straight throttle scheme
         # (cfg.LANE_TARGET_THRESHOLD/THROTTLE_STEP/THROTTLE_MIN/THROTTLE_MAX)
         # rather than inventing new tuning knobs - see _avoid_step
@@ -228,6 +258,32 @@ class ObstacleAvoider:
             kernel = np.ones((self.morph_kernel_size, self.morph_kernel_size), np.uint8)
             return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         return mask
+
+    def _smoothed_lane_width(self, lane_width_px):
+        '''
+        EMA-smoothed, clamped version of LaneFollower's published
+        lane/width_px - see the CONE_LANE_WIDTH_SMOOTHING_ALPHA comment in
+        __init__ for why: the raw value can swing far faster than a real
+        lane's width does, and that noise otherwise feeds directly into
+        both the in-our-lane test (_lane_bounds) and the avoid maneuver's
+        steering target (_other_lane_center). Called every run(), not just
+        while avoiding, so the estimate is already settled by the time a
+        maneuver starts instead of starting cold.
+
+        input: lane_width_px, this frame's raw lane/width_px (or None)
+        output: the smoothed width in pixels, or None if nothing has ever
+                been observed yet
+        '''
+        if lane_width_px is None:
+            return self.smoothed_lane_width_px
+
+        clamped = min(max(lane_width_px, self.lane_width_min_px), self.lane_width_max_px)
+        if self.smoothed_lane_width_px is None:
+            self.smoothed_lane_width_px = clamped
+        else:
+            self.smoothed_lane_width_px = (self.lane_width_smoothing_alpha * clamped
+                                            + (1 - self.lane_width_smoothing_alpha) * self.smoothed_lane_width_px)
+        return self.smoothed_lane_width_px
 
     def detect_cone(self, band_hsv):
         '''
@@ -459,6 +515,11 @@ class ObstacleAvoider:
             return steering, throttle, cv_img, self.cone_detected
         band_hsv = cv2.cvtColor(band_rgb, cv2.COLOR_RGB2HSV)
 
+        # smoothed/clamped in place of the raw value for both the in-our-lane
+        # test below and (once avoiding) the maneuver's steering target -
+        # see _smoothed_lane_width
+        lane_width_px = self._smoothed_lane_width(lane_width_px)
+
         our_lane = _lane_bounds(yellow_x, white_x, lane_width_px, self.white_right_of_yellow, other_lane=False)
 
         self.cone_x, self.cone_color, blue_mask, orange_mask = self.detect_cone(band_hsv)
@@ -534,12 +595,40 @@ class ObstacleAvoider:
             # handling uses for its own lane.
             self.avoid_lost_frames += 1
             self.avoid_steering *= self.lost_steering_decay
+            if self.avoid_lost_frames > 15:
+                # sustained loss, not a brief flicker - drop the rate-limiter
+                # anchor so reacquiring snaps fresh instead of slewing from a
+                # stale position (mirrors LaneFollower's own reset at the
+                # same threshold, see its run())
+                self._avoid_last_position = None
             if self.avoid_lost_frames > self.max_lost_frames:
                 self.avoid_throttle = max(self.avoid_throttle - self.throttle_step, 0.0)
             return self.avoid_steering, self.avoid_throttle
 
         self.avoid_lost_frames = 0
-        self.avoid_steering = self.avoid_pid(other_center)
+
+        # Rate-limit the target before it reaches the PID - mirrors
+        # LaneFollower's own position_rate_limit_px (see its __init__): a
+        # reacquire/noise-driven jump in other_center otherwise steps the
+        # PID's process variable most of the way across the image in one
+        # frame, which is exactly what turned into a full-lock swerve off
+        # the track during on-car testing.
+        if self.avoid_position_rate_limit_px > 0 and self._avoid_last_position is not None:
+            step = other_center - self._avoid_last_position
+            if abs(step) > self.avoid_position_rate_limit_px:
+                other_center = self._avoid_last_position + math.copysign(
+                    self.avoid_position_rate_limit_px, step)
+        self._avoid_last_position = other_center
+
+        # Soft-saturate the remaining error (k*tanh(error/k)) before handing
+        # it to the PID - same technique as LaneFollower's
+        # error_saturation_px, for the same reason: a large error still
+        # shouldn't drive the proportional term straight to full steering
+        # lock.
+        error_px = other_center - self.avoid_target_pixel
+        k = self.avoid_error_saturation_px
+        soft_error_px = k * math.tanh(error_px / k)
+        self.avoid_steering = self.avoid_pid(self.avoid_target_pixel + soft_error_px)
 
         if abs(other_center - self.avoid_target_pixel) > self.avoid_target_threshold:
             # turning hard toward the other lane - slow down, same rule
