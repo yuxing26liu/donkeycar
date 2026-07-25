@@ -107,6 +107,36 @@ Merged into this file so far:
      (recorded frames don't respond to different throttle), flagged
      explicitly for the next physical test.
 
+  7. Boundary-identity guards (added after tub_57_26-07-25 - a short
+     recording of the car failing the tight inner turn, with the user
+     observing the left white boundary being interpreted as the right
+     one). Traced frame-by-frame (replay reproduced the recorded failure
+     steering almost exactly): during the tight turn yellow went
+     undetected past its reacquire window, which silently dropped the
+     yellow-derived white bounds; white then reacquired at x=198 onto the
+     boundary sweeping through image center (frame ~255); yellow next
+     reacquired at x=308 - on the WRONG SIDE of that white - and nothing
+     checked the accepted pair, so the inverted identity survived ~25
+     frames (each tracker's continuity gate defending its own wrong lock),
+     corrupted the row's width EMA (|308-200|=108), and swung the center
+     355 -> 55 (steering +0.77 -> -0.78: the wrong-direction commands that
+     drove the car off). Three acceptance-time guards, none of which touch
+     the healthy tracking path: (a) partner-keyed reacquire bounds - a
+     reacquiring yellow may not land on white's far side (the reciprocal
+     of the existing yellow-derived white bound; rejects the x=308
+     relock), and a reacquiring white must imply a lane width near the
+     row's learned width (LANE_WIDTH_JUMP_PX; rejects the x=198 relock,
+     implied width 138 vs learned ~325). Two earlier variants anchored
+     these bounds to the rate-limited lane center (a symmetric window,
+     then a side-of-center rule) and BOTH regressed the human-driven
+     inner laps - that anchor lags a fast turn, so center-anchored bounds
+     also reject legitimate relocks; partner positions don't lag.
+     (b) an accepted (yellow, white) pair violating min-separation order
+     evicts the less trustworthy side (just-reacquired first, else
+     farther-from-expected, else white), forcing it back through the
+     guarded reacquire path; (c) the per-row width EMA only updates from
+     physically plausible widths (LANE_WIDTH_MIN/MAX_PX).
+
 Not yet merged - bugs found and fixed, but not yet good enough to adopt
 (see donkeycar/parts/_candidates/):
 
@@ -473,6 +503,24 @@ class _LineTracker:
         self.lost_frames = 0
         self.just_reacquired = False
 
+    def evict(self):
+        '''
+        Forcibly drop this tracker's current lock (called by LaneFollower
+        when the pair-order invariant catches this tracker holding a
+        geometrically impossible position relative to its partner line -
+        see run()'s pair-consistency check). Clearing tracked/smoothed
+        state means the next detection goes through the cold-start
+        reacquire path, which LaneFollower bounds against the partner
+        tracker's position and the row's learned lane width (see the
+        boundary-identity guards in its __init__) - so an evicted tracker
+        re-latches somewhere plausible instead of defending a wrong lock
+        with its own continuity gate, which is exactly what tub_57 showed
+        happening for ~25 consecutive frames.
+        '''
+        self.tracked_position = None
+        self.smoothed_position = None
+        self.just_reacquired = False
+
     def _register_miss(self, mask):
         '''Shared bookkeeping for every no-usable-detection path in
         update(): count the miss, then either coast (return the last
@@ -766,6 +814,47 @@ class LaneFollower:
         # edge-of-frame glare. 0 disables.
         self.max_separation_px = getattr(cfg, 'LANE_MAX_SEPARATION_PX', 280)
 
+        # Boundary-identity guards (added after tub_57_26-07-25, a tight
+        # inner-turn failure - full trace in the module docstring's
+        # changelog): the only moment a tracker can latch onto the WRONG
+        # physical line is a reacquire after a sustained loss, and tub_57
+        # showed exactly that cascade - yellow lost past its window during
+        # the tight turn (so the yellow-derived white bounds evaporated),
+        # white reacquired on the boundary sweeping through image center,
+        # then yellow reacquired on the *other side* of that wrong white,
+        # and the inverted pair survived ~25 frames because each tracker's
+        # continuity gate defended its own lock. Three guards:
+        #
+        # (1) Reciprocal order bound: when white is tracked, a REACQUIRING
+        #     yellow only accepts candidates on yellow's side of it (the
+        #     exact mirror of the yellow-derived white bound, which had
+        #     been deliberately one-directional since tub_51 - tub_57 found
+        #     the hole: yellow reacquired on the far side of the tracked
+        #     white and nothing objected). No new config - reuses
+        #     LANE_MIN/MAX_SEPARATION_PX.
+        # (1b) LANE_WIDTH_JUMP_PX: a REACQUIRING white must relock at a
+        #     position whose implied lane width is within this many px of
+        #     the row's learned width (tub_57's wrong white relock implied
+        #     138px where the row had learned ~325). Both checks are
+        #     keyed to the partner tracker's position, NOT the rate-limited
+        #     lane center: two earlier variants anchored to that center (a
+        #     symmetric window, then a side-of-center rule) and both
+        #     measurably rejected legitimate relocks on the human-driven
+        #     laps, because the rate-limited anchor lags a fast turn.
+        #     Partner positions don't lag. 0 disables.
+        # (2) Pair-order invariant (no config): a row whose tracked yellow/
+        #     white pair violates min-separation order evicts the less
+        #     trustworthy side (just-reacquired first, else the one farther
+        #     from its expected position, else white) - see run().
+        # (3) LANE_WIDTH_MIN/MAX_PX: a row's width EMA only updates from
+        #     physically plausible pair widths, so one impossible pairing
+        #     can't corrupt the width that single-line fallbacks and the
+        #     expected-position math depend on (tub_57's row-0 width EMA
+        #     absorbed a 108px "width" from the inverted pair).
+        self.width_jump_px = getattr(cfg, 'LANE_WIDTH_JUMP_PX', 150)
+        self.lane_width_min_px = getattr(cfg, 'LANE_WIDTH_MIN_PX', 90)
+        self.lane_width_max_px = getattr(cfg, 'LANE_WIDTH_MAX_PX', 340)
+
         # Outer-line turn bias (new after tub_51_26-07-24): shift the
         # steering target toward the OUTSIDE line of the current turn -
         # user-observed failure mode is crossing the inside line mid-turn
@@ -859,7 +948,60 @@ class LaneFollower:
                     f"check LANE_SCAN_ROWS against the actual camera resolution")
                 continue
 
-            yellow_x, yellow_mask = self.yellow_trackers[i].update(scan_line)
+            yellow_tracker = self.yellow_trackers[i]
+            white_tracker = self.white_trackers[i]
+
+            # Expected per-boundary positions from the last stable lane
+            # geometry (the rate-limited combined center, moved into this
+            # row's frame via its learned offset, +/- half this row's lane
+            # width). None when there's no anchor (cold start, or cleared
+            # after a sustained full-lane loss).
+            sign = 1.0 if self.white_right_of_yellow else -1.0
+            expected_yellow = None
+            expected_white = None
+            if self._last_position is not None:
+                row_anchor = self._last_position + self.row_center_offset[i]
+                # used only as the eviction tiebreak in the pair-order
+                # invariant below - deliberately NOT as a reacquire bound
+                # (the rate-limited anchor lags a fast turn; bounding
+                # reacquires against it measurably rejected legitimate
+                # relocks on the human-driven laps)
+                expected_yellow = row_anchor - sign * self.row_lane_width_px[i] / 2.0
+                expected_white = row_anchor + sign * self.row_lane_width_px[i] / 2.0
+
+            def _in_reacquire(tracker):
+                # mirrors the acceptance condition inside _LineTracker.update:
+                # the next detection will be taken as a fresh (ungated) lock
+                return (tracker.tracked_position is None
+                        or tracker.lost_frames > tracker.reacquire_after_frames)
+
+            # Reciprocal order bound for a reacquiring yellow - guard (1)
+            # in the __init__ comment: when white is tracked (even a few
+            # frames stale), a reacquiring yellow must land on ITS side of
+            # white. This is the mirror of the yellow-derived white bound
+            # below, which had deliberately been one-directional since the
+            # tub_51 era - tub_57 found the hole in that decision: yellow
+            # reacquired at x=308, on the far side of the tracked white at
+            # 200.8, and nothing objected.
+            white_tracker_ref = None
+            if (white_tracker.tracked_position is not None
+                    and white_tracker.lost_frames <= white_tracker.reacquire_after_frames):
+                white_tracker_ref = white_tracker.tracked_position
+
+            yellow_x_min = None
+            yellow_x_max = None
+            if white_tracker_ref is not None and _in_reacquire(yellow_tracker):
+                if self.white_right_of_yellow:
+                    yellow_x_max = white_tracker_ref - self.min_separation_px
+                    if self.max_separation_px > 0:
+                        yellow_x_min = white_tracker_ref - self.max_separation_px
+                else:
+                    yellow_x_min = white_tracker_ref + self.min_separation_px
+                    if self.max_separation_px > 0:
+                        yellow_x_max = white_tracker_ref + self.max_separation_px
+
+            yellow_x, yellow_mask = self.yellow_trackers[i].update(scan_line,
+                                                                    x_min=yellow_x_min, x_max=yellow_x_max)
 
             # Geometric plausibility bound for white, derived from yellow -
             # see the LANE_MIN_SEPARATION_PX comment in __init__. Prefer this
@@ -867,9 +1009,10 @@ class LaneFollower:
             # position while it's only briefly lost (a normal dashed-line
             # gap), since the line hasn't plausibly moved far in that time.
             # No yellow reference at all (cold start, or yellow lost past its
-            # reacquire window) -> no bound; the constraint can only be as
-            # available as the line it's derived from.
-            yellow_tracker = self.yellow_trackers[i]
+            # reacquire window) -> no yellow-derived bound; the anchor-based
+            # reacquire window below still applies when available (tub_57's
+            # failure lived exactly in this yellow-long-lost hole, where the
+            # old code left white reacquisition completely unbounded).
             if yellow_x is not None:
                 yellow_ref = yellow_x
             elif (yellow_tracker.tracked_position is not None
@@ -889,9 +1032,59 @@ class LaneFollower:
                     white_x_max = yellow_ref - self.min_separation_px
                     if self.max_separation_px > 0:
                         white_x_min = yellow_ref - self.max_separation_px
+            if (yellow_ref is not None and _in_reacquire(white_tracker)
+                    and self.width_jump_px > 0):
+                # Width-consistency bound for a reacquiring white - guard
+                # (1b) in the __init__ comment: the relocked pair's implied
+                # width must be near this row's LEARNED width. tub_57's
+                # wrong relock (white at 198 with yellow correctly at 60)
+                # implied a 138px lane where the row had learned ~325 - a
+                # 187px jump no real lane produces between consecutive
+                # sightings. Lag-free (keyed to yellow's position, not the
+                # rate-limited center), and only active while reacquiring -
+                # steady tracking is never width-constrained.
+                lo = yellow_ref + sign * self.row_lane_width_px[i] - self.width_jump_px
+                hi = yellow_ref + sign * self.row_lane_width_px[i] + self.width_jump_px
+                white_x_min = lo if white_x_min is None else max(white_x_min, lo)
+                white_x_max = hi if white_x_max is None else min(white_x_max, hi)
 
             white_x, white_mask = self.white_trackers[i].update(scan_line,
                                                                  x_min=white_x_min, x_max=white_x_max)
+
+            # Pair-order invariant - guard (2) in the __init__ comment. The
+            # selection-time bounds above can't prevent every inversion
+            # (e.g. yellow reacquiring on the far side of an already-wrong
+            # white, tub_57 frame ~260), so the accepted pair itself is
+            # checked: if it's geometrically impossible, evict the less
+            # trustworthy side and treat it as a miss this frame. Its next
+            # detection then re-latches through the (anchor-windowed)
+            # reacquire path instead of defending the wrong lock.
+            if yellow_x is not None and white_x is not None:
+                if sign * (white_x - yellow_x) < self.min_separation_px:
+                    y_reacq = yellow_tracker.just_reacquired
+                    w_reacq = white_tracker.just_reacquired
+                    if y_reacq and not w_reacq:
+                        evict_yellow = True
+                    elif w_reacq and not y_reacq:
+                        evict_yellow = False
+                    elif expected_yellow is not None:
+                        # neither (or both) just re-latched: evict whichever
+                        # sits farther from where the lane says it should be
+                        evict_yellow = (abs(yellow_x - expected_yellow)
+                                         > abs(white_x - expected_white))
+                    else:
+                        evict_yellow = False  # no anchor: default to distrusting white
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"row {i}: impossible pair yellow={yellow_x:.1f} "
+                                      f"white={white_x:.1f} - evicting "
+                                      f"{'yellow' if evict_yellow else 'white'}")
+                    if evict_yellow:
+                        yellow_tracker.evict()
+                        yellow_x = None
+                    else:
+                        white_tracker.evict()
+                        white_x = None
+
             overlay_rows.append((scan_y, yellow_mask, white_mask, yellow_x, white_x))
 
             if i == 0:
@@ -900,12 +1093,16 @@ class LaneFollower:
                 near_yellow_x, near_white_x = yellow_x, white_x
 
             # each row keeps its own width estimate current whenever it
-            # sees both lines together - see row_lane_width_px in __init__
+            # sees both lines together AND the pair implies a physically
+            # plausible width - guard (3) in the __init__ comment (tub_57's
+            # inverted pair EMA'd a 108px "width" into row 0 before this
+            # gate existed)
             if yellow_x is not None and white_x is not None:
                 measured_width = abs(white_x - yellow_x)
-                self.row_lane_width_px[i] = (
-                    self.lane_width_smoothing_alpha * measured_width
-                    + (1 - self.lane_width_smoothing_alpha) * self.row_lane_width_px[i])
+                if self.lane_width_min_px <= measured_width <= self.lane_width_max_px:
+                    self.row_lane_width_px[i] = (
+                        self.lane_width_smoothing_alpha * measured_width
+                        + (1 - self.lane_width_smoothing_alpha) * self.row_lane_width_px[i])
 
             center = self._lane_center(yellow_x, white_x, self.row_lane_width_px[i])
             if center is not None:
