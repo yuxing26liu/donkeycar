@@ -127,14 +127,24 @@ class ObstacleAvoider:
     so there's lead distance to react before the marker reaches
     LaneFollower's own nearer scan rows.
 
-    A detection only "counts" (self.cone_detected) if it falls within OUR
+    A detection only "counts" (self.cone_ready) if it falls within OUR
     lane's pixel bounds (_lane_bounds, with a small LANE_SHIFT_MARGIN_PX
-    margin) AND holds for CONE_TRIGGER_FRAMES consecutive frames - a cone
-    marked in the other lane is detected but doesn't count, and a one-frame
-    misclassification (e.g. a sliver of glare) can't flip the flag by
-    itself. This mirrors the "don't react to a single frame" caution
-    lane_follower.py's continuity gating uses for the dashed yellow line,
-    applied here to noise rejection instead of dash-gap tolerance.
+    margin) AND is roughly centered in the raw image (_is_centered,
+    CONE_CENTER_MARGIN_PX) AND is close enough to matter (_is_close,
+    CONE_CLOSE_MIN_AREA_PX) - and self.cone_detected only latches once
+    cone_ready holds for CONE_TRIGGER_FRAMES consecutive frames. The
+    centered/close gates were added after on-car testing showed a cone in
+    the OTHER lane still latching cone_detected: lane/width_px can be noisy
+    enough (see project_doc/obstacle_avoidance.md's "noisy lane width"
+    entries) to fool the lane-bounds test on its own, but a far-lane cone
+    still reads as off-center and/or small in the raw frame regardless of
+    what the lane-bounds test thinks, so these two checks hold even when
+    lane geometry is wrong. A cone marked in the other lane is detected but
+    doesn't count, and a one-frame misclassification (e.g. a sliver of
+    glare) can't flip the flag by itself. This mirrors the "don't react to
+    a single frame" caution lane_follower.py's continuity gating uses for
+    the dashed yellow line, applied here to noise rejection instead of
+    dash-gap tolerance.
     '''
 
     def __init__(self, cfg):
@@ -157,6 +167,28 @@ class ObstacleAvoider:
         self.white_right_of_yellow = getattr(cfg, 'WHITE_RIGHT_OF_YELLOW', True)
         self.lane_margin_px = getattr(cfg, 'LANE_SHIFT_MARGIN_PX', 10)
         self.cone_trigger_frames = getattr(cfg, 'CONE_TRIGGER_FRAMES', 2)
+
+        # Added after on-car testing showed a cone sitting in the OTHER lane
+        # still latching cone_detected: the lane-bounds test above
+        # (_lane_bounds/_x_in_bounds) depends entirely on LaneFollower's
+        # published yellow_x/white_x/lane_width_px, which project_doc's
+        # "noisy lane width" incident already showed can swing far enough in
+        # a single frame to misjudge which lane a detection is actually in -
+        # smoothing (_smoothed_lane_width) narrowed that window but doesn't
+        # close it. These two gates are independent of lane geometry
+        # entirely, so they hold even when yellow_x/white_x/lane_width_px are
+        # themselves wrong: a cone worth swerving for is one we're about to
+        # hit, which from a forward-facing camera means it reads as roughly
+        # centered in the raw image (our lane, being the lane the camera
+        # looks down, sits close to image-center; the other lane sits well
+        # off to the side - see _is_centered) AND its blob has grown large
+        # enough to mean "close" (a real 3D object's apparent size grows as
+        # it nears the camera, same reasoning CONE_MAX_WIDTH_PX's docstring
+        # already uses - see _is_close). Both are required in addition to,
+        # not instead of, the lane-bounds test - a cheap extra filter, not a
+        # replacement for a working one.
+        self.cone_center_margin_px = getattr(cfg, 'CONE_CENTER_MARGIN_PX', 60)
+        self.cone_close_min_area_px = getattr(cfg, 'CONE_CLOSE_MIN_AREA_PX', 200)
 
         # lane/width_px (published by LaneFollower) swung 150->392->133px
         # across a handful of frames during on-car avoidance testing - real
@@ -201,6 +233,18 @@ class ObstacleAvoider:
         self.avoid_position_rate_limit_px = getattr(cfg, 'AVOID_POSITION_RATE_LIMIT_PX',
                                                      getattr(cfg, 'LANE_POSITION_RATE_LIMIT_PX', 25))
         self._avoid_last_position = None
+        # Steering rate limit - added after user feedback that the maneuver
+        # turned too sharply into the other lane, leaving LaneFollower(3)
+        # too little time to pick up the new lane's own white boundary
+        # before the turn was already mostly complete. avoid_position_rate_limit_px
+        # (above) only slews the PID's *target*; the PID itself can still
+        # jump straight to a large output the instant the maneuver begins
+        # (e.g. the first frame's error is already sizable). This caps how
+        # much self.avoid_steering itself may change per frame, on top of
+        # that - a deliberately slow turn-in so the car is still looking
+        # roughly down the lane (rather than already committed to a hard
+        # turn) while the new white line comes into the scan band. 0 disables.
+        self.avoid_steering_rate_limit = getattr(cfg, 'AVOID_STEERING_RATE_LIMIT', 0.04)
         # reuse LaneFollower's own turning/straight throttle scheme
         # (cfg.LANE_TARGET_THRESHOLD/THROTTLE_STEP/THROTTLE_MIN/THROTTLE_MAX)
         # rather than inventing new tuning knobs - see _avoid_step
@@ -224,10 +268,15 @@ class ObstacleAvoider:
         # public detection state - what a future avoidance maneuver (or a
         # test) reads; updated every run() call
         self.cone_x = None              # raw detected x this frame (any lane), or None
+        self.cone_area = 0              # winning blob's pixel area this frame, or 0
         self.cone_color = None          # 'blue tape' or 'orange cone' - which detector
                                          # won this frame, or None if cone_x is None
-        self.cone_in_our_lane = False   # raw in-our-lane test this frame, pre-debounce
-        self.cone_detected = False      # debounced: True once cone_in_our_lane has held
+        self.cone_in_our_lane = False   # raw in-our-lane test this frame (lane geometry), pre-debounce
+        self.cone_centered = False      # raw centered-in-frame test this frame (see __init__)
+        self.cone_close = False         # raw close-enough test this frame (see __init__)
+        self.cone_ready = False         # in_our_lane AND centered AND close - what actually
+                                         # drives the debounce counter below
+        self.cone_detected = False      # debounced: True once cone_ready has held
                                          # for cone_trigger_frames consecutive frames
         self._pending_frames = 0
 
@@ -288,9 +337,11 @@ class ObstacleAvoider:
     def detect_cone(self, band_hsv):
         '''
         input: band_hsv, HSV numpy array of the forward scan band
-        output: (x, color_label, blue_mask, orange_mask) - x position in
-                pixels of the winning blob's centroid (or None if neither
-                color produced one), color_label is 'blue tape' or
+        output: (x, area, color_label, blue_mask, orange_mask) - x position
+                in pixels of the winning blob's centroid (or None if neither
+                color produced one), its pixel area (0 if x is None; see
+                _is_close's docstring for why area is what run() uses as a
+                "how close is it" proxy), color_label is 'blue tape' or
                 'orange cone' (whichever won) or None, and both binary color
                 masks (returned for _describe_mask's diagnostics below, so
                 they aren't recomputed twice per frame)
@@ -314,9 +365,9 @@ class ObstacleAvoider:
                       ((blue_area, blue_x, 'blue tape'), (orange_area, orange_x, 'orange cone'))
                       if x is not None]
         if not candidates:
-            return None, None, blue_mask, orange_mask
-        _area, x, color_label = max(candidates)
-        return x, color_label, blue_mask, orange_mask
+            return None, 0, None, blue_mask, orange_mask
+        area, x, color_label = max(candidates)
+        return x, area, color_label, blue_mask, orange_mask
 
     def _describe_mask(self, blue_mask, orange_mask):
         '''
@@ -368,10 +419,18 @@ class ObstacleAvoider:
         if self.avoiding:
             return f"AVOIDING - steering toward other lane (triggered by {self.cone_color or 'cone'}, stays this way for the rest of the drive)"
         if self.cone_detected:
-            return f"SWERVE - {self.cone_color} confirmed in our lane, steer toward other lane"
-        if self.cone_in_our_lane:
-            return (f"{self.cone_color} candidate in our lane, confirming "
+            return f"SWERVE - {self.cone_color} confirmed in our lane, centered, and close - steer toward other lane"
+        if self.cone_ready:
+            return (f"{self.cone_color} candidate in our lane, centered, and close - confirming "
                      f"({self._pending_frames}/{self.cone_trigger_frames} frames) - hold lane for now")
+        if self.cone_in_our_lane:
+            reasons = []
+            if not self.cone_centered:
+                reasons.append("not centered in frame")
+            if not self.cone_close:
+                reasons.append("not close enough")
+            return (f"{self.cone_color} candidate in our lane but {' / '.join(reasons)} "
+                     f"(area={self.cone_area}px) - hold lane for now")
         if self.cone_x is not None:
             return f"{self.cone_color} blob seen but not in our lane - hold lane"
         return "no cone (blue tape or orange) visible - hold lane"
@@ -381,6 +440,30 @@ class ObstacleAvoider:
         if x is None or lo is None:
             return False
         return lo - self.lane_margin_px <= x <= hi + self.lane_margin_px
+
+    def _is_centered(self, x, frame_width):
+        '''
+        True if x sits within CONE_CENTER_MARGIN_PX of the raw image's
+        horizontal center - see the CONE_CENTER_MARGIN_PX comment in
+        __init__ for why this is checked independently of the lane-bounds
+        test. Deliberately the image's center, not our lane's center: a
+        forward-facing camera looking down our own lane already reads our
+        lane as roughly centered in frame, while the other lane - the case
+        this is meant to reject - sits well off to one side.
+        '''
+        if x is None:
+            return False
+        return abs(x - frame_width / 2.0) <= self.cone_center_margin_px
+
+    def _is_close(self, area):
+        '''
+        True if the winning blob's pixel area meets CONE_CLOSE_MIN_AREA_PX -
+        see the CONE_CLOSE_MIN_AREA_PX comment in __init__. A real 3D cone's
+        apparent size grows as it nears the camera (the same reasoning
+        CONE_MAX_WIDTH_PX's docstring already relies on), so area is a cheap
+        proxy for distance without needing a second, nearer scan row.
+        '''
+        return area >= self.cone_close_min_area_px
 
     def _sample_color(self, band_rgb, band_hsv, x, radius=4):
         '''
@@ -436,10 +519,12 @@ class ObstacleAvoider:
         if raw_detected and not self._was_raw_detected:
             mean_hsv, mean_rgb = self._sample_color(band_rgb, band_hsv, self.cone_x)
             lane_note = "IN our lane" if self.cone_in_our_lane else "NOT in our lane (or lane unknown)"
+            centered_note = "centered" if self.cone_centered else "off-center"
+            close_note = "close" if self.cone_close else "far"
             logger.info(
-                f"[cone_tape] {self.cone_color} candidate at x={self.cone_x:.1f}, scan_y={self.scan_y} - "
-                f"sampled color HSV=({mean_hsv[0]:.0f},{mean_hsv[1]:.0f},{mean_hsv[2]:.0f}) "
-                f"RGB=({mean_rgb[0]:.0f},{mean_rgb[1]:.0f},{mean_rgb[2]:.0f}) - {lane_note} - "
+                f"[cone_tape] {self.cone_color} candidate at x={self.cone_x:.1f}, area={self.cone_area}px, "
+                f"scan_y={self.scan_y} - sampled color HSV=({mean_hsv[0]:.0f},{mean_hsv[1]:.0f},{mean_hsv[2]:.0f}) "
+                f"RGB=({mean_rgb[0]:.0f},{mean_rgb[1]:.0f},{mean_rgb[2]:.0f}) - {lane_note}, {centered_note}, {close_note} - "
                 f"ACTION: {action}"
             )
         elif not raw_detected and self._was_raw_detected:
@@ -522,10 +607,19 @@ class ObstacleAvoider:
 
         our_lane = _lane_bounds(yellow_x, white_x, lane_width_px, self.white_right_of_yellow, other_lane=False)
 
-        self.cone_x, self.cone_color, blue_mask, orange_mask = self.detect_cone(band_hsv)
+        self.cone_x, self.cone_area, self.cone_color, blue_mask, orange_mask = self.detect_cone(band_hsv)
         self.cone_in_our_lane = self._x_in_bounds(self.cone_x, our_lane)
+        self.cone_centered = self._is_centered(self.cone_x, cam_img.shape[1])
+        self.cone_close = self._is_close(self.cone_area)
 
-        if self.cone_in_our_lane:
+        # A cone only counts toward the debounce counter once ALL THREE hold
+        # (see the CONE_CENTER_MARGIN_PX/CONE_CLOSE_MIN_AREA_PX comments in
+        # __init__): in our lane per the (noisy) lane geometry, roughly
+        # centered in the raw frame, and close enough to actually matter -
+        # any one of the three failing means "not yet, hold lane."
+        self.cone_ready = self.cone_in_our_lane and self.cone_centered and self.cone_close
+
+        if self.cone_ready:
             self._pending_frames += 1
         else:
             self._pending_frames = 0
@@ -545,7 +639,7 @@ class ObstacleAvoider:
                 f"afterward (see class docstring)"
             )
         elif was_detected and not self.cone_detected:
-            logger.info(f"cone marker no longer in our lane - ACTION: {self._decide_action()}")
+            logger.info(f"cone marker no longer in our lane / centered / close - ACTION: {self._decide_action()}")
 
         if self.avoiding:
             steering, throttle = self._avoid_step(cam_img, yellow_x, lane_width_px, throttle)
@@ -628,11 +722,32 @@ class ObstacleAvoider:
         error_px = other_center - self.avoid_target_pixel
         k = self.avoid_error_saturation_px
         soft_error_px = k * math.tanh(error_px / k)
-        self.avoid_steering = self.avoid_pid(self.avoid_target_pixel + soft_error_px)
+        pid_steering = self.avoid_pid(self.avoid_target_pixel + soft_error_px)
 
-        if abs(other_center - self.avoid_target_pixel) > self.avoid_target_threshold:
+        # Steering rate limit - see AVOID_STEERING_RATE_LIMIT in __init__:
+        # slows how fast the turn itself is allowed to develop (distinct
+        # from avoid_position_rate_limit_px above, which only slews the
+        # PID's *target*), so LaneFollower(3) has more frames with the
+        # camera still looking roughly down the lane to pick up the new
+        # lane's white boundary before the car has already committed to a
+        # hard turn.
+        rate_limited = False
+        if self.avoid_steering_rate_limit > 0:
+            delta = pid_steering - self.avoid_steering
+            if abs(delta) > self.avoid_steering_rate_limit:
+                pid_steering = self.avoid_steering + math.copysign(
+                    self.avoid_steering_rate_limit, delta)
+                rate_limited = True
+        self.avoid_steering = pid_steering
+
+        if rate_limited or abs(other_center - self.avoid_target_pixel) > self.avoid_target_threshold:
             # turning hard toward the other lane - slow down, same rule
-            # LaneFollower uses for its own lane-keeping
+            # LaneFollower uses for its own lane-keeping. Also slows down
+            # while the steering rate limiter is actively capping the turn
+            # (rate_limited True), even if the remaining pixel error is
+            # already under avoid_target_threshold - a big correction is
+            # still underway, just spread over more frames, and the car
+            # should stay slow for the whole stretch it's turning in.
             self.avoid_throttle = max(self.avoid_throttle - self.throttle_step, self.throttle_min)
         else:
             self.avoid_throttle = min(self.avoid_throttle + self.throttle_step, self.throttle_max)
@@ -642,7 +757,15 @@ class ObstacleAvoider:
     def overlay_display(self, cv_img):
         y0, y1 = self.scan_y, self.scan_y + self.scan_height
         if self.cone_x is not None:
-            color = (255, 140, 0) if self.cone_in_our_lane else (150, 150, 150)
+            # bright orange only once the cone is actually "ready" (in
+            # lane, centered, close - see cone_ready in run()); a dimmer
+            # orange for in-lane-but-not-ready-yet, gray for anything else
+            if self.cone_ready:
+                color = (255, 140, 0)
+            elif self.cone_in_our_lane:
+                color = (180, 120, 60)
+            else:
+                color = (150, 150, 150)
             cv2.rectangle(cv_img, (int(self.cone_x) - 8, y0), (int(self.cone_x) + 8, y1),
                           color=color, thickness=2)
         label = f"CONE:{self.cone_detected}" + (f" ({self.cone_color})" if self.cone_color else "")

@@ -494,6 +494,64 @@ against real on-car footage of the avoid maneuver itself - next on-car test
 should watch `lane/width_px` and `avoid_steering` directly to confirm the
 overshoot is actually gone, not just less noisy in isolation.
 
+## On-car feedback (2026-07-27): still false-triggering in the other lane + turning too sharply
+
+Further on-car testing (now against `lane_follower3.py`'s `LaneFollower`,
+which publishes the same `yellow_x`/`white_x`/`lane_width_px` contract as
+`lane_follower.py`'s - see its own module docstring) showed two more
+problems with the maneuver, both consistent with what was already flagged
+as unverified in the previous entry:
+
+1. **A cone in the OTHER lane still latched `cone_detected`.** The
+   smoothing added in the previous entry (`_smoothed_lane_width`) narrows
+   the window where `lane/width_px` noise fools `_lane_bounds`, but doesn't
+   close it - a single bad `yellow_x`/`white_x`/`lane_width_px` combination
+   at just the wrong moment can still put a far-lane cone inside the
+   (noise-derived) "our lane" bounds.
+2. **The avoid maneuver turned too sharply into the other lane**, leaving
+   too few frames for the lane tracker to pick up the new lane's own white
+   boundary before the turn was already mostly complete - the maneuver
+   steers independently of `LaneFollower`'s own detection the whole time
+   it's active (see `_avoid_step`), so a fast turn-in outruns the tracker's
+   ability to reacquire on the new lane.
+
+Fixed in `ObstacleAvoider`, without touching `LaneFollower`/`lane_follower3.py`:
+
+- **Two new gates on the trigger itself, independent of lane geometry
+  entirely** (`cone_ready` in `run()`, in addition to - not instead of -
+  the existing `cone_in_our_lane` lane-bounds test): `_is_centered` requires
+  the raw detection to sit within `CONE_CENTER_MARGIN_PX` of the *raw
+  image's* horizontal center (not our lane's center - a forward-facing
+  camera already reads our own lane as roughly centered in frame, while the
+  other lane sits well off to one side, so this holds even when
+  `_lane_bounds` itself is fooled by noisy geometry); `_is_close` requires
+  the winning blob's pixel area to clear `CONE_CLOSE_MIN_AREA_PX` - a real
+  3D cone's apparent size grows as it nears the camera (the same reasoning
+  `CONE_MAX_WIDTH_PX`'s docstring already relies on), so area is a cheap
+  proxy for distance without a second, nearer scan row. All three
+  (in-lane, centered, close) must hold for a frame to count toward the
+  `CONE_TRIGGER_FRAMES` debounce.
+- **`AVOID_STEERING_RATE_LIMIT`** (default 0.04/frame) caps how much
+  `self.avoid_steering` may change per frame in `_avoid_step`, independent
+  of `avoid_position_rate_limit_px` (which only slews the PID's *target*,
+  not its output) - a deliberately slow turn-in so the car spends more
+  frames still looking roughly down the lane while the new lane's white
+  boundary comes into view. While the limiter is actively capping the turn,
+  `avoid_throttle` also stays in the "turning hard" slow-down branch even
+  if the remaining pixel error is already under `AVOID_TARGET_THRESHOLD` -
+  the correction is still underway, just spread over more frames.
+
+Covered by `donkeycar/tests/test_obstacle_avoider.py`:
+`TestObstacleAvoiderCenteredAndClose` (in-lane-but-off-center and
+in-lane-but-far cases, reproducing the false-trigger directly) and
+`TestObstacleAvoiderSteeringRateLimit`. Like every other constant in this
+file, `CONE_CENTER_MARGIN_PX`/`CONE_CLOSE_MIN_AREA_PX`/
+`AVOID_STEERING_RATE_LIMIT` are starting estimates, not yet independently
+verified against real on-car footage of the revised maneuver - next on-car
+test should confirm the other-lane false trigger is actually gone and watch
+how many frames it now takes to reacquire the new lane's white line during
+the slower turn-in.
+
 ## Next steps
 
 1. Detect the car's black wheels/front (Decision 2, option A) the same way

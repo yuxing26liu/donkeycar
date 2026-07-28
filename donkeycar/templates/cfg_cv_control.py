@@ -658,6 +658,22 @@ CONE_TRIGGER_FRAMES = 2    # consecutive in-lane detections required before
                             # obstacle/cone_detected latches True -- rejects a
                             # single noisy frame (glare, a leaf, etc.)
 
+# Added after on-car testing showed a cone sitting in the OTHER lane still
+# latching cone_detected -- the in-lane test above depends on LaneFollower's
+# published lane geometry, which can be noisy enough (see the
+# CONE_LANE_WIDTH_* comments below) to misjudge which lane a cone is
+# actually in. These two are checked independently of lane geometry, in
+# ADDITION to the in-lane test, not instead of it -- see the
+# CONE_CENTER_MARGIN_PX/CONE_CLOSE_MIN_AREA_PX comments in obstacle_avoider.py.
+CONE_CENTER_MARGIN_PX = 60    # max pixels the detected cone may sit from the
+                                # RAW IMAGE's horizontal center (not our lane's
+                                # center) and still count as "dead ahead"
+CONE_CLOSE_MIN_AREA_PX = 200   # min pixel area (in the scan slice) for the cone
+                                # to count as "close enough to react to" --
+                                # apparent size grows as a real 3D cone nears
+                                # the camera, same reasoning CONE_MAX_WIDTH_PX
+                                # above already relies on
+
 CONE_LOG_INTERVAL_FRAMES = 10  # while the blue tape stays in view, re-print its
                                 # sampled color value this often (in frames) -- the
                                 # thing to watch when tuning BLUE_HSV_THRESHOLD_LOW/HIGH

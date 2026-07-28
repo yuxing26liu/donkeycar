@@ -453,3 +453,114 @@ class TestObstacleAvoiderDiagnostics:
                 avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert warnings == []
+
+
+class TestObstacleAvoiderCenteredAndClose:
+    '''
+    Added after real on-car testing showed a cone in the OTHER lane still
+    latching cone_detected - traced to lane/width_px noise fooling the
+    lane-bounds test (_lane_bounds/_x_in_bounds), the same failure mode
+    project_doc/obstacle_avoidance.md's "noisy lane width" incident already
+    documented for the avoid maneuver's steering target. Fix: cone_detected
+    now also requires the raw detection to be roughly centered in the
+    IMAGE (not our lane - see _is_centered's docstring) and close enough to
+    matter (a large-enough blob - see _is_close's docstring), in ADDITION
+    to the existing lane-bounds test - see cone_ready in run().
+    '''
+
+    def _run_n(self, avoider, cam_img, yellow_x, white_x, lane_width_px, n):
+        result = None
+        for _ in range(n):
+            result = avoider.run(cam_img, yellow_x, white_x, lane_width_px, 0.0, 0.2)
+        return result
+
+    def test_in_lane_but_off_center_does_not_trigger(self):
+        # Reproduces the reported bug directly: a noisy/shifted lane
+        # geometry ([340, 400], center 370) that's far from the raw image's
+        # center (426/2 = 213) still passes the lane-bounds test for a cone
+        # sitting inside it - but that cone is nowhere near where the
+        # camera is actually looking, which is exactly the false-trigger
+        # this project's on-car testing hit.
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(360, 380, 65, 85, ORANGE)])  # centered ~370, inside [340,400]
+        _s, _t, _cv, detected = self._run_n(avoider, img, 340.0, 400.0, 60.0, 5)
+        assert avoider.cone_in_our_lane is True
+        assert avoider.cone_centered is False
+        assert avoider.cone_ready is False
+        assert detected is False
+        assert avoider.avoiding is False
+
+    def test_in_lane_and_centered_but_far_does_not_trigger(self):
+        # Small blob (10x10=100px, clears CONE_MIN_AREA_PX=80 but not
+        # CONE_CLOSE_MIN_AREA_PX=200) at the same centered position the
+        # positive-detection tests use - simulates a cone that's real and
+        # dead ahead but still too far away to react to yet.
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(215, 225, 70, 80, ORANGE)])  # centered ~220, 10x10
+        _s, _t, _cv, detected = self._run_n(avoider, img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 5)
+        assert avoider.cone_in_our_lane is True
+        assert avoider.cone_centered is True
+        assert avoider.cone_close is False
+        assert avoider.cone_ready is False
+        assert detected is False
+
+    def test_in_lane_centered_and_close_triggers(self):
+        # All three hold (mirrors the existing positive-detection fixture) -
+        # cone_ready should be True from frame 1, and cone_detected latches
+        # after CONE_TRIGGER_FRAMES same as before this change.
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(210, 230, 65, 85, ORANGE)])
+        _s, _t, _cv, detected = avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        assert avoider.cone_ready is True
+        assert detected is False  # only 1/2 trigger frames so far
+        _s, _t, _cv, detected = avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        assert detected is True
+
+
+class TestObstacleAvoiderSteeringRateLimit:
+    '''
+    Added after user feedback that the avoid maneuver turned too sharply
+    into the other lane, leaving too few frames for the lane tracker to
+    pick up the new lane's own white boundary before the turn was already
+    mostly complete. AVOID_STEERING_RATE_LIMIT caps how much avoid_steering
+    may change per frame - see the comment in ObstacleAvoider.__init__ and
+    _avoid_step.
+    '''
+
+    def _trigger(self, avoider, cone_patch=(210, 230, 65, 85, ORANGE)):
+        img = _make_frame([cone_patch])
+        for _ in range(2):  # CONE_TRIGGER_FRAMES=2
+            avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        return img
+
+    def test_steering_does_not_jump_past_the_rate_limit_on_trigger(self):
+        avoider = ObstacleAvoider(_Cfg())
+        self._trigger(avoider)
+        # avoid_steering started this maneuver at 0.0 (see __init__); a raw
+        # PID output well beyond the rate limit must be capped to exactly
+        # the limit on the first _avoid_step call, not applied in full.
+        assert abs(avoider.avoid_steering) == pytest.approx(avoider.avoid_steering_rate_limit)
+
+    def test_steering_ramps_gradually_across_frames_while_avoiding(self):
+        avoider = ObstacleAvoider(_Cfg())
+        img = self._trigger(avoider)
+        prev = avoider.avoid_steering
+        for _ in range(10):
+            steering, _t, _cv, _detected = avoider.run(
+                img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+            assert abs(steering - prev) <= avoider.avoid_steering_rate_limit + 1e-9
+            prev = steering
+
+    def test_rate_limit_disabled_allows_immediate_full_jump(self):
+        # AVOID_STEERING_RATE_LIMIT=0 disables the limiter (see __init__
+        # comment) - the maneuver should behave exactly as it did before
+        # this feature existed: the PID's raw output applies in full on the
+        # very first _avoid_step call.
+        class _CfgNoRateLimit(_Cfg):
+            AVOID_STEERING_RATE_LIMIT = 0
+
+        avoider = ObstacleAvoider(_CfgNoRateLimit())
+        self._trigger(avoider)
+        assert avoider.avoid_steering_rate_limit == 0
+        # well past the default 0.04 limit - confirms nothing capped it
+        assert abs(avoider.avoid_steering) > 0.04
