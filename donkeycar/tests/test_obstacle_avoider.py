@@ -564,3 +564,58 @@ class TestObstacleAvoiderSteeringRateLimit:
         assert avoider.avoid_steering_rate_limit == 0
         # well past the default 0.04 limit - confirms nothing capped it
         assert abs(avoider.avoid_steering) > 0.04
+
+
+class TestObstacleAvoiderNoLaneGeometryFallback:
+    '''
+    Added after tub_7_26-07-27: the car drove straight into a cone with no
+    swerve at all, in a stretch where it had already lost the lane from an
+    earlier incident (yellow_x/white_x both None). cone_in_our_lane is
+    structurally False whenever there's no lane geometry to test against
+    (_x_in_bounds returns False when the bounds are (None, None)), so the
+    old all-three-required cone_ready meant a car that had already lost the
+    lane could never trigger avoidance no matter how obviously a cone sat
+    dead ahead. Fix: when lane_geometry_available is False, cone_ready
+    falls back to centered AND close alone - see run().
+    '''
+
+    def _run_n(self, avoider, cam_img, n):
+        result = None
+        for _ in range(n):
+            result = avoider.run(cam_img, None, None, LANE_WIDTH_PX, 0.0, 0.2)
+        return result
+
+    def test_centered_and_close_cone_triggers_with_no_lane_geometry(self):
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(210, 230, 65, 85, ORANGE)])  # centered ~220, 20x20
+        _s, _t, _cv, detected = self._run_n(avoider, img, 2)
+        assert avoider.lane_geometry_available is False
+        assert avoider.cone_in_our_lane is False  # no geometry - structurally can't be True
+        assert avoider.cone_centered is True
+        assert avoider.cone_close is True
+        assert avoider.cone_ready is True
+        assert detected is True
+        assert avoider.avoiding is True
+
+    def test_off_center_cone_still_does_not_trigger_with_no_lane_geometry(self):
+        # the fallback drops the lane-bounds requirement, not the centered/
+        # close requirements - a cone off to the side should still be
+        # ignored even with no lane geometry to check it against.
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(360, 380, 65, 85, ORANGE)])  # centered ~370, far from image center 213
+        _s, _t, _cv, detected = self._run_n(avoider, img, 5)
+        assert avoider.lane_geometry_available is False
+        assert avoider.cone_centered is False
+        assert avoider.cone_ready is False
+        assert detected is False
+
+    def test_lane_geometry_present_uses_normal_gating(self):
+        # sanity check: as soon as ANY lane geometry is published, the
+        # fallback is off and the normal (in-lane AND centered AND close)
+        # rule applies again.
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(210, 230, 65, 85, ORANGE)])
+        avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        assert avoider.lane_geometry_available is True
+        assert avoider.cone_ready == (avoider.cone_in_our_lane and avoider.cone_centered
+                                       and avoider.cone_close)

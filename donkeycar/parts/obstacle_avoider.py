@@ -145,6 +145,16 @@ class ObstacleAvoider:
     a single frame" caution lane_follower.py's continuity gating uses for
     the dashed yellow line, applied here to noise rejection instead of
     dash-gap tolerance.
+
+    Exception: when LaneFollower publishes NO lane geometry at all this
+    frame (yellow_x and white_x both None - self.lane_geometry_available
+    False), cone_in_our_lane is structurally False (see _x_in_bounds) and
+    can never be satisfied, so requiring it would mean a car that has
+    already lost the lane can never trigger avoidance no matter how
+    obviously a cone sits dead ahead. Added after tub_7_26-07-27: the car
+    drove straight into a cone with no swerve while already off the marked
+    lane from an earlier incident. In that specific case cone_ready falls
+    back to centered AND close alone - see run().
     '''
 
     def __init__(self, cfg):
@@ -285,8 +295,9 @@ class ObstacleAvoider:
         self.cone_in_our_lane = False   # raw in-our-lane test this frame (lane geometry), pre-debounce
         self.cone_centered = False      # raw centered-in-frame test this frame (see __init__)
         self.cone_close = False         # raw close-enough test this frame (see __init__)
-        self.cone_ready = False         # in_our_lane AND centered AND close - what actually
-                                         # drives the debounce counter below
+        self.lane_geometry_available = False  # yellow_x or white_x published this frame - see run()
+        self.cone_ready = False         # normally in_our_lane AND centered AND close; centered AND
+                                         # close alone when lane_geometry_available is False - see run()
         self.cone_detected = False      # debounced: True once cone_ready has held
                                          # for cone_trigger_frames consecutive frames
         self._pending_frames = 0
@@ -430,10 +441,22 @@ class ObstacleAvoider:
         if self.avoiding:
             return f"AVOIDING - steering toward other lane (triggered by {self.cone_color or 'cone'}, stays this way for the rest of the drive)"
         if self.cone_detected:
-            return f"SWERVE - {self.cone_color} confirmed in our lane, centered, and close - steer toward other lane"
+            basis = "centered and close (no lane geometry to check)" if not self.lane_geometry_available \
+                else "in our lane, centered, and close"
+            return f"SWERVE - {self.cone_color} confirmed {basis} - steer toward other lane"
         if self.cone_ready:
-            return (f"{self.cone_color} candidate in our lane, centered, and close - confirming "
+            basis = "centered and close (no lane geometry to check)" if not self.lane_geometry_available \
+                else "in our lane, centered, and close"
+            return (f"{self.cone_color} candidate {basis} - confirming "
                      f"({self._pending_frames}/{self.cone_trigger_frames} frames) - hold lane for now")
+        if not self.lane_geometry_available and self.cone_x is not None:
+            reasons = []
+            if not self.cone_centered:
+                reasons.append("not centered in frame")
+            if not self.cone_close:
+                reasons.append("not close enough")
+            return (f"{self.cone_color} candidate but {' / '.join(reasons)} "
+                     f"(area={self.cone_area}px, no lane geometry to check) - hold lane for now")
         if self.cone_in_our_lane:
             reasons = []
             if not self.cone_centered:
@@ -617,18 +640,37 @@ class ObstacleAvoider:
         lane_width_px = self._smoothed_lane_width(lane_width_px)
 
         our_lane = _lane_bounds(yellow_x, white_x, lane_width_px, self.white_right_of_yellow, other_lane=False)
+        self.lane_geometry_available = our_lane[0] is not None
 
         self.cone_x, self.cone_area, self.cone_color, blue_mask, orange_mask = self.detect_cone(band_hsv)
         self.cone_in_our_lane = self._x_in_bounds(self.cone_x, our_lane)
         self.cone_centered = self._is_centered(self.cone_x, cam_img.shape[1])
         self.cone_close = self._is_close(self.cone_area)
 
-        # A cone only counts toward the debounce counter once ALL THREE hold
-        # (see the CONE_CENTER_MARGIN_PX/CONE_CLOSE_MIN_AREA_PX comments in
-        # __init__): in our lane per the (noisy) lane geometry, roughly
-        # centered in the raw frame, and close enough to actually matter -
-        # any one of the three failing means "not yet, hold lane."
-        self.cone_ready = self.cone_in_our_lane and self.cone_centered and self.cone_close
+        if self.lane_geometry_available:
+            # Normal case: all three gates required (see the
+            # CONE_CENTER_MARGIN_PX/CONE_CLOSE_MIN_AREA_PX comments in
+            # __init__) - in our lane per the (noisy) lane geometry, roughly
+            # centered in the raw frame, and close enough to actually matter.
+            self.cone_ready = self.cone_in_our_lane and self.cone_centered and self.cone_close
+        else:
+            # No lane geometry AT ALL this frame (yellow_x and white_x both
+            # None - e.g. LaneFollower has fully lost the track, which is
+            # exactly the state a car that's already run off-course tends to
+            # be in). Added after tub_7_26-07-27: the car went straight into
+            # a second cone with no swerve at all, in a stretch where it had
+            # already drifted off the marked lane from an earlier incident -
+            # cone_in_our_lane is structurally False whenever our_lane is
+            # (None, None) (see _x_in_bounds), so requiring it AND the other
+            # two gates meant a lost car could never trigger avoidance no
+            # matter how obviously a cone sat dead ahead. cone_in_our_lane
+            # was the ONE gate that depends on lane geometry in the first
+            # place (see class docstring); centered/close were added
+            # specifically to be reliable even when that geometry is wrong
+            # (Decision from the earlier "cone in the other lane" fix) - so
+            # when there's no geometry to test against at all, falling back
+            # to those two alone is strictly better than never triggering.
+            self.cone_ready = self.cone_centered and self.cone_close
 
         if self.cone_ready:
             self._pending_frames += 1
@@ -643,8 +685,10 @@ class ObstacleAvoider:
         self.cone_detected = self._pending_frames >= self.cone_trigger_frames
         if self.cone_detected and not self.avoiding:
             self.avoiding = True
+            basis = "centered and close (no lane geometry to check)" if not self.lane_geometry_available \
+                else "in our lane, centered, and close"
             logger.info(
-                f"[cone_tape] cone confirmed in our lane at x={self.cone_x:.1f} "
+                f"[cone_tape] cone confirmed {basis} at x={self.cone_x:.1f} "
                 f"(held {self._pending_frames} frames) - beginning avoidance maneuver "
                 f"toward the other lane; will NOT return to the original lane "
                 f"afterward (see class docstring)"

@@ -552,6 +552,77 @@ test should confirm the other-lane false trigger is actually gone and watch
 how many frames it now takes to reacquire the new lane's white line during
 the slower turn-in.
 
+## On-car run, `tub_7_26-07-27`: false single-line lock in `lane_follower3.py` + a lane-loss deadlock in `ObstacleAvoider`
+
+First drive with the centered/close gates and steering rate limit above
+deployed. `manage2.py`'s `TubWriter` at the time only recorded
+`cam/image_array`/`steering`/`throttle` (see below), so `lane/yellow_x`,
+`lane/white_x`, `lane/width_px`, and `obstacle/cone_detected` weren't in the
+tub - the investigation below replayed the recorded frames through the real
+`_adaptive_lab_mask`/`_select_line_blob` code directly (not a guess) to
+reconstruct what happened, then cross-checked the reconstruction's steering
+curve shape against the tub's real recorded `steering` column.
+
+**What happened, from the frames:** steering pinned to -0.79 within 1.5s of
+starting, held there for 150 straight frames; the camera ends up facing a
+courtyard seating area, then spends ~26s pressed against a cone rather than
+driving past it, and the recording ends jammed against a second cone at
+full throttle with no steering correction in the final approach.
+
+**Root cause 1 (the swerve itself):** replaying the real white-tracker code
+against the recorded frames found a false single-line "white" lock -
+`_adaptive_lab_mask` (correctly) found a bright, low-saturation blob and it
+(correctly, per its own shape filter) passed `_select_line_blob` - but the
+blob was a sunlit building wall next to the start-line cones, not the
+track's painted line. With `yellow_x` never found in this same stretch,
+there was no second line to bound the pick, and - critically - nothing
+existed at the time to require corroboration before trusting a single-line
+extrapolation. Every defense already in `LaneFollower` (`position_rate_limit_px`,
+the boundary-identity guards, `LANE_CENTER_MARGIN_PX`) only checks a NEW
+detection against an ALREADY-ESTABLISHED `self._last_position` - on the
+very first lock of a drive there isn't one yet, so the false lock was
+trusted with zero corroboration and immediately fed the steering PID.
+Fixed in `lane_follower3.py` (module docstring changelog entry 9): a row's
+center only counts toward the first-ever `self._last_position` if it came
+from BOTH lines together; single-line extrapolation is only trusted once a
+real two-line sighting has established an anchor to rate-limit/sanity-check
+against. Costs nothing once driving is underway - the car just coasts
+through the existing full-loss handling until a genuine two-line
+confirmation arrives. Covered by `donkeycar/tests/test_lane_follower3.py`.
+
+**Root cause 2 (the second cone, no swerve at all):** by the time the car
+reached the second cone it had likely never recovered real lane geometry
+after the first incident. `ObstacleAvoider.cone_ready` required
+`cone_in_our_lane` (from `_lane_bounds`) AND centered AND close - but
+`cone_in_our_lane` is structurally `False` whenever `yellow_x`/`white_x` are
+both `None` (`_x_in_bounds` returns `False` against `(None, None)` bounds),
+so a car that has already lost the lane could never trigger avoidance no
+matter how obviously a cone sat dead ahead and centered. Fixed: when
+`lane_geometry_available` is `False` this frame, `cone_ready` falls back to
+centered AND close alone (see `ObstacleAvoider.run()`) - the in-lane test
+was the one gate that depended on lane geometry in the first place; the
+other two were already designed to hold even when that geometry is wrong,
+so relying on them alone when there's no geometry at all to test against is
+strictly better than never triggering. Covered by
+`TestObstacleAvoiderNoLaneGeometryFallback` in `test_obstacle_avoider.py`.
+
+**Also fixed:** `manage2.py` (this car's actual `drive()` script, kept
+alongside this repo) had drifted from the canonical
+`donkeycar/templates/cv_control.py` template - it was missing
+`lane/yellow_x`/`lane/white_x`/`lane/width_px` from `TubWriter`'s recorded
+fields (exactly what made this investigation have to replay raw frames
+instead of just reading the tub) and `VERBOSE_CAR`'s per-part timing table
+on `V.start()`. Both re-synced to match `cv_control.py`.
+
+**Not yet verified:** neither fix has been checked against a real on-car
+drive yet - `lane_follower3.py`'s cold-start guard and `ObstacleAvoider`'s
+lane-loss fallback are both reasoned from a direct replay of `tub_7`'s
+frames through the real detection code, not from a fresh drive. Next
+on-car test should confirm the car no longer locks onto background objects
+at the start of a drive, and separately, still needs the oncoming-car
+detector (see "Next steps" below) since that's a second, distinct source
+of the same "already lost the lane" problem.
+
 ## Next steps
 
 1. Detect the car's black wheels/front (Decision 2, option A) the same way

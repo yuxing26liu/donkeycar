@@ -162,6 +162,32 @@ Merged into this file so far:
      now end in a controlled stop; that is the intended behavior, not
      a missing feature - see the myconfig LIGHTING block.
 
+  9. Cold-start two-line guard (added after tub_7_26-07-27, the first
+     drive with the obstacle-avoidance centered/close gates - see
+     obstacle_avoider.py's changelog and project_doc/obstacle_avoidance.md).
+     The car swerved to a near-max steering lock 1.5s into the drive and
+     never recovered, ending up off the track. Replaying the recorded
+     frames directly through _adaptive_lab_mask/_select_line_blob (the
+     real white-tracker code, not a guess) showed why: with no yellow
+     detected yet, the white tracker's cold-start (unbounded) reacquire
+     locked onto a bright, low-saturation blob around x=300-370 that
+     turned out to be the sunlit building wall behind the start-line
+     cones, not the track's painted line - a false single-line lock that
+     immediately extrapolated a large, confidently-acted-on lane center
+     with nothing to check it against. Every other defense in this class
+     (position_rate_limit_px, the boundary-identity guards,
+     LANE_CENTER_MARGIN_PX) only works by checking a new detection
+     against an already-established self._last_position; on the very
+     first lock of a drive (or right after a sustained full-loss reset,
+     which also clears self._last_position) there isn't one yet. Fix: a
+     row's center only counts toward the FIRST-EVER self._last_position
+     if it came from BOTH lines together - see the guard in run(),
+     immediately after the existing LANE_CENTER_MARGIN_PX check. Costs
+     nothing once driving is underway (only gates while
+     self._last_position is still None); until a genuine two-line
+     sighting arrives the car just coasts through the existing full-loss
+     handling instead of confidently swerving on an unconfirmed blob.
+
 Not yet merged - bugs found and fixed, but not yet good enough to adopt
 (see donkeycar/parts/_candidates/):
 
@@ -1203,6 +1229,37 @@ class LaneFollower:
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"row {i}: rejecting implausible lane center {center:.1f} "
                                   f"(image width {cam_img.shape[1]})")
+                center = None
+            if (center is not None and self._last_position is None
+                    and not (yellow_x is not None and white_x is not None)):
+                # Cold-start two-line guard (added after tub_7_26-07-24: the
+                # very first frames of a drive - before self._last_position
+                # has ever been set - swerved hard on a single-line
+                # extrapolated center that turned out to be a false "white"
+                # lock: _adaptive_lab_mask found a bright, low-saturation
+                # blob and it passed the shape filter, but the blob was a
+                # sunlit building wall next to the cone, not the track's
+                # painted line - confirmed by replaying the real footage
+                # through _adaptive_lab_mask/_select_line_blob directly.
+                # Every other defense in this class (position_rate_limit_px,
+                # the boundary-identity guards, even LANE_CENTER_MARGIN_PX
+                # above) works by checking a new detection against an
+                # already-established self._last_position; on the very
+                # first lock of a drive (or right after a sustained
+                # full-loss reset - see the lost_frames>15 branch below,
+                # which also clears self._last_position) there isn't one
+                # yet, so a single-line extrapolation was being trusted
+                # with zero corroboration. A row's center only counts
+                # toward the FIRST-EVER self._last_position if it came from
+                # BOTH lines together - a two-line sighting is much
+                # stronger evidence than one possibly-spurious blob, and
+                # this costs nothing once driving is underway (it only
+                # gates while self._last_position is still None, i.e. the
+                # car simply coasts via the existing full-loss handling
+                # below until a genuine two-line confirmation arrives).
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"row {i}: rejecting single-line cold-start center {center:.1f} "
+                                  f"- no established anchor yet to corroborate it")
                 center = None
             if center is not None:
                 row_centers.append(center)
