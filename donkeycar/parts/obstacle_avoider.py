@@ -188,6 +188,17 @@ class ObstacleAvoider:
         # not instead of, the lane-bounds test - a cheap extra filter, not a
         # replacement for a working one.
         self.cone_center_margin_px = getattr(cfg, 'CONE_CENTER_MARGIN_PX', 60)
+        # CAUTION: 200 is only just above CONE_MIN_AREA_PX's 80px noise
+        # floor, not calibrated against how large a real close cone gets -
+        # tub_41_26-07-24's on-car log recorded a genuinely close, centered
+        # cone's blob at ~8654px (see project_doc/obstacle_avoidance.md,
+        # the CONE_MAX_WIDTH_PX incident), two orders of magnitude bigger
+        # than this default. 200 is a deliberately low starting floor (so
+        # this gate doesn't accidentally reject real detections before
+        # there's real near/far footage to calibrate against), not a
+        # "close" threshold in the sense a human would mean it - watch the
+        # `area=` value now printed in _log_raw_detection against real
+        # distances on the car and raise this once there's data.
         self.cone_close_min_area_px = getattr(cfg, 'CONE_CLOSE_MIN_AREA_PX', 200)
 
         # lane/width_px (published by LaneFollower) swung 150->392->133px

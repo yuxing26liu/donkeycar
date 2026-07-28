@@ -672,7 +672,15 @@ CONE_CLOSE_MIN_AREA_PX = 200   # min pixel area (in the scan slice) for the cone
                                 # to count as "close enough to react to" --
                                 # apparent size grows as a real 3D cone nears
                                 # the camera, same reasoning CONE_MAX_WIDTH_PX
-                                # above already relies on
+                                # above already relies on. CAUTION: this is a
+                                # low starting floor, not a calibrated "close"
+                                # value -- a genuinely close, centered cone
+                                # measured ~8654px on tub_41_26-07-24 (see the
+                                # CONE_MAX_WIDTH_PX incident above), two orders
+                                # of magnitude bigger than this default. Watch
+                                # the `area=` value obstacle_avoider.py now
+                                # logs against real distances and raise this
+                                # once there's real near/far data.
 
 CONE_LOG_INTERVAL_FRAMES = 10  # while the blue tape stays in view, re-print its
                                 # sampled color value this often (in frames) -- the
