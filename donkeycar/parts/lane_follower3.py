@@ -137,6 +137,31 @@ Merged into this file so far:
      guarded reacquire path; (c) the per-row width EMA only updates from
      physically plausible widths (LANE_WIDTH_MIN/MAX_PX).
 
+  8. Uneven-lighting hardening (added after tub_68/tub_69, 2026-07-25 -
+     the first drives across a hard sunlight/building-shadow boundary;
+     both failed near lighting transitions while normal-lighting laps
+     were reliable). Traced per-frame: (a) in deep shadow (band
+     brightness ~80-98) yellow's fixed saturation floor goes blind for
+     hundreds of frames, and every yellow_ref-keyed identity guard
+     silently deactivates with it; (b) lone white relocks onto shadow
+     content then produce lane centers far outside the image (-120 in
+     tub_69, +506 in tub_68) that nothing rejects - the car drove
+     pinned at max steering, at speed, for 3+ seconds, off the track;
+     (c) in overexposed sunlight (band brightness 215+) yellow is also
+     blind, but loosening its threshold there floods the mask with
+     sunlit vegetation (measured 8-36% mask fraction vs the 10% guard) -
+     so the bright side must fail safe rather than adapt. Two changes:
+     the shadow-side-only bounded saturation-floor adaptation in
+     _LineTracker (LIGHTING_* keys - recovers real dashes at 1-5% mask
+     fraction in the exact tub_69 failure stretch, keeping yellow and
+     therefore the identity guards alive in shadow), and the
+     plausible-center invariant in run() (LANE_CENTER_MARGIN_PX - a
+     row whose implied lane center is far outside the image counts as
+     a miss, so sustained geometric nonsense reaches the full-loss
+     slow/stop path instead of being steered on). Bright-side failures
+     now end in a controlled stop; that is the intended behavior, not
+     a missing feature - see the myconfig LIGHTING block.
+
 Not yet merged - bugs found and fixed, but not yet good enough to adopt
 (see donkeycar/parts/_candidates/):
 
@@ -498,6 +523,32 @@ class _LineTracker:
         # reverts to honest None returns. 0 disables (pre-feature behavior).
         self.coast_frames = _shape_param(cfg, color_name, 'LINE_COAST_FRAMES', 0)
 
+        # Shadow-side lighting adaptation (HSV/yellow only - added after
+        # tub_68/tub_69, the first uneven-lighting drives; see the module
+        # docstring's changelog entry 8): in deep building shadow the
+        # yellow paint's HSV saturation falls below the fixed S_LOW floor
+        # and yellow goes blind for hundreds of frames - which also
+        # deactivates every yellow_ref-keyed identity guard downstream.
+        # When the band's smoothed brightness (HSV V-channel mean) drops
+        # below LIGHTING_DARK_L_REF, the effective saturation floor is
+        # interpolated from its configured value down to S_LOW_DARK_MIN,
+        # reaching the floor at LIGHTING_DARK_L_FLOOR. Strictly one-sided:
+        # brightness above the dark reference NEVER adjusts anything -
+        # measured directly on tub_68's overexposed frames, loosening
+        # saturation there floods the mask with sunlit vegetation (8-36%
+        # mask fraction at S_LOW=25 vs the ~10% guard ceiling), the exact
+        # tub_16 gravel failure all over again. In shadow the same
+        # loosening recovered 1-2 real dash rows per frame at 1-5% mask
+        # fraction. The EMA (LIGHTING_BRIGHTNESS_ALPHA) keeps a hard
+        # shadow edge from flickering the threshold frame-to-frame.
+        self.lighting_adapt = (getattr(cfg, 'LIGHTING_ADAPT_ENABLED', False)
+                                and color_space == 'HSV')
+        self.dark_l_ref = getattr(cfg, 'LIGHTING_DARK_L_REF', 100.0)
+        self.dark_l_floor = getattr(cfg, 'LIGHTING_DARK_L_FLOOR', 70.0)
+        self.s_low_dark_min = _shape_param(cfg, color_name, 'S_LOW_DARK_MIN', 25)
+        self.brightness_alpha = getattr(cfg, 'LIGHTING_BRIGHTNESS_ALPHA', 0.3)
+        self._brightness_ema = None
+
         self.tracked_position = None
         self.smoothed_position = None
         self.lost_frames = 0
@@ -555,7 +606,26 @@ class _LineTracker:
         '''
         if self.color_space == 'HSV':
             scan_line = cv2.cvtColor(scan_line_rgb, cv2.COLOR_RGB2HSV)
-            mask = cv2.inRange(scan_line, self.color_thr_low, self.color_thr_hi)
+            color_thr_low = self.color_thr_low
+            if self.lighting_adapt:
+                # shadow-side saturation-floor adaptation - see __init__.
+                # Uses the V channel already available from the HSV
+                # conversion; smoothed so a hard shadow edge sweeping the
+                # band doesn't flicker the threshold.
+                v_mean = float(np.mean(scan_line[:, :, 2]))
+                if self._brightness_ema is None:
+                    self._brightness_ema = v_mean
+                else:
+                    self._brightness_ema = (self.brightness_alpha * v_mean
+                                             + (1 - self.brightness_alpha) * self._brightness_ema)
+                if self._brightness_ema < self.dark_l_ref:
+                    span = max(self.dark_l_ref - self.dark_l_floor, 1.0)
+                    t = min((self.dark_l_ref - self._brightness_ema) / span, 1.0)
+                    base_s_low = float(self.color_thr_low[1])
+                    s_low_eff = base_s_low - t * (base_s_low - self.s_low_dark_min)
+                    color_thr_low = self.color_thr_low.copy()
+                    color_thr_low[1] = s_low_eff
+            mask = cv2.inRange(scan_line, color_thr_low, self.color_thr_hi)
         elif self.color_space == 'LAB_ADAPTIVE':
             mask = _adaptive_lab_mask(scan_line_rgb, self.adaptive_k_std, self.adaptive_min_std,
                                        self.adaptive_max_std, self.adaptive_max_saturation,
@@ -855,6 +925,24 @@ class LaneFollower:
         self.lane_width_min_px = getattr(cfg, 'LANE_WIDTH_MIN_PX', 90)
         self.lane_width_max_px = getattr(cfg, 'LANE_WIDTH_MAX_PX', 340)
 
+        # Plausible-center invariant (added after tub_68/tub_69, the first
+        # uneven-lighting drives): in deep shadow with yellow long-blind
+        # (all yellow_ref-keyed guards inactive), lone white relocks onto
+        # shadow content produced lane-center estimates far OUTSIDE the
+        # image - tub_69 drove hard-left pinned at -0.80 for 60+ frames on
+        # centers of -24..-120, tub_68 mirrored it at +429..+506 - and
+        # nothing objected, because a garbage single-row center resets the
+        # full-loss counter every frame and keeps the car confidently
+        # driving. A lane center more than this many px outside the image
+        # is physically meaningless: the row is treated as a miss, and
+        # when every row fails the test the existing full-loss path (decay
+        # steering, slow, stop) finally engages - the car stops near the
+        # lighting boundary instead of driving itself off the track.
+        # Brief slightly-off-frame estimates during aggressive-but-real
+        # recoveries stay inside the +/-40 margin (worst legitimate case
+        # observed across all replayed tubs: ~-27). Negative disables.
+        self.center_margin_px = getattr(cfg, 'LANE_CENTER_MARGIN_PX', 40)
+
         # Outer-line turn bias (new after tub_51_26-07-24): shift the
         # steering target toward the OUTSIDE line of the current turn -
         # user-observed failure mode is crossing the inside line mid-turn
@@ -1105,6 +1193,17 @@ class LaneFollower:
                         + (1 - self.lane_width_smoothing_alpha) * self.row_lane_width_px[i])
 
             center = self._lane_center(yellow_x, white_x, self.row_lane_width_px[i])
+            if (center is not None and self.center_margin_px >= 0
+                    and not (-self.center_margin_px <= center
+                             <= cam_img.shape[1] + self.center_margin_px)):
+                # physically meaningless lane center (far outside the
+                # image) - see LANE_CENTER_MARGIN_PX in __init__; count
+                # this row as a miss so sustained nonsense reaches the
+                # full-loss slow/stop path instead of steering on it
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"row {i}: rejecting implausible lane center {center:.1f} "
+                                  f"(image width {cam_img.shape[1]})")
+                center = None
             if center is not None:
                 row_centers.append(center)
                 row_weights.append(weight)
