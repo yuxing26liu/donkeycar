@@ -162,6 +162,26 @@ Merged into this file so far:
      now end in a controlled stop; that is the intended behavior, not
      a missing feature - see the myconfig LIGHTING block.
 
+  9. Bounded gray-world band normalization (added after tub_3_26-07-27,
+     a twilight/blue-hour run in which the only failures were frames
+     with a strong blue cast). Diagnosis: the cast is real blue-hour
+     skylight (10,000K+) in fully-shaded sections, beyond the OAK-D's
+     default auto-white-balance correction range - NOT a channel-order
+     or camera-pipeline bug (mid-run frames are neutral with yellow
+     reading correctly, and auto-exposure held brightness at ~160
+     throughout). Under the cast the whole scan region reads saturated
+     blue (band saturation p50 29 -> 129): yellow's hue window matches
+     0.00% of pixels and white paint trips the anti-yellow saturation
+     cap, so the car fail-safed to a stop. Fix: equalize each scan
+     band's channel means (per-channel gain, clipped to
+     LANE_GRAYWORLD_MAX_GAIN, EMA-smoothed by LANE_GRAYWORLD_ALPHA)
+     before both trackers - the bands are mostly gray concrete, the
+     ideal gray-world reference. Measured: yellow recovery 0% -> 40%
+     of frames in the blue stretch, exact no-op on neutral stretches.
+     Camera-side AWB deliberately untouched (already AUTO; fixed modes
+     trade one lighting's failure for another's; not validatable
+     offline).
+
 Not yet merged - bugs found and fixed, but not yet good enough to adopt
 (see donkeycar/parts/_candidates/):
 
@@ -925,6 +945,28 @@ class LaneFollower:
         self.lane_width_min_px = getattr(cfg, 'LANE_WIDTH_MIN_PX', 90)
         self.lane_width_max_px = getattr(cfg, 'LANE_WIDTH_MAX_PX', 340)
 
+        # Bounded gray-world color normalization of each scan band (added
+        # after tub_3_26-07-27, a twilight run - see changelog entry 9):
+        # at blue hour the scene is lit by deep-blue skylight beyond the
+        # OAK-D's auto-white-balance correction range, and the whole scan
+        # region reads as saturated blue (measured: band saturation p50
+        # jumped 29 -> 129). Yellow's hue window then matches 0.00% of
+        # pixels and the car (correctly) fail-safes to a stop. The scan
+        # bands are mostly gray concrete - the ideal gray-world reference -
+        # so equalizing the band's channel means (gain per channel, clipped
+        # to LANE_GRAYWORLD_MAX_GAIN, EMA-smoothed across frames) removes
+        # the cast exactly where detection happens. On neutral frames the
+        # gains sit at ~1.0 and this is a no-op (verified: yellow 97%->97%
+        # on tub_3's neutral stretch); on the blue-cast failure stretch it
+        # recovered yellow from 0% to 40% of frames. Camera-side AWB was
+        # left untouched deliberately: it already runs in AUTO mode, fixed
+        # modes trade one lighting's failure for another's, and camera
+        # config changes can't be validated offline.
+        self.grayworld_enabled = getattr(cfg, 'LANE_GRAYWORLD_ENABLED', False)
+        self.grayworld_max_gain = getattr(cfg, 'LANE_GRAYWORLD_MAX_GAIN', 1.6)
+        self.grayworld_alpha = getattr(cfg, 'LANE_GRAYWORLD_ALPHA', 0.3)
+        self._grayworld_gains = [None for _ in self.scan_rows]
+
         # Plausible-center invariant (added after tub_68/tub_69, the first
         # uneven-lighting drives): in deep shadow with yellow long-blind
         # (all yellow_ref-keyed guards inactive), lone white relocks onto
@@ -1035,6 +1077,24 @@ class LaneFollower:
                     f"Empty lane scan slice at scan_y={scan_y}: cam_img shape={cam_img.shape}; "
                     f"check LANE_SCAN_ROWS against the actual camera resolution")
                 continue
+
+            # Bounded gray-world normalization of this band - see the
+            # __init__ comment (blue-hour cast recovery). Gains are
+            # EMA-smoothed per row so a single odd frame can't flick the
+            # band's colors, and clipped so a genuinely colorful band
+            # (paint, foliage at the frame edge) can't be overcorrected.
+            if self.grayworld_enabled:
+                means = scan_line.reshape(-1, 3).mean(axis=0).astype(np.float64)
+                target = means.mean()
+                gains = np.clip(target / np.maximum(means, 1.0),
+                                 1.0 / self.grayworld_max_gain, self.grayworld_max_gain)
+                if self._grayworld_gains[i] is None:
+                    self._grayworld_gains[i] = gains
+                else:
+                    self._grayworld_gains[i] = (self.grayworld_alpha * gains
+                                                 + (1 - self.grayworld_alpha) * self._grayworld_gains[i])
+                scan_line = np.clip(scan_line.astype(np.float64) * self._grayworld_gains[i],
+                                     0, 255).astype(np.uint8)
 
             yellow_tracker = self.yellow_trackers[i]
             white_tracker = self.white_trackers[i]
