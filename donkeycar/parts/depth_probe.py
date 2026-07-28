@@ -18,6 +18,7 @@ thing in front of the car" -- it just hasn't been proven against a real
 depth stream yet, which is exactly what this part is for.
 """
 import logging
+import warnings
 
 import numpy as np
 
@@ -47,20 +48,44 @@ class DepthProbe:
         input: depth_array, a HxW uint16 numpy array of depth in mm (0 = no reading)
         output: (nearest_col, nearest_dist_mm), or (None, None) if nothing
                 valid was found in the scan slice
+
+        Uses each column's MEDIAN valid depth (over the scan_height rows),
+        not the raw closest pixel - real on-car footage (tub_30_26-07-28)
+        showed scattered single-pixel stereo noise sitting right at the
+        min_valid_depth_mm floor throughout the frame, at every real
+        distance, which a raw per-column min latches onto every time: a
+        held-up cone's approach from ~1.5m to filling the frame produced
+        almost no change in the old min-based reading (200-220mm the
+        entire time), while the scan slice's true median depth dropped
+        ~6857mm -> ~400mm over those same frames. A column's median is
+        only trusted if at least half its rows have a valid reading, so a
+        mostly-empty column with one noisy pixel can't win by accident.
         '''
         scan_slice = depth_array[self.scan_y:self.scan_y + self.scan_height, :]
 
         # depthai reports 0 for pixels with no valid depth reading; mask
         # those (and anything closer than min_valid_depth_mm, which is
-        # lens-adjacent noise) out before taking the per-column minimum.
+        # lens-adjacent noise) out before taking each column's median.
         valid = scan_slice >= self.min_valid_depth_mm
-        if not np.any(valid):
+        valid_counts = valid.sum(axis=0)
+        enough_valid = valid_counts >= (self.scan_height // 2)
+        if not np.any(enough_valid):
             return None, None
 
-        masked = np.where(valid, scan_slice, np.iinfo(scan_slice.dtype).max)
-        col_min = np.min(masked, axis=0)
-        nearest_col = int(np.argmin(col_min))
-        nearest_dist = int(col_min[nearest_col])
+        masked = np.where(valid, scan_slice.astype(np.float32), np.nan)
+        # A column with zero valid pixels is all-NaN, which nanmedian
+        # warns about even though its result (NaN) is exactly right - it
+        # gets overridden to inf below via enough_valid anyway, so the
+        # warning is noise, not a real problem; suppress it rather than
+        # let it spam the console on every frame with an empty column
+        # (e.g. looking at open sky/track with nothing in range).
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', category=RuntimeWarning)
+            col_median = np.nanmedian(masked, axis=0)
+        col_median = np.where(enough_valid, col_median, np.inf)
+
+        nearest_col = int(np.argmin(col_median))
+        nearest_dist = int(col_median[nearest_col])
         return nearest_col, nearest_dist
 
     def run(self, depth_array):
