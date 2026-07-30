@@ -591,6 +591,38 @@ CONE_COMMIT_BBOX_HEIGHT_PX = 90
 CONE_EMERGENCY_BBOX_HEIGHT_PX = 170
 CORRIDOR_SAFETY_MARGIN_PX = -20        # negative narrows the corridor inward
 CONE_CENTER_FALLBACK_MARGIN_PX = 70    # used only when lane geometry is unavailable
+
+# Lateral-sweep-past veto, added 2026-07-30 after replaying real on-car
+# shadow-mode tubs (cone_approach_right2, cone_negative2) - see
+# obstacle_planner.py's __init__ comment for the real numbers this was
+# calibrated against. This is the confirmed fix for the false in-path
+# commit found on cone_negative (and reproduced on cone_negative2).
+CONE_LATERAL_HISTORY_FRAMES = 10
+CONE_LATERAL_SWEEP_REJECT_PX = 25
+CONE_LATERAL_MIN_HEIGHT_PX = 45
+
+# Corridor plausibility (order + width band) - defense-in-depth requested
+# alongside the lateral-sweep fix; did not by itself catch either
+# confirmed real false positive (see obstacle_planner.py).
+CORRIDOR_WIDTH_MIN_PX = 90
+CORRIDOR_WIDTH_MAX_PX = 340
+
+# Require a real depth reading (not the bbox-height fallback) before ever
+# committing to a lane switch. True is the safe default for a car with a
+# working depth pipeline; both real approach tubs had valid depth
+# throughout their commit-relevant windows.
+CONE_REQUIRE_VALID_DEPTH_TO_SWITCH = True
+
+# Emergency requires this many consecutive qualifying frames UNLESS
+# distance/size is past the tighter "critical" threshold, which still
+# triggers instantly - protective measure added after avoid_cone's
+# unexplained single-frame post-maneuver emergency reading (not
+# reproduced in later tubs, so this is general hardening, not a
+# root-caused fix).
+CONE_EMERGENCY_CONFIRM_FRAMES = 2
+CONE_CRITICAL_DISTANCE_MM = 200
+CONE_CRITICAL_BBOX_HEIGHT_PX = 210
+
 PLANNER_PREPARE_MIN_FRAMES = 4
 PLANNER_HOLD_MIN_FRAMES = 10
 PLANNER_MANEUVER_TIMEOUT_FRAMES = 300  # 15s at 20Hz

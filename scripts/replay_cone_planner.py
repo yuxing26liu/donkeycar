@@ -222,7 +222,7 @@ def lane_change_reacquire_study(tub_name, tubs_dir, cfg, out_dir, steering_thres
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--tub', choices=TUB_LIST + ['tub_30_26-07-28'])
+    ap.add_argument('--tub')  # any tub directory name under --tubs-dir, not restricted to TUB_LIST
     ap.add_argument('--all', action='store_true')
     ap.add_argument('--tubs-dir', default=DEFAULT_TUBS_DIR)
     ap.add_argument('--myconfig', default=DEFAULT_MYCONFIG)

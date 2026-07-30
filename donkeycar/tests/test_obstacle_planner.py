@@ -31,13 +31,19 @@ def make_cfg(**overrides):
     return cfg
 
 
-def lane(yellow_x=200.0, white_x=260.0, width_px=60.0, white_right_of_yellow=True, primary_row_y=200.0):
+def lane(yellow_x=200.0, white_x=350.0, width_px=150.0, white_right_of_yellow=True, primary_row_y=200.0):
+    # gap (here 150px) must clear ObstaclePlanner's CORRIDOR_WIDTH_MIN_PX
+    # default (90) or every detection is rejected by the corridor-
+    # plausibility gate regardless of position -- real lane widths on the
+    # actual car run ~150-330px (see obstacle_planner.py), so 150 is a
+    # realistic default, not just "big enough to pass the gate".
     return LaneGeometry(yellow_x=yellow_x, white_x=white_x, width_px=width_px,
                          white_right_of_yellow=white_right_of_yellow, primary_row_y=primary_row_y)
 
 
-def det_in_lane(distance_mm=2000.0, cx=230, w=20, h=40):
-    # our lane spans [200,260] by default -- center it inside that
+def det_in_lane(distance_mm=2000.0, cx=275, w=20, h=40):
+    # our lane spans [200,350] by default (narrowed to [220,330] at the
+    # default -20 corridor margin) -- center it inside that
     return Detection(bbox=BBox(int(cx - w / 2), 150, w, h), area_px=w * h,
                       distance_mm=distance_mm, distance_valid=True, distance_source='depth')
 
@@ -92,7 +98,7 @@ def test_full_happy_path_switch_hold_return():
     cfg = make_cfg()
     p = ObstaclePlanner(cfg)
     geom = lane(white_right_of_yellow=True)  # currently in 'right' lane
-    neighbor_geom = lane(yellow_x=50.0, white_x=-10.0, white_right_of_yellow=False)
+    neighbor_geom = lane(yellow_x=200.0, white_x=50.0, white_right_of_yellow=False)
 
     # 1) approach: confirm in-path (3 ticks to cross detect_confirm_frames),
     # then a 4th tick evaluates OBJECT_WATCH's own commit-distance check.
@@ -160,7 +166,7 @@ def test_cone_clears_during_prepare_aborts_to_follow_lane():
 
 def test_emergency_close_cone_forces_safe_stop():
     p = ObstaclePlanner(make_cfg())
-    d = p.step(det_in_lane(distance_mm=300), lane())  # instantly emergency-close
+    d = p.step(det_in_lane(distance_mm=150), lane())  # below CONE_CRITICAL_DISTANCE_MM -- instant, no confirm needed  # instantly emergency-close
     assert p.state == PlannerState.SAFE_STOP
     assert d.throttle_scale == 0.0
     assert d.requested_lane is None
@@ -184,7 +190,7 @@ def test_maneuver_timeout_forces_safe_stop():
 def test_safe_stop_auto_recovers_when_clean():
     cfg = make_cfg(PLANNER_SAFE_STOP_RECOVER_FRAMES=3)
     p = ObstaclePlanner(cfg)
-    p.step(det_in_lane(distance_mm=300), lane())
+    p.step(det_in_lane(distance_mm=150), lane())
     assert p.state == PlannerState.SAFE_STOP
     d = run_n(p, 3, None, lane())
     assert p.state == PlannerState.FOLLOW_LANE
@@ -199,10 +205,10 @@ def test_emergency_cone_sustained_in_safe_stop_is_not_a_repeated_transition():
     _frames_in_state to 0 every frame and produced hundreds of identical
     log lines."""
     p = ObstaclePlanner(make_cfg())
-    p.step(det_in_lane(distance_mm=300), lane())
+    p.step(det_in_lane(distance_mm=150), lane())
     assert p.state == PlannerState.SAFE_STOP
     for _ in range(20):
-        p.step(det_in_lane(distance_mm=300), lane())
+        p.step(det_in_lane(distance_mm=150), lane())
     # frames_in_state should have accumulated normally, not been reset
     # every tick by a spurious self-transition
     assert p._frames_in_state == 20
@@ -211,10 +217,106 @@ def test_emergency_cone_sustained_in_safe_stop_is_not_a_repeated_transition():
 def test_safe_stop_does_not_recover_when_disabled():
     cfg = make_cfg(PLANNER_SAFE_STOP_AUTO_RECOVER=False)
     p = ObstaclePlanner(cfg)
-    p.step(det_in_lane(distance_mm=300), lane())
+    p.step(det_in_lane(distance_mm=150), lane())
     assert p.state == PlannerState.SAFE_STOP
     run_n(p, 100, None, lane())
     assert p.state == PlannerState.SAFE_STOP, "auto-recover disabled -- must require explicit reset"
+
+
+def test_emergency_requires_confirmation_unless_critical():
+    """A non-critical emergency-distance reading (below CONE_EMERGENCY_
+    DISTANCE_MM but at/above CONE_CRITICAL_DISTANCE_MM) must be confirmed
+    over CONE_EMERGENCY_CONFIRM_FRAMES consecutive frames before
+    triggering SAFE_STOP - added after avoid_cone's frame-162 anomaly (an
+    unexplained single-frame emergency reading right after completing a
+    maneuver)."""
+    cfg = make_cfg(CONE_EMERGENCY_CONFIRM_FRAMES=2, CONE_CRITICAL_DISTANCE_MM=200)
+    p = ObstaclePlanner(cfg)
+    p.step(det_in_lane(distance_mm=300), lane())  # emergency but not critical -- 1st frame
+    assert p.state != PlannerState.SAFE_STOP, "a single non-critical emergency frame must not trigger SAFE_STOP"
+    p.step(det_in_lane(distance_mm=300), lane())  # 2nd consecutive frame -- now confirmed
+    assert p.state == PlannerState.SAFE_STOP
+
+
+def test_critical_distance_triggers_emergency_instantly():
+    cfg = make_cfg(CONE_CRITICAL_DISTANCE_MM=200)
+    p = ObstaclePlanner(cfg)
+    d = p.step(det_in_lane(distance_mm=150), lane())  # below critical -- must not wait for confirmation
+    assert p.state == PlannerState.SAFE_STOP
+    assert d.throttle_scale == 0.0
+
+
+def test_lateral_sweep_past_is_not_treated_as_in_path():
+    """A cone that's laterally sweeping toward one edge of the frame as it
+    closes (the real signature of an object in the neighboring lane being
+    driven past - see cone_negative2 in this project's replay findings)
+    must not be classified as in-path, even though its raw screen
+    position momentarily overlaps the corridor."""
+    cfg = make_cfg(CONE_LATERAL_HISTORY_FRAMES=10, CONE_LATERAL_SWEEP_REJECT_PX=25,
+                   CONE_LATERAL_MIN_HEIGHT_PX=45)
+    p = ObstaclePlanner(cfg)
+    geom = lane()
+    # bbox center sweeps steadily from inside the corridor toward the edge
+    # as bbox height grows (closing distance) -- mirrors the real
+    # cone_negative2 numbers (cx 143->31 over ~45 frames, bbox_h 42->200+)
+    cx_start, h_start = 275, 50
+    for i in range(15):
+        cx = cx_start - i * 6
+        h = h_start + i * 4
+        det = Detection(bbox=BBox(int(cx - 20 / 2), 150, 20, h), area_px=20 * h,
+                         distance_mm=2000 - i * 80, distance_valid=True, distance_source='depth')
+        d = p.step(det, geom)
+    assert p.state in (PlannerState.FOLLOW_LANE, PlannerState.OBJECT_WATCH), \
+        f"sweeping cone should never reach CONFIRMED_IN_PATH, got {p.state}"
+    assert d.cone_in_path is False
+
+
+def test_stable_centered_approach_is_not_rejected_by_lateral_check():
+    """The complementary case: a cone that stays laterally stable as it
+    closes (real cone_approach_right2 signature: bbox center held ~190-
+    231px, max 10-frame drift 18px once bbox_h>=45) must NOT be vetoed by
+    the lateral-sweep check - it should still be able to reach
+    CONFIRMED_IN_PATH."""
+    cfg = make_cfg(CONE_LATERAL_HISTORY_FRAMES=10, CONE_LATERAL_SWEEP_REJECT_PX=25,
+                   CONE_LATERAL_MIN_HEIGHT_PX=45, CONE_COMMIT_DISTANCE_MM=1200)
+    p = ObstaclePlanner(cfg)
+    geom = lane()
+    cx, h = 275, 50
+    d = None
+    for i in range(15):
+        h += 10  # closing distance, growing blob, near-stable center
+        det = Detection(bbox=BBox(int(cx - 20 / 2), 150, 20, h), area_px=20 * h,
+                         distance_mm=max(2000 - i * 150, 900), distance_valid=True, distance_source='depth')
+        d = p.step(det, geom)
+    # must have progressed well past OBJECT_WATCH -- proves the lateral
+    # check doesn't block a genuine stable/centered approach
+    assert p.state not in (PlannerState.FOLLOW_LANE, PlannerState.OBJECT_WATCH), f"got {p.state}"
+
+
+def test_implausible_corridor_width_is_not_trusted():
+    """A corridor whose width falls outside CORRIDOR_WIDTH_MIN/MAX_PX is
+    not trusted for path classification, even if the cone's raw position
+    would otherwise overlap it."""
+    cfg = make_cfg(CORRIDOR_WIDTH_MIN_PX=90, CORRIDOR_WIDTH_MAX_PX=340)
+    p = ObstaclePlanner(cfg)
+    implausibly_narrow = lane(yellow_x=200.0, white_x=230.0, width_px=30.0)  # 30px gap, below the 90px floor
+    run_n(p, 20, det_in_lane(distance_mm=1000, cx=215), implausibly_narrow)
+    assert p.state == PlannerState.FOLLOW_LANE
+
+
+def test_require_valid_depth_to_switch_blocks_bbox_only_commit():
+    """CONE_REQUIRE_VALID_DEPTH_TO_SWITCH=True (the default) must not let
+    a bbox-height-only (no real depth) detection commit to
+    CONFIRMED_IN_PATH, even if it's past the bbox-height commit
+    threshold."""
+    cfg = make_cfg(CONE_REQUIRE_VALID_DEPTH_TO_SWITCH=True, CONE_COMMIT_BBOX_HEIGHT_PX=90)
+    p = ObstaclePlanner(cfg)
+    geom = lane()
+    det = Detection(bbox=BBox(265, 150, 20, 120), area_px=20 * 120,
+                     distance_mm=None, distance_valid=False, distance_source='bbox_height')
+    run_n(p, 20, det, geom)
+    assert p.state == PlannerState.OBJECT_WATCH, \
+        "must not commit past OBJECT_WATCH without valid depth when the gate is enabled"
 
 
 def test_decision_always_populated_even_in_disabled_mode():

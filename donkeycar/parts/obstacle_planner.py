@@ -62,6 +62,7 @@ thresholds are carried over from the architecture-planning discussion's
 order-of-magnitude reasoning and are explicitly flagged as unverified.
 """
 import logging
+from collections import deque
 
 from donkeycar.parts.obstacle_types import PlannerState, RolloutMode, PlannerDecision
 
@@ -82,6 +83,17 @@ class ObstaclePlanner:
         self.watch_distance_mm = getattr(cfg, 'CONE_WATCH_DISTANCE_MM', 3000)
         self.commit_distance_mm = getattr(cfg, 'CONE_COMMIT_DISTANCE_MM', 1200)
         self.emergency_distance_mm = getattr(cfg, 'CONE_EMERGENCY_DISTANCE_MM', 400)
+        # Emergency requires this many CONSECUTIVE qualifying frames before
+        # triggering SAFE_STOP, UNLESS distance/size is at or past the
+        # tighter "critical" threshold below, which still triggers
+        # instantly - added after avoid_cone's frame-162 anomaly (an
+        # unexplained single-frame emergency reading right after
+        # completing a maneuver); not reproduced in cone_approach_right2/
+        # cone_negative2, so this is a general protective measure rather
+        # than a fix for a root-caused bug.
+        self.emergency_confirm_frames = getattr(cfg, 'CONE_EMERGENCY_CONFIRM_FRAMES', 2)
+        self.critical_distance_mm = getattr(cfg, 'CONE_CRITICAL_DISTANCE_MM', 200)
+        self.critical_bbox_height_px = getattr(cfg, 'CONE_CRITICAL_BBOX_HEIGHT_PX', 210)
 
         # bbox-height (px) fallback thresholds. Checked directly against
         # cone_approach_right's real, monotonic bbox-height progression
@@ -121,6 +133,46 @@ class ObstaclePlanner:
         self.center_fallback_margin_px = getattr(cfg, 'CONE_CENTER_FALLBACK_MARGIN_PX', 70)
         self.image_center_px = getattr(cfg, 'IMAGE_W', 426) / 2.0
 
+        # Lateral-sweep-past veto, added 2026-07-30 after replaying real
+        # on-car shadow-mode tubs (cone_approach_right2, cone_negative2):
+        # a cone truly in our path stays laterally near-centered as
+        # distance closes (cone_approach_right2: bbox center held in a
+        # ~190-231px band, max 10-frame drift 18px once bbox_h>=45);
+        # a cone in the neighboring lane that the car simply drives past
+        # sweeps steadily toward one edge of the frame as it closes
+        # (cone_negative2: bbox center drifted 143px->31px, a clean
+        # monotonic sweep, >=25px net drift over any 10-frame window by
+        # idx152 - 4 frames before that recording's false CONFIRMED_IN_
+        # PATH commit at idx156). This is a real, physical distinction
+        # (parallax of a passing object vs. an object dead ahead), not a
+        # tuned-away symptom - gated by a minimum bbox height so it only
+        # applies once the blob is large enough that its centroid isn't
+        # dominated by detection noise (checked: false-triggered at up to
+        # 83px drift on far/tiny <45px-tall blobs in cone_approach_right2
+        # before this gate was added).
+        self.lateral_history_frames = getattr(cfg, 'CONE_LATERAL_HISTORY_FRAMES', 10)
+        self.lateral_sweep_reject_px = getattr(cfg, 'CONE_LATERAL_SWEEP_REJECT_PX', 25)
+        self.lateral_min_height_px = getattr(cfg, 'CONE_LATERAL_MIN_HEIGHT_PX', 45)
+        self._cx_history = deque(maxlen=self.lateral_history_frames)
+
+        # Corridor plausibility, requested as defense-in-depth alongside
+        # the lateral-sweep fix above - NOTE this did NOT catch either
+        # confirmed real false-positive on its own (the first cone_
+        # negative's corrupted yellow-lock was smooth/self-consistent,
+        # not a jump; cone_negative2's width 277-289px was within this
+        # band) - it's an additional net, not a replacement for the fix
+        # that's actually proven against real data.
+        self.corridor_width_min_px = getattr(cfg, 'CORRIDOR_WIDTH_MIN_PX', 90)
+        self.corridor_width_max_px = getattr(cfg, 'CORRIDOR_WIDTH_MAX_PX', 340)
+
+        # Require a real depth reading (not the uncalibrated bbox-height
+        # fallback) before ever committing to a lane switch - one of
+        # today's requested conservative defaults for the first active
+        # test. Both real approach tubs (cone_approach_right2,
+        # cone_negative2) had valid depth throughout their commit-
+        # relevant windows, so this doesn't block the legitimate case.
+        self.require_valid_depth_to_switch = getattr(cfg, 'CONE_REQUIRE_VALID_DEPTH_TO_SWITCH', True)
+
         self.prepare_min_frames = getattr(cfg, 'PLANNER_PREPARE_MIN_FRAMES', 4)
         self.hold_min_frames = getattr(cfg, 'PLANNER_HOLD_MIN_FRAMES', 10)
         self.maneuver_timeout_frames = getattr(cfg, 'PLANNER_MANEUVER_TIMEOUT_FRAMES', 300)
@@ -138,22 +190,66 @@ class ObstaclePlanner:
         self._clear_count = 0
         self._acquire_count = 0
         self._safe_recover_count = 0
+        self._emergency_count = 0
         self._maneuver_side = None      # 'left' | 'right' -- the neighbor lane this maneuver targets
         self._original_side = None      # lane to return to
         self._closest_seen = None       # tracks whether the cone has started retreating in HOLD
 
     # ---- perception helpers ----------------------------------------
 
+    def _update_lateral_history(self, detection):
+        """Call exactly once per tick (from step(), before any
+        _is_relevant() calls) - maintains the rolling bbox-center history
+        the lateral-sweep veto below reads. Cleared on a miss so a
+        different object appearing later doesn't inherit stale history."""
+        if detection is None:
+            self._cx_history.clear()
+            return
+        self._cx_history.append(detection.bbox.cx)
+
+    def _is_sweeping_past(self, detection):
+        """True if the cone's lateral position is drifting steadily
+        toward one edge of the frame as it closes - the signature of an
+        object in the NEIGHBOR lane being driven past, not one actually
+        in our path (see __init__ comment for the real-data numbers this
+        was calibrated against). Only evaluated once the blob is large
+        enough (lateral_min_height_px) that its centroid isn't dominated
+        by detection noise."""
+        if detection.bbox.h < self.lateral_min_height_px:
+            return False
+        if len(self._cx_history) < self.lateral_history_frames:
+            return False
+        drift = self._cx_history[-1] - self._cx_history[0]
+        return abs(drift) >= self.lateral_sweep_reject_px
+
+    def _corridor_plausible(self, geometry):
+        """Cheap defense-in-depth sanity check on the corridor itself
+        (order + width band) - requested alongside the lateral-sweep fix.
+        NOTE: neither confirmed real false-positive in this project was
+        actually caught by this check (both had a self-consistent,
+        in-band corridor) - this is an extra net, not the proven fix."""
+        corridor = geometry.corridor()
+        if corridor is None:
+            return False
+        lo, hi = corridor
+        width = hi - lo
+        return lo < hi and self.corridor_width_min_px <= width <= self.corridor_width_max_px
+
     def _is_relevant(self, detection, geometry):
         """Is this detection actually in our driving path, vs. merely
-        visible? Corridor-overlap when lane geometry is available;
-        image-center fallback (same idea as origin/blue-tape-detect's
-        lane_geometry_available branch, reused as a concept) when it
-        isn't."""
+        visible? Corridor-overlap when lane geometry is available (and
+        plausible, and the cone isn't just sweeping past - see the two
+        helpers above); image-center fallback (same idea as
+        origin/blue-tape-detect's lane_geometry_available branch, reused
+        as a concept) when lane geometry isn't available at all."""
         if detection is None:
+            return False
+        if self._is_sweeping_past(detection):
             return False
         corridor = geometry.corridor(at_row_y=detection.bbox.cy) if geometry else None
         if corridor is not None:
+            if not self._corridor_plausible(geometry):
+                return False
             lo, hi = corridor
             return detection.bbox.overlaps_x(lo - self.corridor_margin_px, hi + self.corridor_margin_px)
         # no lane geometry this frame -- conservative image-center fallback
@@ -181,6 +277,7 @@ class ObstaclePlanner:
         self.mode; this keeps 'shadow' mode's log identical to what
         'active' would have done."""
         self._frames_in_state += 1
+        self._update_lateral_history(detection)
         transition = self._step_fsm(detection, geometry)
         if transition is not None:
             new_state, reason = transition
@@ -232,13 +329,22 @@ class ObstaclePlanner:
         # found by this exact symptom replaying cone_static_right, where
         # the cone sits emergency-close for hundreds of consecutive
         # frames).
-        if (relevant and self.state not in (PlannerState.SWITCH_TO_NEIGHBOR_LANE,
-                                             PlannerState.HOLD_UNTIL_CLEAR,
-                                             PlannerState.RETURN_TO_ORIGINAL_LANE,
-                                             PlannerState.SAFE_STOP)
-                and self._distance_at_or_below(detection, self.emergency_distance_mm,
-                                                self.emergency_bbox_height_px)):
-            return PlannerState.SAFE_STOP, "emergency-close relevant cone"
+        emergency_candidate = (relevant and self.state not in (PlannerState.SWITCH_TO_NEIGHBOR_LANE,
+                                                                 PlannerState.HOLD_UNTIL_CLEAR,
+                                                                 PlannerState.RETURN_TO_ORIGINAL_LANE,
+                                                                 PlannerState.SAFE_STOP)
+                               and self._distance_at_or_below(detection, self.emergency_distance_mm,
+                                                                self.emergency_bbox_height_px))
+        if emergency_candidate:
+            critical = self._distance_at_or_below(detection, self.critical_distance_mm,
+                                                    self.critical_bbox_height_px)
+            if critical:
+                return PlannerState.SAFE_STOP, "critically-close relevant cone (immediate)"
+            self._emergency_count += 1
+            if self._emergency_count >= self.emergency_confirm_frames:
+                return PlannerState.SAFE_STOP, f"emergency-close relevant cone ({self._emergency_count} frames)"
+        else:
+            self._emergency_count = 0
 
         if self.state == PlannerState.FOLLOW_LANE:
             self._watch_count = self._watch_count + 1 if relevant else 0
@@ -249,7 +355,11 @@ class ObstaclePlanner:
         if self.state == PlannerState.OBJECT_WATCH:
             if relevant:
                 self._clear_count = 0
-                if self._distance_at_or_below(detection, self.commit_distance_mm, self.commit_bbox_height_px):
+                within_commit = self._distance_at_or_below(detection, self.commit_distance_mm,
+                                                             self.commit_bbox_height_px)
+                if within_commit:
+                    if self.require_valid_depth_to_switch and not detection.distance_valid:
+                        return None  # close enough by bbox-height alone, but no real depth to trust yet
                     return PlannerState.CONFIRMED_IN_PATH, "cone within commit distance"
                 return None
             self._clear_count += 1

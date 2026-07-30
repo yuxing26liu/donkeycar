@@ -36,6 +36,11 @@ def make_cfg(mode):
         PLANNER_PREPARE_MIN_FRAMES=1, PLANNER_HOLD_MIN_FRAMES=1,
         PLANNER_MANEUVER_TIMEOUT_FRAMES=200,
         CORRIDOR_SAFETY_MARGIN_PX=0,
+        CORRIDOR_WIDTH_MIN_PX=50,   # this file's synthetic painted lane gap is narrower than the real-world default
+        # this file has no synthetic depth array (arbiter.run(..., None, ...)) --
+        # the depth-required gate is about detection accuracy, not mode
+        # dispatch, which is what this file actually tests
+        CONE_REQUIRE_VALID_DEPTH_TO_SWITCH=False,
     )
     return cfg
 
