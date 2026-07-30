@@ -1011,6 +1011,69 @@ class LaneFollower:
         # why this must be set on the pid object, not clipped post-hoc.
         self.pid_st.output_limits = (-1.0, 1.0)
 
+    @property
+    def current_lane(self):
+        '''"right" or "left" - which lane this instance is currently
+        steering to hold, i.e. the human-readable form of
+        white_right_of_yellow. Read-only; use set_lane() to change it.'''
+        return 'right' if self.white_right_of_yellow else 'left'
+
+    def set_lane(self, lane):
+        '''
+        Runtime lane switch for cone avoidance: retarget this SAME hardened
+        PID/detection pipeline at the other lane instead of building a
+        second controller. The raw camera geometry doesn't change when this
+        is called - only which side of the yellow dashed centerline the
+        solid edge is expected on (white_right_of_yellow) - so this is a
+        reinterpretation of the same two trackers, not a new one.
+
+        Calling with the already-active lane is a no-op: nothing is reset,
+        so repeated/idempotent calls (e.g. a planner re-confirming its
+        target lane every tick) can't corrupt tracking state.
+
+        On an actual switch, resets only what a lane change genuinely
+        invalidates:
+        - Both trackers' continuity anchors (evict()): the previous lane's
+          solid edge is now on the WRONG side of frame from the tracker's
+          last locked position, so preferred_x continuity would actively
+          fight the switch, biasing blob selection back toward the old
+          edge instead of letting the new one latch cleanly. evict() forces
+          the same cold-start reacquire path already used for the
+          boundary-identity-swap recovery this class does elsewhere.
+        - Per-row width/offset EMAs: learned for the previous lane's
+          geometry as seen from THIS car's camera mount; seeded from the
+          last known width (both lanes share the same paint gauge) rather
+          than the raw config default, since that's the better prior.
+        - The rate-limited combined position (_last_position) and the
+          last-known-x telemetry (last_yellow_x/last_white_x): reset to
+          None so the 25px/frame position rate limiter doesn't try to slew
+          across an entire lane width - this reuses the same "reset to
+          None after sustained loss" path run() already takes for full
+          reacquisition, rather than a new code path.
+        Explicitly NOT reset: the PID's own internal state (its output is
+        recomputed against the new target next frame - the same size of
+        correction any lane reacquisition already produces), current
+        steering/throttle (motion should stay continuous), and the
+        gray-world white-balance EMA (a property of the camera/lighting,
+        not of which lane is tracked).
+        '''
+        if lane not in ('left', 'right'):
+            raise ValueError(f"set_lane(lane) expects 'left' or 'right', got {lane!r}")
+        new_white_right_of_yellow = (lane == 'right')
+        if new_white_right_of_yellow == self.white_right_of_yellow:
+            return
+        self.white_right_of_yellow = new_white_right_of_yellow
+        for tracker in self.yellow_trackers:
+            tracker.evict()
+        for tracker in self.white_trackers:
+            tracker.evict()
+        self.row_lane_width_px = [float(self.lane_width_px) for _ in self.scan_rows]
+        self.row_center_offset = [0.0 for _ in self.scan_rows]
+        self._last_position = None
+        self.last_yellow_x = None
+        self.last_white_x = None
+        self.lost_frames = 0
+
     def _lane_center(self, yellow_x, white_x, lane_width_px):
         '''
         Combine whichever of the two lines is visible into a single "center of
