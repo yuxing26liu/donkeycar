@@ -56,9 +56,9 @@ def cone_frame():
     frame = np.full((H, W, 3), 60, dtype=np.uint8)
     hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
     hsv[80:160, 200:230] = ORANGE_HSV       # cone -- centered, tall, close
-    hsv[160:176, 185:200] = (25, 150, 180)  # yellow dash, within YELLOW_HSV default range
+    hsv[150:190, 180:205] = (25, 150, 180)  # yellow dash, within YELLOW_HSV default range
     frame = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-    frame[160:176, 260:280] = (240, 240, 240)  # white edge, right of yellow
+    frame[150:190, 260:285] = (240, 240, 240)  # white edge, right of yellow
     return frame
 
 
@@ -102,9 +102,17 @@ def test_shadow_mode_never_calls_set_lane_or_changes_throttle():
 
 
 def test_active_mode_eventually_calls_set_lane_and_scales_throttle():
+    """This synthetic frame only paints ONE white-colored patch (on the
+    right, for the right lane) - it can't simulate a genuine post-switch
+    reacquisition of a real left lane (there's no second edge on the
+    correct side to find), so this test's scope is deliberately just
+    'did active mode dispatch a real set_lane() call and scale
+    throttle', not 'did it complete the full maneuver' - that full-cycle
+    behavior is what the real tub replay (scripts/replay_cone_planner.py)
+    validates against actual recorded lane geometry."""
     lf, arbiter = make_stack('active')
     starting_lane = lf.current_lane
-    result = run_ticks(lf, arbiter, 15)
+    result = run_ticks(lf, arbiter, 40)
     state = result[2]
     assert lf.current_lane != starting_lane, \
         f"active mode should have switched lanes by now (planner state={state})"

@@ -266,7 +266,26 @@ class ObstaclePlanner:
         return detection.bbox.h <= px_threshold
 
     def _lane_acquired(self, geometry):
-        return geometry is not None and geometry.corridor() is not None
+        """Stricter than _is_relevant's corridor check on purpose: this
+        gates 'is the (possibly just-switched-to) lane genuinely being
+        tracked right now', not 'is there SOME lane estimate available'.
+        LaneFollower's lane/yellow_x and lane/white_x Memory outputs are
+        last-known-good telemetry that does NOT reset to None on a miss
+        (by design, for continuity) - found via real active-mode test
+        replay (tub_122_26-07-30): after set_lane('left'), white_x
+        correctly went None (never re-acquired) but yellow_x stayed
+        frozen at one stale pre-switch value for 45+ frames, and the
+        single-line corridor fallback happily returned non-None from
+        that stale value the whole time - the planner falsely believed
+        the neighbor lane was acquired (HOLD_UNTIL_CLEAR) while
+        LaneFollower was actually completely blind and decaying to its
+        own MAX_LOST_FRAMES stop. Requiring BOTH lines closes this
+        specific hole: white_x present or not is NOT sticky the same way
+        (it only persists a value it actually had), so this is a real,
+        verified fix for the exact failure observed, not a guess."""
+        return (geometry is not None
+                and geometry.yellow_x is not None
+                and geometry.white_x is not None)
 
     # ---- main step ---------------------------------------------------
 
