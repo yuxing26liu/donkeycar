@@ -116,12 +116,53 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
     # verification (e.g. via tub recording or the CV overlay) before any
     # avoidance maneuver is wired up.
     #
+    obstacle_avoider = None
     if getattr(cfg, 'HAVE_OBSTACLE_AVOIDANCE', False):
         from donkeycar.parts.obstacle_avoider import ObstacleAvoider
-        V.add(ObstacleAvoider(cfg),
+        obstacle_avoider = ObstacleAvoider(cfg)
+        V.add(obstacle_avoider,
               inputs=['cam/image_array', 'lane/yellow_x', 'lane/white_x', 'lane/width_px',
                       'pilot/steering', 'pilot/throttle', 'cv/image_array'],
               outputs=['pilot/steering', 'pilot/throttle', 'cv/image_array', 'obstacle/cone_detected'],
+              run_condition='run_pilot')
+        # ObstacleAvoider.run() only returns obstacle/cone_detected, the raw
+        # (un-latching) per-frame detection - it does NOT return
+        # self.avoiding, which latches permanently once the cone maneuver
+        # starts and is what CarAvoider actually needs to know (Decision 5:
+        # "ignore triggers of the other type until back to cruising"). Once
+        # the cone leaves the scan band, cone_detected goes False again even
+        # though the swerve is still happening, so wiring cone_detected
+        # straight into CarAvoider would only defer its own trigger for the
+        # handful of frames the cone stays in view - not for the whole
+        # ongoing maneuver. Reading obstacle_avoider.avoiding directly off
+        # the live instance (rather than changing ObstacleAvoider.run()'s
+        # return signature, which would ripple through every existing
+        # unpacking call site in test_obstacle_avoider.py) publishes the
+        # actual persistent state.
+        V.add(Lambda(lambda: obstacle_avoider.avoiding),
+              outputs=['obstacle/avoiding'], run_condition='run_pilot')
+
+    #
+    # Oncoming-car avoidance (see project_doc/obstacle_avoidance.md,
+    # Decision 2 and donkeycar/parts/car_avoider.py's class docstring):
+    # color-keys the oncoming car's black wheels/front on its own earlier
+    # scan row and swerves to the other lane, triggering early (while the
+    # car is still crossing the yellow centerline) rather than waiting for
+    # it to be fully inside our lane. Added after the cone avoider, and
+    # consumes obstacle/avoiding (see above - NOT obstacle/cone_detected) so
+    # a cone maneuver already underway isn't fought for the steering
+    # actuator (Decision 5). obstacle/avoiding is only published when
+    # HAVE_OBSTACLE_AVOIDANCE is on; Memory.get() returns None for an
+    # unpublished key, and CarAvoider's other_avoidance_active parameter
+    # treats anything falsy the same as False, so this degrades safely when
+    # only HAVE_CAR_AVOIDANCE is enabled.
+    #
+    if getattr(cfg, 'HAVE_CAR_AVOIDANCE', False):
+        from donkeycar.parts.car_avoider import CarAvoider
+        V.add(CarAvoider(cfg),
+              inputs=['cam/image_array', 'lane/yellow_x', 'lane/white_x', 'lane/width_px',
+                      'pilot/steering', 'pilot/throttle', 'cv/image_array', 'obstacle/avoiding'],
+              outputs=['pilot/steering', 'pilot/throttle', 'cv/image_array', 'obstacle/car_detected'],
               run_condition='run_pilot')
 
     recording_control = ToggleRecording(cfg.AUTO_RECORD_ON_THROTTLE, cfg.RECORD_DURING_AI)

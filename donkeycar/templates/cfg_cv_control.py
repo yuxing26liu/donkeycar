@@ -700,6 +700,67 @@ CONE_LOG_INTERVAL_FRAMES = 10  # while the blue tape stays in view, re-print its
                                 # against the real tape on the car (LOGLEVEL=INFO,
                                 # cv_control.py's default, is enough to see these)
 
+# CarAvoider -- oncoming-car detection + avoidance (Decision 2 in
+# project_doc/obstacle_avoidance.md). Color-keys the oncoming car's black
+# wheels/front (donkeycar/parts/car_avoider.py), on its own earlier scan row
+# than the cone (CAR_SCAN_Y), and swerves to the other lane the same way
+# ObstacleAvoider does for the cone -- but triggers EARLY: as soon as the car
+# is detected encroaching CAR_EARLY_MARGIN_PX past the yellow centerline
+# into our lane, not only once it's already fully inside our lane's bounds --
+# the oncoming car is closing at combined speed, unlike the stationary cone,
+# so waiting until it's fully "in our lane" leaves far less time to swerve.
+# Detection-only would be safe to leave on like HAVE_OBSTACLE_AVOIDANCE, but
+# this part's whole point is the avoidance maneuver, so it's off by default
+# until BLACK_HSV_THRESHOLD is checked against real footage of the actual
+# car (no such footage existed when this was written -- see
+# car_avoider.py's class docstring).
+HAVE_CAR_AVOIDANCE = False
+
+CAR_SCAN_Y = 45         # higher up / farther ahead than CONE_SCAN_Y=60, for
+                        # more lead time to react to a closing car
+CAR_SCAN_HEIGHT = 20
+
+# HSV range for the oncoming car's black wheels/front -- a low Value
+# (brightness) threshold, independent of hue/saturation. Guessed, not yet
+# tuned on hardware -- unlike ORANGE_HSV_THRESHOLD above, no real footage of
+# the car existed to sample from when this was written. Verify against real
+# footage (LOGLEVEL=DEBUG + scripts/hsv_picker.py) before trusting it, and
+# watch for shadows / the concrete's expansion-joint seams triggering a
+# false positive (see CAR_REQUIRE_GROWTH below for a guard against those).
+BLACK_HSV_THRESHOLD_LOW = (0, 0, 0)
+BLACK_HSV_THRESHOLD_HIGH = (179, 255, 60)
+
+CAR_MIN_AREA_PX = 50     # smaller than CONE_MIN_AREA_PX -- a still-distant
+                          # car's blob is smaller than a cone at avoidance range
+CAR_MAX_WIDTH_PX = 100000  # unbounded by default, same reasoning as
+                            # CONE_MAX_WIDTH_PX -- a close real car
+                            # legitimately fills much of the frame width
+
+CAR_LANE_MARGIN_PX = 10   # margin added to our lane's bounds when testing
+                           # whether the car is already fully inside it
+CAR_EARLY_MARGIN_PX = 60  # how far PAST the yellow centerline (into the
+                           # opposite lane) the trigger zone extends, so
+                           # avoidance can begin while the car is still
+                           # crossing rather than only once it has arrived
+CAR_TRIGGER_FRAMES = 2    # consecutive triggering frames required before
+                           # obstacle/car_detected latches True
+CAR_FRAME_EDGE_MARGIN_PX = 5  # reject a detection sitting at the extreme
+                               # image edges (background clutter, same as
+                               # the recycling bin/kiosk sign in the cone
+                               # detector's real footage)
+
+# Frame-over-frame blob-growth requirement (Decision 2 option C) -- OFF by
+# default per the design doc ("held in reserve... only worth building if
+# [color-key + shape/size filter] isn't enough in on-car testing"). Flip on
+# if shadows/expansion-joint seams prove to be a recurring false trigger --
+# a real approaching car's blob should grow frame to frame; a static shadow
+# or seam shouldn't.
+CAR_REQUIRE_GROWTH = False
+CAR_GROWTH_WINDOW_FRAMES = 5
+CAR_GROWTH_MIN_PX_PER_FRAME = 3.0
+
+CAR_LOG_INTERVAL_FRAMES = 10
+
 
 #
 # Assign path follow functions to buttons.

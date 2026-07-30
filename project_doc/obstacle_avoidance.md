@@ -17,9 +17,15 @@ the reference photos in `CLAUDE.md`), the car must additionally:
    losing lane-keeping.
 
 This is being built incrementally, one detector at a time, verified before
-the next piece is layered on. **Step 1's detector and the cone avoidance
-maneuver (Phase 2, below) are implemented; the oncoming-car detector is
-not.**
+the next piece is layered on. **The cone detector + avoidance maneuver
+(Phase 2, below) are implemented. The oncoming-car detector + avoidance
+maneuver are now also implemented** (`donkeycar/parts/car_avoider.py`,
+`CarAvoider` - see "What's implemented: oncoming-car detection + avoidance"
+below), but **unverified against any real footage of the actual car**
+(synthetic-image tests only, same starting point the cone detector was at
+before `tub_33_26-07-24` was checked) - `HAVE_CAR_AVOIDANCE` defaults to
+`False` in `cfg_cv_control.py` until `BLACK_HSV_THRESHOLD_LOW/HIGH` is
+checked against real footage.
 
 ## Design decisions
 
@@ -65,6 +71,28 @@ sampled directly from two frames of `tub_33_26-07-24`.
 
 Plan: **A**, with **C** as a documented fallback if the seam/shadow proves to
 be a recurring false trigger during testing.
+
+**Implemented** in `donkeycar/parts/car_avoider.py` (`CarAvoider`): option A
+(black-HSV color-key + `_select_line_blob`'s shape/size filter, plus a
+frame-edge sanity gate), with option C built and wired up but **off by
+default** (`CAR_REQUIRE_GROWTH = False`) exactly as "held in reserve" above
+describes - `self.car_growing` (frame-over-frame blob-area growth over
+`CAR_GROWTH_WINDOW_FRAMES`) is computed and published every frame regardless,
+so it's visible for tuning before deciding whether real footage needs it
+turned on. `BLACK_HSV_THRESHOLD_LOW/HIGH` is an untuned guess, same caveat
+`BLUE_HSV_THRESHOLD` carries - no real footage of this track's oncoming car
+existed to sample from when this was written (unlike
+`ORANGE_HSV_THRESHOLD`, calibrated from real cone pixels).
+
+The one piece of this decision not anticipated by the table above: the
+oncoming car is *closing* (its speed plus ours), unlike the stationary cone,
+so a trigger gated on "fully inside our lane's bounds" (the cone's approach)
+leaves much less time to complete a swerve. `CarAvoider` adds an
+"encroachment" trigger (`CAR_EARLY_MARGIN_PX`, `_encroachment_bound`/
+`_past_encroachment_bound`) that extends past the yellow centerline into the
+*opposite* lane, so avoidance can begin while the car is still crossing
+rather than only once it has arrived - see `car_avoider.py`'s class
+docstring, "Triggering early".
 
 ### Decision 1.5 — Return to the original lane after clearing the cone? (revised, implemented)
 
@@ -657,21 +685,100 @@ Covered by `TestObstacleAvoiderCloseConeWidth` in
 still latches `cone_detected`/`avoiding` end-to-end, not just passes the
 shape filter in isolation.
 
+## What's implemented: oncoming-car detection + avoidance
+
+`donkeycar/parts/car_avoider.py`, class `CarAvoider` - a separate `Part`,
+not a change to `obstacle_avoider.py` or `lane_follower.py`. Mirrors
+`ObstacleAvoider`'s structure closely (imports `_lane_bounds`/
+`_other_lane_center` directly from `obstacle_avoider.py` rather than
+duplicating that math a third time; reuses `_select_line_blob` from
+`lane_follower.py`; the avoidance maneuver itself, `_avoid_step`, is a
+near-duplicate of `ObstacleAvoider._avoid_step` with this part's own PID/
+rate-limit state, for the same "separate loops can't corrupt each other's
+integral state" reason the cone maneuver's own dedicated PID exists).
+
+Detection: black-HSV color-key on `CAR_SCAN_Y`/`CAR_SCAN_HEIGHT` (an
+earlier/higher scan row than the cone's, since the car is closing at
+combined speed - Decision 4). Trigger gating differs from the cone
+detector in the one way that actually matters here (see Decision 2 above,
+"Triggering early"): fires on `car_in_our_lane` **OR** `car_encroaching` (a
+wider zone extending `CAR_EARLY_MARGIN_PX` past the yellow centerline into
+the opposite lane), not only once the car is fully inside our lane's
+bounds. Same lane-geometry-lost fallback as `ObstacleAvoider`
+(`tub_7_26-07-27`'s fix): a raw detection still counts even with
+`yellow_x`/`white_x` both `None`.
+
+Maneuver: once `car_detected` latches after `CAR_TRIGGER_FRAMES` consecutive
+qualifying frames, `self.avoiding` latches permanently (same Decision 1.5
+simplicity tradeoff as the cone maneuver - not revisited for the oncoming-
+car case specifically) and steers toward `_other_lane_center` with the same
+defenses `ObstacleAvoider._avoid_step` uses (soft-saturated error, position/
+steering rate limits, a yellow-jump plausibility gate, passive hold/decay on
+lane loss) - skipping any of those would just reproduce the on-car failures
+already documented above for the cone maneuver.
+
+Decision 5 (`run_condition`/actuator conflict): `run()` takes an optional
+`other_avoidance_active` flag, wired from a new `obstacle/avoiding` Memory
+key (see `cv_control.py`/`manage2.py`) - **not** `obstacle/cone_detected`.
+`ObstacleAvoider.run()` only ever returns the raw, un-latching per-frame
+`cone_detected`, which goes back to `False` once the cone leaves the scan
+band even though `self.avoiding` (the actual permanent swerve state) stays
+`True` forever - wiring `cone_detected` into `CarAvoider` would only defer
+its trigger for the handful of frames the cone stays in view, not the whole
+ongoing maneuver. `obstacle/avoiding` is published by a small `Lambda` part
+that reads `ObstacleAvoider.avoiding` directly off the live instance each
+tick, rather than changing `ObstacleAvoider.run()`'s return signature
+(which would ripple through every unpacking call site in
+`test_obstacle_avoider.py`). With this signal, a cone maneuver already
+active isn't fought for the steering actuator the same frame an oncoming
+car crosses in; `CarAvoider`'s own trigger keeps counting but the maneuver
+itself waits until `obstacle/avoiding` clears - which, given neither
+maneuver un-latches, in practice means "until the cone maneuver was never
+triggered at all this drive."
+
+Config: `HAVE_CAR_AVOIDANCE` (default `False` - flip on only after
+`BLACK_HSV_THRESHOLD_LOW/HIGH` is checked against real footage),
+`CAR_SCAN_Y/HEIGHT`, `BLACK_HSV_THRESHOLD_LOW/HIGH`, `CAR_MIN_AREA_PX`,
+`CAR_MAX_WIDTH_PX`, `CAR_LANE_MARGIN_PX`, `CAR_EARLY_MARGIN_PX`,
+`CAR_TRIGGER_FRAMES`, `CAR_FRAME_EDGE_MARGIN_PX`, `CAR_REQUIRE_GROWTH` (+
+its window/rate constants), `AVOID_CAR_PID_P/I/D` and the rest of the
+`AVOID_CAR_*` maneuver constants (all fall back to the same generic
+`LANE_*`/`PID_*` values `ObstacleAvoider`'s `AVOID_*` constants do) - see
+`cfg_cv_control.py`.
+
+Tested: `donkeycar/tests/test_car_avoider.py`, synthetic images only (same
+starting point `test_obstacle_avoider.py` was at before real footage was
+checked) - covers the encroachment-vs-in-lane-vs-neither trigger geometry,
+frame-edge/debris/tiny-speck rejection, the lane-geometry-lost fallback,
+debounce reset on a miss, the growth gate (both on and off), the
+`other_avoidance_active` deferral, and that the maneuver actually steers
+toward the other lane's center.
+
 ## Next steps
 
-1. Detect the car's black wheels/front (Decision 2, option A) the same way
-   the cone's tape is detected now: a second color-keyed detector, its own
-   scan row (Decision 4), reporting `obstacle/car_in_our_lane` — still
-   detection-only at first, verified the same way before wiring in control.
-2. Decide how the car detector interacts with the cone maneuver once it
-   exists: since the cone maneuver (Decision 1.5) no longer releases back to
-   `LaneFollower`, a car crossing into our (post-swerve) lane needs its own
-   trigger logic layered on top rather than the "one maneuver, first wins"
-   model Decision 5 originally assumed for two *returning* maneuvers.
-3. Verify the avoidance maneuver (Phase 2, implemented) and every guessed
-   constant (`AVOID_PID_P/I/D`, still just copied from the main steering
-   PID) against real on-car footage - so far only checked against synthetic
-   images in `donkeycar/tests/test_obstacle_avoider.py`, not a real cone/lane.
-   Update this document with what changed and why (same as `CLAUDE.md`'s
-   standing instruction to treat every CV/PID constant here as provisional
-   until checked against hardware).
+1. ~~Detect the car's black wheels/front~~ **Done** - see above.
+2. Decide how the car detector interacts with the cone maneuver once both
+   are active on the same drive: since neither maneuver releases back to
+   `LaneFollower`, a car crossing into our (post-cone-swerve) lane still
+   needs to be judged against *whichever* lane the car is currently
+   actually driving in, not always the original `lane/yellow_x`-relative
+   "our lane" - both parts currently reason from the same raw
+   `lane/yellow_x`/`white_x`/`lane_width_px` published by `LaneFollower`
+   regardless of which lane a prior cone swerve left the car in, so this
+   is NOT yet solved, only deferred via `other_avoidance_active` (which
+   only prevents the two maneuvers from fighting over the actuator in the
+   same instant, not the deeper "which lane is 'ours' right now" question).
+3. Verify both avoidance maneuvers (Phase 2 for the cone, implemented; the
+   car maneuver above) and every guessed constant (`AVOID_PID_P/I/D`,
+   `AVOID_CAR_PID_P/I/D`, still just copied from the main steering PID)
+   against real on-car footage - so far only checked against synthetic
+   images in `donkeycar/tests/test_obstacle_avoider.py` /
+   `test_car_avoider.py`, not a real cone/car/lane. In particular,
+   `BLACK_HSV_THRESHOLD_LOW/HIGH`, `CAR_EARLY_MARGIN_PX`, and
+   `CAR_SCAN_Y/HEIGHT` are all untuned guesses with no real footage behind
+   them at all (unlike `ORANGE_HSV_THRESHOLD`, sampled from real cone
+   pixels) - this is the most important gap to close before
+   `HAVE_CAR_AVOIDANCE` should ever be flipped `True` on the car. Update
+   this document with what changed and why (same as `CLAUDE.md`'s standing
+   instruction to treat every CV/PID constant here as provisional until
+   checked against hardware).
