@@ -217,18 +217,21 @@ class OakD(object):
             self.depth_queue: DataOutputQueue = self.oak_d_device.getOutputQueue(
                 name="depth", maxSize=1, blocking=False
             )
-            self.depth_image = self.get_frame(self.depth_queue)
+            depth_image = self.get_frame(self.depth_queue)
+            if self.resize:
+                depth_image = cv2.resize(
+                    depth_image, (self.width, self.height), cv2.INTER_NEAREST
+                )
+            # run_threaded() reads self.depth_image from the main vehicle
+            # loop with no lock; assign only once, fully-formed, so it can
+            # never observe the pre-resize shape mid-update.
+            self.depth_image = depth_image
 
         if self.enable_rgb:
             self.rgb_queue: DataOutputQueue = self.oak_d_device.getOutputQueue(
                 "rgb", maxSize=1, blocking=False
             )
             self.color_image = self.get_rgb_frame(self.rgb_queue)
-
-        if self.resize and self.enable_depth:
-            self.depth_image = cv2.resize(
-                self.depth_image, (self.width, self.height), cv2.INTER_NEAREST
-            )
 
     def update(self):
         """

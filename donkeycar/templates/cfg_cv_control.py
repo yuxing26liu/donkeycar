@@ -535,6 +535,18 @@ REALSENSE_D435_ID = None        # serial number of camera or None if you only ha
 
 
 #
+# Luxonis OAK-D depth sensing camera (see donkeycar/parts/oak_d.py).
+# Set CAMERA_TYPE = "OAKD" to use it. This car's actual myconfig.py sets
+# these directly; declared here only so cfg.OAKD_* always resolves even
+# without a myconfig override, and so this template documents the keys
+# add_camera() (complete.py) expects.
+#
+OAKD_RGB = True       # True to capture RGB image -> cam/image_array
+OAKD_DEPTH = False    # True to capture depth as image array -> cam/depth_array
+OAKD_ID = None        # serial number of camera or None if you only have one camera (it will autodetect)
+
+
+#
 # Stop Sign Detector
 #
 STOP_SIGN_DETECTOR = False

@@ -4,7 +4,7 @@
 Scripts to drive on autopilot using computer vision
 
 Usage:
-    manage.py (drive) [--js] [--log=INFO] [--camera=(single|stereo)] [--myconfig=<filename>]
+    manage.py (drive) [--js] [--log=INFO] [--camera=(single|stereo)] [--myconfig=<filename>] [--meta=<key:value> ...]
 
 
 Options:
@@ -12,6 +12,9 @@ Options:
     --js               Use physical joystick.
     --myconfig=filename     Specify myconfig file to use.
                             [default: myconfig.py]
+    --meta=<key:value>      Key/value strings describing a piece of meta
+                            data about this drive (e.g. lane:right). Option
+                            may be used more than once.
 """
 import logging
 
@@ -194,13 +197,20 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
     # three columns just never appear) when running LineFollower instead.
     # Recording them lets a tub be analyzed for exactly what was detected
     # per frame, instead of having to infer it from steering/throttle.
+    #
+    # cam/depth_array is likewise only populated when CAMERA_TYPE="OAKD"
+    # (or "D435") and *_DEPTH is enabled (see add_camera() in complete.py) -
+    # same None-skip no-op otherwise. Recorded as a 16-bit PNG (gray16_array)
+    # so raw depth can be analyzed offline alongside the RGB frame.
     inputs=['cam/image_array',
             'steering', 'throttle',
-            'lane/yellow_x', 'lane/white_x', 'lane/width_px']
+            'lane/yellow_x', 'lane/white_x', 'lane/width_px',
+            'cam/depth_array']
 
     types=['image_array',
            'float', 'float',
-           'float', 'float', 'float']
+           'float', 'float', 'float',
+           'gray16_array']
 
     #
     # Create data storage part
@@ -274,4 +284,5 @@ if __name__ == '__main__':
     logging.basicConfig(level=numeric_level)
 
     if args['drive']:
-        drive(cfg, use_joystick=args['--js'], camera_type=args['--camera'])
+        drive(cfg, use_joystick=args['--js'], camera_type=args['--camera'],
+              meta=args['--meta'])
