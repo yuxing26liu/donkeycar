@@ -104,12 +104,44 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
     #
     # Computer Vision Controller
     #
-    add_cv_controller(V, cfg, pid,
+    cv_controller = add_cv_controller(V, cfg, pid,
                       cfg.CV_CONTROLLER_MODULE,
                       cfg.CV_CONTROLLER_CLASS,
                       cfg.CV_CONTROLLER_INPUTS,
                       cfg.CV_CONTROLLER_OUTPUTS,
                       cfg.CV_CONTROLLER_CONDITION)
+
+    #
+    # Cone-avoidance planner (cone-dodger3000 branch) - disabled unless
+    # OBSTACLE_AVOIDANCE_MODE is set to 'observe'/'shadow'/'active' in
+    # myconfig.py (default 'disabled': the part below isn't even added,
+    # so a car without this configured pays zero cost for it). Requires
+    # CV_CONTROLLER_CLASS to be LaneFollower (needs .set_lane()/
+    # .current_lane/.white_right_of_yellow/.scan_rows) - silently skipped
+    # otherwise, e.g. when running the baseline LineFollower.
+    # 'active' mode is the only mode that ever calls set_lane() or
+    # changes what actually drives the car - see pilot_arbiter.py.
+    obstacle_avoidance_mode = getattr(cfg, 'OBSTACLE_AVOIDANCE_MODE', 'disabled')
+    if obstacle_avoidance_mode != 'disabled' and cfg.CV_CONTROLLER_CLASS == 'LaneFollower':
+        from donkeycar.parts.cone_detector import ConeDetector
+        from donkeycar.parts.obstacle_planner import ObstaclePlanner
+        from donkeycar.parts.pilot_arbiter import PilotArbiter
+
+        cone_detector = ConeDetector(cfg)
+        obstacle_planner = ObstaclePlanner(cfg)
+        pilot_arbiter = PilotArbiter(cfg, cv_controller, cone_detector, obstacle_planner)
+        V.add(pilot_arbiter,
+              inputs=['cam/image_array', 'cam/depth_array', 'pilot/steering', 'pilot/throttle',
+                      'lane/yellow_x', 'lane/white_x', 'lane/width_px'],
+              outputs=['pilot/steering', 'pilot/throttle',
+                       'planner/state', 'planner/reason', 'planner/requested_lane',
+                       'planner/cone_in_path', 'cone/bbox_x', 'cone/bbox_y', 'cone/bbox_w',
+                       'cone/bbox_h', 'cone/distance_mm', 'cone/distance_valid',
+                       'cone/distance_source'],
+              run_condition=cfg.CV_CONTROLLER_CONDITION)
+    elif obstacle_avoidance_mode != 'disabled':
+        logger.warning(f"OBSTACLE_AVOIDANCE_MODE={obstacle_avoidance_mode!r} but CV_CONTROLLER_CLASS="
+                        f"{cfg.CV_CONTROLLER_CLASS!r} (not LaneFollower) -- cone avoidance not wired in.")
 
     recording_control = ToggleRecording(cfg.AUTO_RECORD_ON_THROTTLE, cfg.RECORD_DURING_AI)
     V.add(recording_control, inputs=['user/mode', "recording"], outputs=["recording"])
@@ -202,15 +234,27 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
     # (or "D435") and *_DEPTH is enabled (see add_camera() in complete.py) -
     # same None-skip no-op otherwise. Recorded as a 16-bit PNG (gray16_array)
     # so raw depth can be analyzed offline alongside the RGB frame.
+    #
+    # planner/* and cone/* are only populated when OBSTACLE_AVOIDANCE_MODE
+    # is not 'disabled' (see pilot_arbiter.py) - same None-skip no-op
+    # otherwise. Recording these is what makes an on-car cone-avoidance
+    # test tub analyzable offline frame-by-frame (state/reason per frame,
+    # not just inferred from steering/throttle after the fact).
     inputs=['cam/image_array',
             'steering', 'throttle',
             'lane/yellow_x', 'lane/white_x', 'lane/width_px',
-            'cam/depth_array']
+            'cam/depth_array',
+            'planner/state', 'planner/reason', 'planner/requested_lane', 'planner/cone_in_path',
+            'cone/bbox_x', 'cone/bbox_y', 'cone/bbox_w', 'cone/bbox_h',
+            'cone/distance_mm', 'cone/distance_valid', 'cone/distance_source']
 
     types=['image_array',
            'float', 'float',
            'float', 'float', 'float',
-           'gray16_array']
+           'gray16_array',
+           'str', 'str', 'str', 'boolean',
+           'float', 'float', 'float', 'float',
+           'float', 'boolean', 'str']
 
     #
     # Create data storage part
@@ -267,10 +311,14 @@ def add_cv_controller(
         my_class = getattr(module, class_name)
 
         # add instance of class to vehicle
-        V.add(my_class(pid, cfg),
+        controller = my_class(pid, cfg)
+        V.add(controller,
               inputs=inputs,
               outputs=outputs,
               run_condition=run_condition)
+        # returned so drive() can hand the SAME instance to PilotArbiter
+        # (needs .set_lane()/.current_lane, not just its Memory outputs)
+        return controller
 
 
 if __name__ == '__main__':

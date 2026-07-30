@@ -547,6 +547,62 @@ OAKD_ID = None        # serial number of camera or None if you only have one cam
 
 
 #
+# Cone avoidance (cone-dodger3000 branch) - see donkeycar/parts/
+# cone_detector.py, obstacle_planner.py, pilot_arbiter.py. Only wired in
+# (see cv_control.py) when CV_CONTROLLER_CLASS is LaneFollower and this
+# is not 'disabled'. 'active' is the only mode that ever changes what
+# actually drives the car - default to 'disabled' or 'observe'/'shadow'
+# until offline replay AND a real on-car test at low speed both look
+# right (see this project's cone-avoidance validation notes).
+#
+OBSTACLE_AVOIDANCE_MODE = 'disabled'   # disabled | observe | shadow | active
+
+# ConeDetector - HSV+contour, thresholds measured off real cone frames
+# across 5+ tubs/lighting conditions (see cone_detector.py docstring).
+CONE_HSV_THRESHOLD_LOW = (0, 70, 70)
+CONE_HSV_THRESHOLD_HIGH = (18, 255, 255)
+CONE_MIN_AREA_PX = 80
+CONE_MIN_ASPECT_RATIO = 0.8            # height/width
+CONE_MAX_MASK_FRACTION = 0.6
+CONE_MORPH_KERNEL_SIZE = 3
+CONE_MAX_JUMP_PX = 120                 # continuity gate on bbox center x
+CONE_REACQUIRE_AFTER_FRAMES = 15
+CONE_DEPTH_ROI_H_FRAC = (0.30, 0.70)   # inner width fraction of bbox sampled for depth
+CONE_DEPTH_ROI_V_FRAC = (0.35, 0.90)   # inner height fraction of bbox sampled for depth
+CONE_DEPTH_PERCENTILE = 25             # robust stat, NOT raw min (see docstring)
+CONE_DEPTH_MIN_VALID_MM = 150
+CONE_DEPTH_MIN_VALID_PX = 20
+
+# ObstaclePlanner - frame-count-based confirm/clear/dwell thresholds (not
+# wall-clock timers) plus distance thresholds. mm thresholds are
+# architecture-level starting points, NOT yet validated against real
+# depth+approach data; bbox-height-px thresholds ARE checked against a
+# real cone_approach_right driving approach. See obstacle_planner.py
+# docstring for exactly what's confirmed vs. still assumed, including a
+# known unresolved false-positive finding on the cone_negative tub.
+CONE_DETECT_CONFIRM_FRAMES = 3
+CONE_CLEAR_CONFIRM_FRAMES = 5
+CONE_LANE_ACQUIRE_CONFIRM_FRAMES = 6
+CONE_WATCH_DISTANCE_MM = 3000
+CONE_COMMIT_DISTANCE_MM = 1200
+CONE_EMERGENCY_DISTANCE_MM = 400
+CONE_WATCH_BBOX_HEIGHT_PX = 45
+CONE_COMMIT_BBOX_HEIGHT_PX = 90
+CONE_EMERGENCY_BBOX_HEIGHT_PX = 170
+CORRIDOR_SAFETY_MARGIN_PX = -20        # negative narrows the corridor inward
+CONE_CENTER_FALLBACK_MARGIN_PX = 70    # used only when lane geometry is unavailable
+PLANNER_PREPARE_MIN_FRAMES = 4
+PLANNER_HOLD_MIN_FRAMES = 10
+PLANNER_MANEUVER_TIMEOUT_FRAMES = 300  # 15s at 20Hz
+PLANNER_SAFE_STOP_RECOVER_FRAMES = 40
+PLANNER_SAFE_STOP_AUTO_RECOVER = True
+PLANNER_PREPARE_THROTTLE_SCALE = 0.6
+PLANNER_SWITCH_THROTTLE_SCALE = 0.5
+PLANNER_HOLD_THROTTLE_SCALE = 0.6
+PLANNER_RETURN_THROTTLE_SCALE = 0.8
+
+
+#
 # Stop Sign Detector
 #
 STOP_SIGN_DETECTOR = False
