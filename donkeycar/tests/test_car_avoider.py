@@ -27,6 +27,8 @@ class _Cfg:
                                 # 150-250px, see lane_follower.py)
     CAR_TRIGGER_FRAMES = 2
     CAR_FRAME_EDGE_MARGIN_PX = 5
+    CAR_CENTER_MARGIN_PX = 60
+    CAR_CLOSE_MIN_AREA_PX = 150
     CAR_REQUIRE_GROWTH = False
     CAR_GROWTH_WINDOW_FRAMES = 5
     CAR_GROWTH_MIN_PX_PER_FRAME = 3.0
@@ -158,9 +160,11 @@ class TestCarAvoiderDetection:
         assert detected is False
         assert avoider.car_x is None
 
-    def test_no_lane_geometry_still_triggers_on_raw_detection(self):
+    def test_no_lane_geometry_still_triggers_when_centered_and_close(self):
         # mirrors ObstacleAvoider's tub_7_26-07-27 fallback: a car that has
-        # already lost the lane must still be able to trigger avoidance
+        # already lost the lane must still be able to trigger avoidance -
+        # but (unlike the old, too-permissive version of this fallback)
+        # only when centered and close, not for any qualifying blob at all
         avoider = CarAvoider(_Cfg())
         img = _make_frame([(210, 230, SCAN_Y0 + 2, SCAN_Y0 + 12, BLACK)])
         result = None
@@ -169,6 +173,36 @@ class TestCarAvoiderDetection:
         _s, _t, _cv, detected = result
         assert detected is True
         assert avoider.lane_geometry_available is False
+        assert avoider.car_centered is True
+        assert avoider.car_close is True
+
+    def test_no_lane_geometry_off_center_blob_does_not_trigger(self):
+        # regression test for the on-car false trigger this fallback caused
+        # (LineFollower mistakenly active instead of LaneFollower, so
+        # yellow_x/white_x were never published; a shadowed background
+        # object off to one side latched obstacle/car_detected and froze
+        # the maneuver). A blob far from the raw image's horizontal center
+        # (213) must NOT trigger just because lane geometry is unavailable.
+        avoider = CarAvoider(_Cfg())
+        img = _make_frame([(20, 60, SCAN_Y0 + 2, SCAN_Y0 + 16, BLACK)])  # x~40, far left
+        result = None
+        for _ in range(5):
+            result = avoider.run(img, None, None, LANE_WIDTH_PX, 0.0, 0.2)
+        _s, _t, _cv, detected = result
+        assert detected is False
+        assert avoider.car_x is not None
+        assert avoider.car_centered is False
+
+    def test_no_lane_geometry_small_blob_does_not_trigger(self):
+        avoider = CarAvoider(_Cfg())
+        # centered but below CAR_CLOSE_MIN_AREA_PX=150 (10x10=100px)
+        img = _make_frame([(215, 225, SCAN_Y0 + 2, SCAN_Y0 + 12, BLACK)])
+        result = None
+        for _ in range(5):
+            result = avoider.run(img, None, None, LANE_WIDTH_PX, 0.0, 0.2)
+        _s, _t, _cv, detected = result
+        assert detected is False
+        assert avoider.car_close is False
 
     def test_one_frame_then_miss_resets_debounce(self):
         avoider = CarAvoider(_Cfg())

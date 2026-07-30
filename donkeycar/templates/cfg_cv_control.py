@@ -714,6 +714,19 @@ CONE_LOG_INTERVAL_FRAMES = 10  # while the blue tape stays in view, re-print its
 # until BLACK_HSV_THRESHOLD is checked against real footage of the actual
 # car (no such footage existed when this was written -- see
 # car_avoider.py's class docstring).
+#
+# REQUIRES CV_CONTROLLER_CLASS = "LaneFollower" (same requirement
+# ObstacleAvoider already documents) -- with LineFollower active instead,
+# lane/yellow_x, lane/white_x, lane/width_px are NEVER published (only
+# LaneFollower's run() returns them), so CarAvoider can never tell where
+# "our lane" is and permanently falls back to CAR_CENTER_MARGIN_PX/
+# CAR_CLOSE_MIN_AREA_PX alone -- confirmed on-car: with LineFollower active
+# by mistake, a shadowed doorway in the background false-triggered the
+# maneuver, and since yellow_x was never available either, the maneuver
+# itself could never find a real steering target and permanently decayed
+# throttle to 0. Double check myconfig.py sets CV_CONTROLLER_CLASS =
+# "LaneFollower" AND the full CV_CONTROLLER_OUTPUTS list (see
+# project_doc/obstacle_avoidance.md's "Known gotcha") before trusting this.
 HAVE_CAR_AVOIDANCE = False
 
 CAR_SCAN_Y = 45         # higher up / farther ahead than CONE_SCAN_Y=60, for
@@ -748,6 +761,33 @@ CAR_FRAME_EDGE_MARGIN_PX = 5  # reject a detection sitting at the extreme
                                # image edges (background clutter, same as
                                # the recycling bin/kiosk sign in the cone
                                # detector's real footage)
+
+# Corroboration required ONLY when lane geometry is unavailable (yellow_x/
+# white_x/lane_width_px all None this frame -- e.g. LaneFollower has lost
+# the track, or CV_CONTROLLER_CLASS is misconfigured to something that
+# never publishes lane/* at all, like LineFollower) -- see car_avoider.py's
+# "Exception" paragraph. Without ANY lane geometry to test position
+# against, car_in_our_lane/car_encroaching are structurally False, so
+# CarAvoider falls back to requiring the raw detection be centered AND
+# close instead of "any qualifying black blob at all" -- unlike the cone's
+# orange/blue, "black" is common background clutter (shadows, doorways,
+# railings), so an ungated fallback here is a real false-trigger risk, not
+# just a theoretical one -- confirmed on-car when LineFollower was active
+# by mistake instead of LaneFollower: a shadowed stairwell doorway in the
+# background latched obstacle/car_detected and froze the maneuver
+# permanently (yellow_x never being available meant the maneuver's own
+# steering target could never be computed either, so throttle decayed to
+# 0 and stayed there).
+CAR_CENTER_MARGIN_PX = 60      # max pixels from the RAW IMAGE's horizontal
+                                 # center and still count as "dead ahead"
+CAR_CLOSE_MIN_AREA_PX = 150     # min pixel area to count as "close enough
+                                 # to react to" when there's no lane
+                                 # geometry to check position against --
+                                 # CAUTION: a low starting floor (like
+                                 # CONE_CLOSE_MIN_AREA_PX), not a
+                                 # calibrated "close" value -- no real
+                                 # footage of the actual car existed to
+                                 # calibrate against when this was written
 
 # Frame-over-frame blob-growth requirement (Decision 2 option C) -- OFF by
 # default per the design doc ("held in reserve... only worth building if

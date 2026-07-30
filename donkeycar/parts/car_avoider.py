@@ -120,8 +120,16 @@ class CarAvoider:
     car_in_our_lane/car_encroaching are structurally False (both depend on
     yellow_x), so a car that has already lost the lane could otherwise
     never trigger avoidance no matter how obviously an oncoming car sat
-    dead ahead. Falls back to "a plausible black blob was detected in the
-    scan band at all" in that case - see run().
+    dead ahead. Falls back to requiring centered AND close (CAR_CENTER_MARGIN_PX/
+    CAR_CLOSE_MIN_AREA_PX - the same two lane-geometry-independent gates
+    the cone detector uses in this situation) rather than "any qualifying
+    blob at all" - added after an on-car test where LineFollower was
+    active instead of LaneFollower (so yellow_x/white_x/lane_width_px were
+    NEVER published, not just briefly lost), and an ungated fallback
+    latched onto a shadowed doorway in the background with nothing
+    resembling an oncoming car anywhere near it. Unlike the cone's orange/
+    blue, "black" is common background clutter, so the ungated version of
+    this exception (safe enough for the cone) was not safe enough here.
 
     The avoidance maneuver itself (_avoid_step) steers toward
     _other_lane_center exactly like ObstacleAvoider._avoid_step does,
@@ -196,6 +204,25 @@ class CarAvoider:
         # encroachment-zone gating already does most of the real work here.
         self.frame_edge_margin_px = getattr(cfg, 'CAR_FRAME_EDGE_MARGIN_PX', 5)
 
+        # Corroboration required when lane geometry is unavailable (see the
+        # "Exception" paragraph below and run()) - mirrors
+        # ObstacleAvoider's CONE_CENTER_MARGIN_PX/CONE_CLOSE_MIN_AREA_PX.
+        # Added after an on-car test (LineFollower active by mistake instead
+        # of LaneFollower, so lane/yellow_x/white_x/width_px were never
+        # populated) showed a shadowed stairwell doorway in the background -
+        # nowhere near the track, let alone an oncoming car - latch
+        # obstacle/car_detected and permanently freeze the maneuver
+        # (yellow_x never available meant _avoid_step could never find a
+        # real target, so throttle decayed to 0 and stayed there). With NO
+        # lane geometry to test position against at all, "a qualifying
+        # black blob exists anywhere in the scan band" was the only gate
+        # car_ready had - far too permissive for a color as generic as
+        # "black," unlike the cone's orange/blue. These two checks hold
+        # even when lane geometry is wrong, same reasoning as the cone
+        # detector's equivalent gates.
+        self.car_center_margin_px = getattr(cfg, 'CAR_CENTER_MARGIN_PX', 60)
+        self.car_close_min_area_px = getattr(cfg, 'CAR_CLOSE_MIN_AREA_PX', 150)
+
         # Frame-over-frame blob-growth requirement (Decision 2 option C) -
         # off by default per the design doc ("held in reserve... only
         # worth building if [color-key + shape/size filter] isn't enough in
@@ -261,6 +288,8 @@ class CarAvoider:
         self.car_growing = False
         self.car_in_our_lane = False
         self.car_encroaching = False
+        self.car_centered = False
+        self.car_close = False
         self.lane_geometry_available = False
         self.car_ready = False
         self.car_detected = False
@@ -328,6 +357,30 @@ class CarAvoider:
             self.car_growing = growth >= self.growth_min_px_per_frame * frames
         else:
             self.car_growing = False
+
+    def _is_centered(self, x, frame_width):
+        '''
+        True if x sits within CAR_CENTER_MARGIN_PX of the raw image's
+        horizontal center - only consulted when lane geometry is
+        unavailable (see run()'s "Exception" branch and the
+        CAR_CENTER_MARGIN_PX comment in __init__). Mirrors
+        ObstacleAvoider._is_centered exactly, same rationale: a forward-
+        facing camera reads whatever's actually ahead of the car as roughly
+        centered, while background clutter off to one side (a doorway, a
+        railing, a sign) does not.
+        '''
+        if x is None:
+            return False
+        return abs(x - frame_width / 2.0) <= self.car_center_margin_px
+
+    def _is_close(self, area):
+        '''
+        True if the winning blob's pixel area meets CAR_CLOSE_MIN_AREA_PX -
+        only consulted when lane geometry is unavailable. Mirrors
+        ObstacleAvoider._is_close: a real 3D object's apparent size grows
+        as it nears the camera, so area is a cheap distance proxy.
+        '''
+        return area >= self.car_close_min_area_px
 
     def _log_raw_detection(self):
         raw_detected = self.car_x is not None
@@ -398,17 +451,35 @@ class CarAvoider:
         self.car_in_our_lane = _x_in_bounds(self.car_x, our_lane, self.lane_margin_px)
         bound = _encroachment_bound(yellow_x, self.early_margin_px, self.white_right_of_yellow)
         self.car_encroaching = _past_encroachment_bound(self.car_x, bound, self.white_right_of_yellow)
+        self.car_centered = self._is_centered(self.car_x, frame_width)
+        self.car_close = self._is_close(self.car_area)
 
         if self.lane_geometry_available:
             car_positioned = self.car_in_our_lane or self.car_encroaching
         else:
-            # lane fully lost - same fallback ObstacleAvoider uses (see its
+            # Lane fully lost - same fallback ObstacleAvoider uses (see its
             # class docstring's "Exception" paragraph, added after
             # tub_7_26-07-27): car_in_our_lane/car_encroaching are
             # structurally False whenever yellow_x is None, so a car that
             # already lost the lane could otherwise never trigger no matter
             # how obviously an oncoming car sat dead ahead.
-            car_positioned = self.car_x is not None
+            #
+            # Unlike ObstacleAvoider's cone (orange/blue - rare, specific
+            # colors), "black" is common background clutter (shadows,
+            # doorways, railings, the track's own expansion-joint seams),
+            # so falling back to "a qualifying blob exists at all" is too
+            # permissive here - confirmed on-car: with LineFollower
+            # mistakenly active instead of LaneFollower (so yellow_x/
+            # white_x/lane_width_px were never published at all), a
+            # shadowed stairwell doorway in the background latched
+            # obstacle/car_detected and froze the maneuver permanently
+            # (yellow_x never available meant _avoid_step's other_center
+            # was always None, so throttle decayed to 0 and stayed there).
+            # Requiring centered AND close - the same two lane-geometry-
+            # independent gates the cone detector already uses in this
+            # situation - holds even when there's no lane geometry at all
+            # to judge position against.
+            car_positioned = self.car_centered and self.car_close
 
         self.car_ready = (self.car_x is not None and car_positioned
                            and (not self.require_growth or self.car_growing))

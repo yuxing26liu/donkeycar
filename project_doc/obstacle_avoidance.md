@@ -754,6 +754,76 @@ debounce reset on a miss, the growth gate (both on and off), the
 `other_avoidance_active` deferral, and that the maneuver actually steers
 toward the other lane's center.
 
+## On-car feedback (2026-07-30): false trigger + frozen throttle from a misconfigured `CV_CONTROLLER_CLASS`
+
+First on-car observation of `CarAvoider`: `obstacle/car_detected` latched
+`True` ("CAR:True AVOIDING" on the CV overlay) with a bounding box drawn on
+a shadowed stairwell doorway in the background - nowhere near an actual
+oncoming car - and the car stopped moving and never recovered.
+
+Root cause, confirmed from the CV overlay text itself rather than guessed:
+the overlay read `STEERING:-3.1 / THROTTLE:0.15 / I YELLOW:18 /
+CONF:1020.00` - a format unique to `LineFollower.overlay_display()`
+(`donkeycar/parts/line_follower.py`; `STEERING:{:.1f}`, `I YELLOW:{:d}`,
+`CONF:{:.2f}`), not `LaneFollower`'s. `STEERING:-3.1` (outside `[-1, 1]`)
+confirms it independently: `LineFollower` never sets
+`pid_st.output_limits`, unlike `lane_follower.py`/`lane_follower3.py`,
+which both clamp to `(-1.0, 1.0)`. So `CV_CONTROLLER_CLASS` was actually
+`"LineFollower"` on this run, not `"LaneFollower"` as the mission requires
+(see CLAUDE.md and the "Known gotcha" section above).
+
+That single misconfiguration explains both symptoms:
+
+1. `LineFollower.run()` only returns 3 values (steering, throttle, image) -
+   it never publishes `lane/yellow_x`/`lane/white_x`/`lane/width_px` AT
+   ALL (not just intermittently, like a real sustained-loss case). Both
+   `ObstacleAvoider` and `CarAvoider` therefore always saw
+   `lane_geometry_available = False` and ran their lane-lost fallback path
+   for the entire drive.
+2. `CarAvoider`'s fallback at the time required only "a qualifying black
+   blob exists in the scan band at all" - no positional gate whatsoever.
+   `BLACK_HSV_THRESHOLD` (`V<=60`, matches any dark pixel regardless of
+   hue/saturation) matched the shadowed doorway immediately - a false
+   positive `ObstacleAvoider`'s equivalent fallback (centered AND close,
+   even with no lane geometry) would very likely have caught, since
+   "black" is common background clutter in a way the cone's orange/blue
+   isn't.
+3. Once latched, `self.avoiding` is permanent by design (mirrors the cone's
+   Decision 1.5) - but with `yellow_x` never available, `_avoid_step`'s
+   `_other_lane_center` could never compute a real target either. The
+   maneuver was permanently stuck in its own passive "lane lost" fallback:
+   steering decayed toward 0 and, once `avoid_lost_frames` exceeded
+   `MAX_LOST_FRAMES` (40 frames, ~2s at 20Hz), throttle ratcheted down to
+   0 and stayed there - directly explaining why the car stopped moving and
+   never recovered.
+
+Fixed in `CarAvoider` (`donkeycar/parts/car_avoider.py`), without touching
+`ObstacleAvoider`/`lane_follower.py`: the lane-lost fallback now requires
+`car_centered AND car_close` (`CAR_CENTER_MARGIN_PX`/`CAR_CLOSE_MIN_AREA_PX`,
+new config, mirroring `CONE_CENTER_MARGIN_PX`/`CONE_CLOSE_MIN_AREA_PX`
+exactly) instead of "any qualifying blob at all" - see `_is_centered`/
+`_is_close` and the updated class docstring's "Exception" paragraph.
+Covered by `test_no_lane_geometry_off_center_blob_does_not_trigger` and
+`test_no_lane_geometry_small_blob_does_not_trigger` in
+`test_car_avoider.py` (both reproduce the false-trigger shape directly:
+an off-center or too-small blob with no lane geometry available must NOT
+trigger).
+
+**Not fixed by this, and not fixable in `car_avoider.py` at all**: the
+actual misconfiguration. `CV_CONTROLLER_CLASS` must be checked and set to
+`"LaneFollower"` directly in the car's real `myconfig.py`
+(`/home/pi/mycar/myconfig.py` - outside this repo, per CLAUDE.md), along
+with the full `CV_CONTROLLER_OUTPUTS` list (see the "Known gotcha" section
+above) - `cfg_cv_control.py`'s own default is `CV_CONTROLLER_CLASS =
+"LineFollower"` (shared with the baseline template), so this must be an
+explicit override, not an assumption. Also worth noting: this specific
+test was indoors, near a stairwell with no painted lane lines at all - even
+with `CV_CONTROLLER_CLASS` fixed, `LaneFollower` would still never publish
+real lane geometry in that setting (there's no paint for it to detect), so
+`CarAvoider` needs to be verified on the actual outdoor track, not indoors,
+before its behavior with a correctly-configured `LaneFollower` can be
+trusted.
+
 ## Next steps
 
 1. ~~Detect the car's black wheels/front~~ **Done** - see above.
