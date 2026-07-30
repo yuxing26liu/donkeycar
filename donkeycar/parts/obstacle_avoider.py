@@ -802,23 +802,26 @@ class ObstacleAvoider:
         # camera still looking roughly down the lane to pick up the new
         # lane's white boundary before the car has already committed to a
         # hard turn.
-        rate_limited = False
         if self.avoid_steering_rate_limit > 0:
             delta = pid_steering - self.avoid_steering
             if abs(delta) > self.avoid_steering_rate_limit:
                 pid_steering = self.avoid_steering + math.copysign(
                     self.avoid_steering_rate_limit, delta)
-                rate_limited = True
         self.avoid_steering = pid_steering
 
-        if rate_limited or abs(other_center - self.avoid_target_pixel) > self.avoid_target_threshold:
+        if abs(other_center - self.avoid_target_pixel) > self.avoid_target_threshold:
             # turning hard toward the other lane - slow down, same rule
-            # LaneFollower uses for its own lane-keeping. Also slows down
-            # while the steering rate limiter is actively capping the turn
-            # (rate_limited True), even if the remaining pixel error is
-            # already under avoid_target_threshold - a big correction is
-            # still underway, just spread over more frames, and the car
-            # should stay slow for the whole stretch it's turning in.
+            # LaneFollower uses for its own lane-keeping. Deliberately NOT
+            # gated on rate_limited (dropped after on-car testing showed the
+            # maneuver crawling at throttle_min for its entire duration):
+            # avoid_steering_rate_limit keeps rate_limited True for most of
+            # the ramp-in by design (that's the whole point of pacing the
+            # turn), so using it as a second, independent throttle-down
+            # trigger left the car creeping the whole swerve instead of just
+            # its first few frames - widening the window for LaneFollower's
+            # own tracker to lose both lines and trigger its sustained-loss
+            # stop. The pixel-error check alone already captures "still
+            # meaningfully off-target, slow down."
             self.avoid_throttle = max(self.avoid_throttle - self.throttle_step, self.throttle_min)
         else:
             self.avoid_throttle = min(self.avoid_throttle + self.throttle_step, self.throttle_max)
