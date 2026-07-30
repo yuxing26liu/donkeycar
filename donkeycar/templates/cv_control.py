@@ -139,6 +139,8 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
                        'cone/bbox_h', 'cone/distance_mm', 'cone/distance_valid',
                        'cone/distance_source'],
               run_condition=cfg.CV_CONTROLLER_CONDITION)
+        logger.info(f"Cone avoidance wired in: OBSTACLE_AVOIDANCE_MODE={obstacle_avoidance_mode!r} "
+                    f"(only 'active' calls set_lane() or changes throttle)")
     elif obstacle_avoidance_mode != 'disabled':
         logger.warning(f"OBSTACLE_AVOIDANCE_MODE={obstacle_avoidance_mode!r} but CV_CONTROLLER_CLASS="
                         f"{cfg.CV_CONTROLLER_CLASS!r} (not LaneFollower) -- cone avoidance not wired in.")
