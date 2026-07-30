@@ -25,7 +25,11 @@ class _Cfg:
     ORANGE_HSV_THRESHOLD_LOW = (0, 90, 60)
     ORANGE_HSV_THRESHOLD_HIGH = (18, 255, 255)
     CONE_MIN_AREA_PX = 80
-    CONE_MAX_WIDTH_PX = 250
+    # effectively unbounded, matching cfg_cv_control.py's current default -
+    # see TestObstacleAvoiderCloseConeWidth for why a finite cap here
+    # (250, then 400) twice caused the car to drive straight into a real,
+    # close, centered cone
+    CONE_MAX_WIDTH_PX = 100000
     WHITE_RIGHT_OF_YELLOW = True
     LANE_SHIFT_MARGIN_PX = 10
     CONE_TRIGGER_FRAMES = 2
@@ -619,3 +623,39 @@ class TestObstacleAvoiderNoLaneGeometryFallback:
         assert avoider.lane_geometry_available is True
         assert avoider.cone_ready == (avoider.cone_in_our_lane and avoider.cone_centered
                                        and avoider.cone_close)
+
+
+class TestObstacleAvoiderCloseConeWidth:
+    '''
+    Added after tub_7_26-07-27: on-car testing showed the car driving
+    straight into a real, close, centered cone with no avoidance at all -
+    traced to CONE_MAX_WIDTH_PX (400 at the time) rejecting the cone's own
+    blob outright once it grew wider than the cap, which happens exactly
+    when the car is closest and avoidance matters most. This is the SAME
+    root cause as the tub_41_26-07-24 incident that raised the cap from
+    250 to 400 in the first place - that "comfortable margin" (400 vs. the
+    observed 295px) still wasn't enough, because a real close cone can
+    fill most of the frame width, not just ~70% of it. See the
+    CONE_MAX_WIDTH_PX comments in cfg_cv_control.py and obstacle_avoider.py.
+    '''
+
+    def test_frame_filling_centered_cone_still_detected(self):
+        avoider = ObstacleAvoider(_Cfg())
+        for fill_width in (300, 350, 400, 401, 416, IMAGE_W):
+            avoider2 = ObstacleAvoider(_Cfg())  # fresh instance per width
+            x0 = (IMAGE_W - fill_width) // 2
+            img = _make_frame([(x0, x0 + fill_width, 65, 85, ORANGE)])
+            _s, _t, _cv, detected = avoider2.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+            assert avoider2.cone_x is not None, f"cone blob rejected at width={fill_width}px"
+            assert avoider2.cone_close is True, f"not counted as close at width={fill_width}px"
+
+    def test_close_cone_still_triggers_avoidance(self):
+        # end-to-end: a cone filling nearly the whole frame width, held
+        # for CONE_TRIGGER_FRAMES, must actually latch avoidance - not
+        # just be detected in isolation
+        avoider = ObstacleAvoider(_Cfg())
+        img = _make_frame([(5, IMAGE_W - 5, 65, 85, ORANGE)])  # 416px wide, centered
+        for _ in range(2):
+            _s, _t, _cv, detected = avoider.run(img, YELLOW_X, WHITE_X, LANE_WIDTH_PX, 0.0, 0.2)
+        assert detected is True
+        assert avoider.avoiding is True

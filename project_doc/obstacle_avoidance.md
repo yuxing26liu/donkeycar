@@ -623,6 +623,40 @@ at the start of a drive, and separately, still needs the oncoming-car
 detector (see "Next steps" below) since that's a second, distinct source
 of the same "already lost the lane" problem.
 
+## On-car feedback (2026-07-29): drove straight into a close, centered cone - CONE_MAX_WIDTH_PX again
+
+User report: cone was detected fine at a distance, but "when it's in the
+center and super close then it went straight to the orange cone and didn't
+avoid it." Reproduced directly (not guessed): `detect_cone()` against a
+synthetic frame with a centered orange blob returns a real `x`/`area` up to
+400px wide, then `None`/`0` for every width from 401px up to a full
+426px-wide (`IMAGE_W`) frame-filling blob - `CONE_MAX_WIDTH_PX`'s shape
+filter (`_select_line_blob`) was rejecting the cone's own blob outright
+once it grew past the cap.
+
+This is the exact same root cause as the tub_41_26-07-24 incident already
+documented above, which raised the cap from 250 to 400 - and that fix
+wasn't wrong in kind, just not generous enough: a real cone's own blob
+legitimately grows to fill most or all of the frame width at close range
+(this camera's tub_7 footage showed genuinely edge-to-edge orange frames -
+see the tub_7 investigation above), not just the ~295px observed on
+tub_41. There is no width cap a real close cone can't eventually exceed,
+so "raise it again" would just set up a third occurrence at some larger
+distance-dependent width. Fixed by making `CONE_MAX_WIDTH_PX` effectively
+unbounded (100000) by default in both `cfg_cv_control.py` and
+`ObstacleAvoider.__init__`'s fallback - see the comments there for why a
+width cap doesn't transfer from the line-tracker shape filter it was
+ported from (a wide sunlit patch is false-positive risk for a *line*; a
+wide *orange* blob on this track is stronger cone evidence, not weaker).
+Kept as a config knob, not removed outright, in case some other
+track/marker needs one.
+
+Covered by `TestObstacleAvoiderCloseConeWidth` in
+`test_obstacle_avoider.py`: sweeps blob widths 300px through a full
+426px-wide frame-filling blob and asserts every one still detects and
+still latches `cone_detected`/`avoiding` end-to-end, not just passes the
+shape filter in isolation.
+
 ## Next steps
 
 1. Detect the car's black wheels/front (Decision 2, option A) the same way

@@ -638,19 +638,31 @@ BLUE_HSV_THRESHOLD_LOW = (95, 100, 60)
 BLUE_HSV_THRESHOLD_HIGH = (130, 255, 255)
 
 CONE_MIN_AREA_PX = 80     # smallest pixel area (in the scan slice) counted as the cone/marker
-# Widest pixel width (in the scan slice) counted as the cone/marker. Raised
-# from 250 after tub_41_26-07-24 (real on-car footage) showed a close,
-# centered cone's own orange blob repeatedly measured 278-295px wide and
-# got rejected outright by the old 250px cap - right when the cone was
-# closest and avoidance mattered most. Unlike a line tracker's width cap
-# (rejecting a wide sunlit patch of pavement pretending to be a paint
-# stripe), a cone is a real 3D object that legitimately fills much of the
-# frame up close, and orange is a strong, exclusive color match on this
-# track - a wide orange blob is stronger evidence of a real cone, not
-# weaker. 400 leaves comfortable margin above the observed 295px while
-# still well under IMAGE_W so a genuine full-frame anomaly (e.g. total
-# sensor blowout) is still rejected.
-CONE_MAX_WIDTH_PX = 400
+# Widest pixel width (in the scan slice) counted as the cone/marker.
+# Effectively unbounded (100000) as of tub_7_26-07-27 - this has now
+# caused the car to drive straight into a cone TWICE from the same root
+# cause, at two different cap values:
+#   - 250 (original): tub_41_26-07-24 showed a close, centered cone's
+#     blob repeatedly measured 278-295px wide and got rejected outright -
+#     right when the cone was closest and avoidance mattered most. Raised
+#     to 400 as a "comfortable margin" over the observed 295px.
+#   - 400: tub_7_26-07-27 showed that "comfortable margin" reasoning was
+#     itself the bug - a real close, centered cone can legitimately fill
+#     MOST of the frame width (measured 401-426px on this camera, i.e.
+#     right up to IMAGE_W), not just 278-295px. Confirmed directly:
+#     donkeycar/tests/test_obstacle_avoider.py's
+#     TestObstacleAvoiderCloseConeWidth reproduces frame-filling widths
+#     from 300 up to 426px and asserts every one still detects.
+# Unlike a line tracker's width cap (rejecting a wide sunlit patch of
+# pavement pretending to be a paint stripe), a cone is a real 3D object
+# that legitimately fills the ENTIRE frame width at close range, and
+# orange is a strong, exclusive color match on this track - a wide orange
+# blob is stronger evidence of a real cone, not weaker. There is no width
+# a genuine close cone can't reach, so there's no safe finite cap to set
+# here - this constant is kept only as a knob for a track that specifically
+# needs one (e.g. a different, less color-exclusive marker), not as a
+# default safety net.
+CONE_MAX_WIDTH_PX = 100000
 
 LANE_SHIFT_MARGIN_PX = 10  # margin added to our lane's pixel bounds when testing
                             # whether a detection falls inside it

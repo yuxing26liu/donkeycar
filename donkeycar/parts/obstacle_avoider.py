@@ -29,7 +29,7 @@ def _lane_bounds(yellow_x, white_x, lane_width_px, white_right_of_yellow, other_
     sign = 1.0 if white_right_of_yellow else -1.0
 
     if other_lane:
-        if yellow_x is None:
+        if yellow_x is None or lane_width_px is None:
             return None, None
         far_edge = yellow_x - sign * lane_width_px
         return tuple(sorted((yellow_x, far_edge)))
@@ -37,9 +37,13 @@ def _lane_bounds(yellow_x, white_x, lane_width_px, white_right_of_yellow, other_
     if yellow_x is not None and white_x is not None:
         return tuple(sorted((yellow_x, white_x)))
     if yellow_x is not None:
+        if lane_width_px is None:
+            return None, None
         edge = yellow_x + sign * lane_width_px
         return tuple(sorted((yellow_x, edge)))
     if white_x is not None:
+        if lane_width_px is None:
+            return None, None
         edge = white_x - sign * lane_width_px
         return tuple(sorted((white_x, edge)))
     return None, None
@@ -59,7 +63,7 @@ def _other_lane_center(yellow_x, lane_width_px, white_right_of_yellow):
     yellow_x isn't visible - see Decision 3 in project_doc/obstacle_avoidance.md:
     no reliable anchor means no maneuver steering this frame, not a guess.
     '''
-    if yellow_x is None:
+    if yellow_x is None or lane_width_px is None:
         return None
     sign = 1.0 if white_right_of_yellow else -1.0
     return yellow_x - sign * lane_width_px / 2.0
@@ -172,7 +176,19 @@ class ObstacleAvoider:
         self.orange_low = np.asarray(getattr(cfg, 'ORANGE_HSV_THRESHOLD_LOW', (0, 90, 60)))
         self.orange_high = np.asarray(getattr(cfg, 'ORANGE_HSV_THRESHOLD_HIGH', (18, 255, 255)))
         self.cone_min_area_px = getattr(cfg, 'CONE_MIN_AREA_PX', 80)
-        self.cone_max_width_px = getattr(cfg, 'CONE_MAX_WIDTH_PX', 250)
+        # Effectively unbounded by default - see the CONE_MAX_WIDTH_PX
+        # comment in cfg_cv_control.py for the two on-car incidents that
+        # got this raised twice (250 -> 400 after tub_41_26-07-24, then
+        # this default after tub_7_26-07-27 showed even 400 still rejects
+        # a real cone at the exact moment avoidance matters most: closer
+        # than ~(400/IMAGE_W) of the frame width away). A width cap makes
+        # sense for a LINE tracker (rejecting a wide sunlit patch of
+        # pavement pretending to be a paint stripe) but not for a real 3D
+        # cone, which legitimately fills the entire frame width at close
+        # range - unlike a painted line, "wider" is stronger evidence of a
+        # real cone, not weaker, so this only exists as a knob for a track
+        # that specifically needs one, not as a default safety net.
+        self.cone_max_width_px = getattr(cfg, 'CONE_MAX_WIDTH_PX', 100000)
 
         self.white_right_of_yellow = getattr(cfg, 'WHITE_RIGHT_OF_YELLOW', True)
         self.lane_margin_px = getattr(cfg, 'LANE_SHIFT_MARGIN_PX', 10)
