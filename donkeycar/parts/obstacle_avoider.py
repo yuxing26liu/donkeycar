@@ -329,29 +329,34 @@ class ObstacleAvoider:
                                                        getattr(cfg, 'REACQUIRE_AFTER_FRAMES', 15))
         self._avoid_last_yellow_x = None
         self._avoid_yellow_reject_frames = 0
-        # reuse LaneFollower's own CONTINUOUS turning/straight throttle law
-        # (see its "Confidence-aware speed policy" docstring point and
-        # throttle_turn_min/throttle_steer_scale in its __init__), not its
-        # OLD binary one - LaneFollower itself abandoned the binary law
-        # after tub_53_26-07-24 showed it pinned the car at THROTTLE_MIN
-        # 75%+ of the time. _avoid_step used to reuse that same old binary
-        # law (abs(other_center - avoid_target_pixel) > LANE_TARGET_THRESHOLD
-        # px), which is an even worse fit here than it was for LaneFollower:
-        # the avoid maneuver deliberately moves the car ~100+px off
-        # pixel-center by design, so that condition stayed true for nearly
-        # the entire swerve (and sometimes after, if other_center never
-        # quite settled within 10px) - on-car/screenshot testing showed the
-        # car crawling at THROTTLE_MIN through and after the whole
-        # maneuver. Ported to the continuous law below, driven by
-        # abs(self.avoid_steering) instead of raw pixel distance from
-        # center: steering magnitude reflects how hard the turn is RIGHT
-        # NOW and settles back toward 0 well before other_center ever
-        # reaches pixel-perfect center, so throttle recovers as soon as the
-        # turn itself eases off instead of waiting on exact centering.
+        # Continuous turning/straight throttle law (see _avoid_step) -
+        # replaced an old BINARY law (abs(other_center - avoid_target_pixel)
+        # > LANE_TARGET_THRESHOLD px) after on-car testing showed the car
+        # crawling at THROTTLE_MIN through and after the whole maneuver: the
+        # swerve deliberately moves the car ~100+px off pixel-center by
+        # design, so that 10px-threshold condition stayed true almost the
+        # entire time. First replacement attempt drove the continuous law
+        # off abs(self.avoid_steering) (mirroring LaneFollower's own
+        # confidence-aware throttle policy, which uses abs(self.steering))
+        # - that overcorrected the other way: the car sped up and left the
+        # track. Root cause: LaneFollower's self.steering is a direct,
+        # undamped PID output, but self.avoid_steering is deliberately
+        # rate-limited (AVOID_STEERING_RATE_LIMIT, see below) to pace the
+        # turn-in - for roughly the first dozen-plus frames of the maneuver
+        # the car is already far off-target (large real error) but avoid_steering
+        # hasn't been allowed to ramp up yet, so that law read "barely
+        # turning" and let throttle climb toward max before the turn had
+        # actually developed - the car covered too much ground off-line
+        # before steering caught up enough to slow it back down. Fixed by
+        # scaling off the pixel error to the target instead (large from
+        # frame 1 of the maneuver, not lagged by the steering-rate limiter)
+        # - the same signal the original binary law used, just continuous
+        # instead of a hard cutoff. Reuses avoid_error_saturation_px as the
+        # scale (no new tunable needed): already this system's own
+        # "how big a lateral error counts as large" calibration, used for
+        # the exact same error value's soft-saturation just above.
         self.avoid_throttle_turn_min = getattr(cfg, 'AVOID_THROTTLE_TURN_MIN',
                                                 getattr(cfg, 'LANE_THROTTLE_TURN_MIN', None))
-        self.avoid_throttle_steer_scale = getattr(cfg, 'AVOID_THROTTLE_STEER_SCALE',
-                                                   getattr(cfg, 'LANE_THROTTLE_STEER_SCALE', 0.6))
         self.throttle_step = getattr(cfg, 'THROTTLE_STEP', 0.05)
         self.throttle_min = getattr(cfg, 'THROTTLE_MIN', 0.1)
         self.throttle_max = getattr(cfg, 'THROTTLE_MAX', 0.3)
@@ -934,13 +939,15 @@ class ObstacleAvoider:
                     self.avoid_steering_rate_limit, delta)
         self.avoid_steering = pid_steering
 
-        # Continuous throttle law (see avoid_throttle_turn_min/
-        # avoid_throttle_steer_scale in __init__ for why this replaced the
-        # old binary pixel-distance check): scales smoothly from
-        # throttle_max (steering centered) down to avoid_throttle_turn_min
-        # (|avoid_steering| at avoid_throttle_steer_scale or beyond),
-        # mirroring LaneFollower's own confidence-aware speed policy.
-        turn_factor = min(abs(self.avoid_steering) / self.avoid_throttle_steer_scale, 1.0)
+        # Continuous throttle law (see avoid_throttle_turn_min in __init__
+        # for the two prior throttle laws this replaced and why): scales
+        # smoothly from throttle_max (on target) down to
+        # avoid_throttle_turn_min (error at avoid_error_saturation_px or
+        # beyond), using the SAME pixel error already computed above for
+        # the PID (not avoid_steering, which lags behind it - see
+        # __init__) - responsive from frame 1 of the maneuver, not just
+        # once the turn has developed.
+        turn_factor = min(abs(error_px) / self.avoid_error_saturation_px, 1.0)
         throttle_target = (self.throttle_max
                             - (self.throttle_max - self.avoid_throttle_turn_min) * turn_factor)
         if self.avoid_throttle < throttle_target:
