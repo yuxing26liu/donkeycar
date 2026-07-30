@@ -155,23 +155,15 @@ class ObstacleAvoider:
     the dashed yellow line, applied here to noise rejection instead of
     dash-gap tolerance.
 
-    Exception: self.lane_geometry_available (and therefore whether
-    cone_in_our_lane gets required at all) is False whenever either (a)
-    LaneFollower publishes NO lane geometry this frame (yellow_x and
-    white_x both None), in which case cone_in_our_lane is structurally
-    False (see _x_in_bounds) and can never be satisfied, so requiring it
-    would mean a car that has already lost the lane can never trigger
-    avoidance no matter how obviously a cone sits dead ahead - added after
-    tub_7_26-07-27: the car drove straight into a cone with no swerve while
-    already off the marked lane from an earlier incident; or (b)
-    lane_width_px has never yet been calibrated by a real two-line
-    measurement (self._lane_width_calibrated still False - see __init__),
-    in which case _lane_bounds's single-anchor extrapolation is only a
-    guess built on an untouched default width, not a real measurement -
-    added after on-car testing showed a real, dead-center, close cone
-    rejected as "not in our lane" purely because lane_width_px was still
-    sitting at its raw LANE_WIDTH_PX default. In both cases cone_ready
-    falls back to centered AND close alone - see run().
+    Exception: when LaneFollower publishes NO lane geometry at all this
+    frame (yellow_x and white_x both None - self.lane_geometry_available
+    False), cone_in_our_lane is structurally False (see _x_in_bounds) and
+    can never be satisfied, so requiring it would mean a car that has
+    already lost the lane can never trigger avoidance no matter how
+    obviously a cone sits dead ahead. Added after tub_7_26-07-27: the car
+    drove straight into a cone with no swerve while already off the marked
+    lane from an earlier incident. In that specific case cone_ready falls
+    back to centered AND close alone - see run().
     '''
 
     def __init__(self, cfg):
@@ -329,39 +321,13 @@ class ObstacleAvoider:
                                                        getattr(cfg, 'REACQUIRE_AFTER_FRAMES', 15))
         self._avoid_last_yellow_x = None
         self._avoid_yellow_reject_frames = 0
-        # Continuous turning/straight throttle law (see _avoid_step) -
-        # replaced an old BINARY law (abs(other_center - avoid_target_pixel)
-        # > LANE_TARGET_THRESHOLD px) after on-car testing showed the car
-        # crawling at THROTTLE_MIN through and after the whole maneuver: the
-        # swerve deliberately moves the car ~100+px off pixel-center by
-        # design, so that 10px-threshold condition stayed true almost the
-        # entire time. First replacement attempt drove the continuous law
-        # off abs(self.avoid_steering) (mirroring LaneFollower's own
-        # confidence-aware throttle policy, which uses abs(self.steering))
-        # - that overcorrected the other way: the car sped up and left the
-        # track. Root cause: LaneFollower's self.steering is a direct,
-        # undamped PID output, but self.avoid_steering is deliberately
-        # rate-limited (AVOID_STEERING_RATE_LIMIT, see below) to pace the
-        # turn-in - for roughly the first dozen-plus frames of the maneuver
-        # the car is already far off-target (large real error) but avoid_steering
-        # hasn't been allowed to ramp up yet, so that law read "barely
-        # turning" and let throttle climb toward max before the turn had
-        # actually developed - the car covered too much ground off-line
-        # before steering caught up enough to slow it back down. Fixed by
-        # scaling off the pixel error to the target instead (large from
-        # frame 1 of the maneuver, not lagged by the steering-rate limiter)
-        # - the same signal the original binary law used, just continuous
-        # instead of a hard cutoff. Reuses avoid_error_saturation_px as the
-        # scale (no new tunable needed): already this system's own
-        # "how big a lateral error counts as large" calibration, used for
-        # the exact same error value's soft-saturation just above.
-        self.avoid_throttle_turn_min = getattr(cfg, 'AVOID_THROTTLE_TURN_MIN',
-                                                getattr(cfg, 'LANE_THROTTLE_TURN_MIN', None))
+        # reuse LaneFollower's own turning/straight throttle scheme
+        # (cfg.LANE_TARGET_THRESHOLD/THROTTLE_STEP/THROTTLE_MIN/THROTTLE_MAX)
+        # rather than inventing new tuning knobs - see _avoid_step
+        self.avoid_target_threshold = getattr(cfg, 'LANE_TARGET_THRESHOLD', 10)
         self.throttle_step = getattr(cfg, 'THROTTLE_STEP', 0.05)
         self.throttle_min = getattr(cfg, 'THROTTLE_MIN', 0.1)
         self.throttle_max = getattr(cfg, 'THROTTLE_MAX', 0.3)
-        if self.avoid_throttle_turn_min is None:
-            self.avoid_throttle_turn_min = self.throttle_min
         # reuse LaneFollower's own sustained-loss handling constants for the
         # same passive fallback (Decision 3) applied to the avoid maneuver
         self.max_lost_frames = getattr(cfg, 'MAX_LOST_FRAMES', 40)
@@ -384,35 +350,12 @@ class ObstacleAvoider:
         self.cone_in_our_lane = False   # raw in-our-lane test this frame (lane geometry), pre-debounce
         self.cone_centered = False      # raw centered-in-frame test this frame (see __init__)
         self.cone_close = False         # raw close-enough test this frame (see __init__)
-        self.lane_geometry_available = False  # yellow_x or white_x published this frame AND
-                                         # lane_width_px has been calibrated at least once - see run()
+        self.lane_geometry_available = False  # yellow_x or white_x published this frame - see run()
         self.cone_ready = False         # normally in_our_lane AND centered AND close; centered AND
                                          # close alone when lane_geometry_available is False - see run()
         self.cone_detected = False      # debounced: True once cone_ready has held
                                          # for cone_trigger_frames consecutive frames
         self._pending_frames = 0
-        # True once LaneFollower has published a REAL two-line lane_width_px
-        # measurement at least once (yellow_x and white_x both present in
-        # the same frame) - see the lane_geometry_available assignment in
-        # run() for why this gates it. lane_width_px is published every
-        # frame regardless (LaneFollower.run() always returns
-        # self.lane_width_px), starting from and sitting at its untouched
-        # LANE_WIDTH_PX default (150) until the first real dual-line
-        # measurement ever updates it - there's no way to distinguish "a
-        # real measured width that happens to be 150" from "never measured,
-        # still the raw default" just by looking at the number, so this
-        # tracks it explicitly instead. Added after on-car testing showed a
-        # real, dead-center, close cone (white_x present, yellow_x None)
-        # rejected as "not in our lane": _lane_bounds extrapolated the
-        # missing yellow edge from white_x using the untouched 150px
-        # default (the real lane is closer to 264-273px per earlier
-        # avoidance testing on this same track - see AVOID_YELLOW_MAX_JUMP_PX's
-        # comment above), putting the computed lane bounds ~27px short of
-        # where the cone actually was. Never reset once True - once a real
-        # measurement has been seen, there's no reason to stop trusting
-        # single-anchor extrapolations from it, same as LaneFollower itself
-        # never resets its own width estimate mid-drive.
-        self._lane_width_calibrated = False
 
         # diagnostic-logging state only (see _log_raw_detection /
         # _warn_if_lane_geometry_missing) - not used for detection itself
@@ -751,17 +694,8 @@ class ObstacleAvoider:
         # see _smoothed_lane_width
         lane_width_px = self._smoothed_lane_width(lane_width_px)
 
-        if yellow_x is not None and white_x is not None:
-            self._lane_width_calibrated = True
-
         our_lane = _lane_bounds(yellow_x, white_x, lane_width_px, self.white_right_of_yellow, other_lane=False)
-        # Require a real dual-line calibration, not just "our_lane computed
-        # at all" - _lane_bounds happily extrapolates a lane from a SINGLE
-        # anchor + lane_width_px (see its docstring), which is only as good
-        # as that width estimate. See _lane_width_calibrated in __init__ for
-        # the on-car incident where trusting an uncalibrated (still-default)
-        # width rejected a real, dead-ahead cone.
-        self.lane_geometry_available = our_lane[0] is not None and self._lane_width_calibrated
+        self.lane_geometry_available = our_lane[0] is not None
 
         self.cone_x, self.cone_area, self.cone_color, blue_mask, orange_mask = self.detect_cone(band_hsv)
         self.cone_in_our_lane = self._x_in_bounds(self.cone_x, our_lane)
@@ -939,21 +873,22 @@ class ObstacleAvoider:
                     self.avoid_steering_rate_limit, delta)
         self.avoid_steering = pid_steering
 
-        # Continuous throttle law (see avoid_throttle_turn_min in __init__
-        # for the two prior throttle laws this replaced and why): scales
-        # smoothly from throttle_max (on target) down to
-        # avoid_throttle_turn_min (error at avoid_error_saturation_px or
-        # beyond), using the SAME pixel error already computed above for
-        # the PID (not avoid_steering, which lags behind it - see
-        # __init__) - responsive from frame 1 of the maneuver, not just
-        # once the turn has developed.
-        turn_factor = min(abs(error_px) / self.avoid_error_saturation_px, 1.0)
-        throttle_target = (self.throttle_max
-                            - (self.throttle_max - self.avoid_throttle_turn_min) * turn_factor)
-        if self.avoid_throttle < throttle_target:
-            self.avoid_throttle = min(self.avoid_throttle + self.throttle_step, throttle_target)
+        if abs(other_center - self.avoid_target_pixel) > self.avoid_target_threshold:
+            # turning hard toward the other lane - slow down, same rule
+            # LaneFollower uses for its own lane-keeping. Deliberately NOT
+            # gated on rate_limited (dropped after on-car testing showed the
+            # maneuver crawling at throttle_min for its entire duration):
+            # avoid_steering_rate_limit keeps rate_limited True for most of
+            # the ramp-in by design (that's the whole point of pacing the
+            # turn), so using it as a second, independent throttle-down
+            # trigger left the car creeping the whole swerve instead of just
+            # its first few frames - widening the window for LaneFollower's
+            # own tracker to lose both lines and trigger its sustained-loss
+            # stop. The pixel-error check alone already captures "still
+            # meaningfully off-target, slow down."
+            self.avoid_throttle = max(self.avoid_throttle - self.throttle_step, self.throttle_min)
         else:
-            self.avoid_throttle = max(self.avoid_throttle - self.throttle_step, throttle_target)
+            self.avoid_throttle = min(self.avoid_throttle + self.throttle_step, self.throttle_max)
 
         return self.avoid_steering, self.avoid_throttle
 
