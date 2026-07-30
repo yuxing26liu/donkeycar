@@ -31,3 +31,6 @@ htmlcov/
 # PyTorch
 lightning_logs
 tb_logs
+
+# scripts/replay_cone_planner.py output (regeneratable analysis reports)
+_replay_reports/
