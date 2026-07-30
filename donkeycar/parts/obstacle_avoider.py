@@ -103,7 +103,12 @@ class ObstacleAvoider:
     in whichever lane it ends up in for the rest of the drive - simpler
     and lower-risk than a return maneuver, and this track only has the one
     cone to clear. See _avoid_step for the passive fallback if lane
-    geometry is lost mid-maneuver.
+    geometry is lost mid-maneuver, and avoid_yellow_max_jump_px (__init__)
+    for the plausibility gate that routes an implausible yellow_x reading
+    into that same fallback instead of letting the maneuver chase it -
+    added after testing showed the car clear a cone, swerve into the other
+    lane, then keep drifting past it off the pavement entirely instead of
+    settling there.
 
     Not yet implemented (see project_doc/obstacle_avoidance.md "Next steps"):
     detecting the oncoming car (planned: color-key its black wheels/front,
@@ -282,6 +287,40 @@ class ObstacleAvoider:
         # roughly down the lane (rather than already committed to a hard
         # turn) while the new white line comes into the scan band. 0 disables.
         self.avoid_steering_rate_limit = getattr(cfg, 'AVOID_STEERING_RATE_LIMIT', 0.04)
+        # Plausibility gate on yellow_x itself, checked BEFORE it ever reaches
+        # _other_lane_center - added after on-car/screenshot testing showed
+        # the car clear a cone, swerve into the other lane, then drift off
+        # the pavement entirely rather than settling there. Root cause:
+        # other_center is a straight linear function of yellow_x
+        # (yellow_x - lane_width_px/2), so a single bad yellow_x is a bad
+        # target with nothing else in _avoid_step to catch it -
+        # avoid_position_rate_limit_px/avoid_steering_rate_limit above only
+        # slow down how fast a target is chased, they never ask whether it's
+        # real, so a *sustained* bad reading still gets walked to eventually
+        # (e.g. ~20 frames * AVOID_STEERING_RATE_LIMIT 0.04 = -0.80, matching
+        # the full-lock steering seen right before the car left the track).
+        # The observed YELLOW_X readings jumped ~280px within a handful of
+        # frames - not a real dashed line moving, almost certainly
+        # LaneFollower's own yellow tracker re-acquiring onto background
+        # clutter (dirt/gravel/plants) once the car had already started
+        # drifting toward the pavement's edge mid-maneuver. LaneFollower's
+        # OWN tracker already guards against exactly this with
+        # MAX_JUMP_PIXELS, but that guard is internal to its tracker and
+        # doesn't help here since ObstacleAvoider consumes yellow_x
+        # downstream - per CLAUDE.md, lane_follower.py itself stays
+        # untouched, so this mirrors that same jump-gate/reacquire pattern
+        # here instead (see _avoid_step): a jump bigger than a real line can
+        # make in one frame is treated as a miss (routes into the existing
+        # other_center-is-None passive hold/decay fallback below) rather
+        # than a real position to chase, until either it stops jumping or
+        # avoid_yellow_reacquire_frames consecutive rejections pass and it's
+        # accepted as the new reality (mirrors _LineTracker.reacquire_after_frames).
+        self.avoid_yellow_max_jump_px = getattr(cfg, 'AVOID_YELLOW_MAX_JUMP_PX',
+                                                 getattr(cfg, 'MAX_JUMP_PIXELS', 40))
+        self.avoid_yellow_reacquire_frames = getattr(cfg, 'AVOID_YELLOW_REACQUIRE_FRAMES',
+                                                       getattr(cfg, 'REACQUIRE_AFTER_FRAMES', 15))
+        self._avoid_last_yellow_x = None
+        self._avoid_yellow_reject_frames = 0
         # reuse LaneFollower's own turning/straight throttle scheme
         # (cfg.LANE_TARGET_THRESHOLD/THROTTLE_STEP/THROTTLE_MIN/THROTTLE_MAX)
         # rather than inventing new tuning knobs - see _avoid_step
@@ -750,6 +789,21 @@ class ObstacleAvoider:
         if self.avoid_throttle is None:
             self.avoid_throttle = throttle
 
+        # Reject an implausible yellow_x jump before it can become a bad
+        # steering target - see avoid_yellow_max_jump_px in __init__.
+        if yellow_x is not None and self._avoid_last_yellow_x is not None:
+            jump = abs(yellow_x - self._avoid_last_yellow_x)
+            if (jump > self.avoid_yellow_max_jump_px
+                    and self._avoid_yellow_reject_frames < self.avoid_yellow_reacquire_frames):
+                self._avoid_yellow_reject_frames += 1
+                yellow_x = None  # treated as a miss this frame, same as a real loss
+            else:
+                self._avoid_yellow_reject_frames = 0
+                self._avoid_last_yellow_x = yellow_x
+        elif yellow_x is not None:
+            self._avoid_last_yellow_x = yellow_x
+            self._avoid_yellow_reject_frames = 0
+
         other_center = _other_lane_center(yellow_x, lane_width_px, self.white_right_of_yellow)
 
         if other_center is None:
@@ -766,6 +820,16 @@ class ObstacleAvoider:
                 # stale position (mirrors LaneFollower's own reset at the
                 # same threshold, see its run())
                 self._avoid_last_position = None
+                # Same reasoning applies to the yellow-jump anchor: without
+                # this, a genuine sustained loss (yellow_x really None, not
+                # a rejected jump) leaves _avoid_last_yellow_x stale, so the
+                # first legitimate reading once the car/world has moved on
+                # gets misread as an implausible jump and rejected too -
+                # adding needless lag exactly when the maneuver is trying to
+                # recover. Clearing it here lets that first post-loss
+                # reading snap fresh instead, same as the position anchor.
+                self._avoid_last_yellow_x = None
+                self._avoid_yellow_reject_frames = 0
             if self.avoid_lost_frames > self.max_lost_frames:
                 self.avoid_throttle = max(self.avoid_throttle - self.throttle_step, 0.0)
             return self.avoid_steering, self.avoid_throttle
