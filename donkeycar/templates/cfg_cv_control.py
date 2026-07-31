@@ -583,9 +583,18 @@ CONE_DEPTH_MIN_VALID_PX = 20
 CONE_DETECT_CONFIRM_FRAMES = 3
 CONE_CLEAR_CONFIRM_FRAMES = 5
 CONE_LANE_ACQUIRE_CONFIRM_FRAMES = 6
+# RAISED 2026-07-30 after cone_test2 (real active-mode approach, valid
+# depth throughout): commit=1200mm didn't fire until the cone was
+# already at 1143mm/frame-filling, directly matching the observed "turns
+# way too late"/"doesn't slow down" (throttle scaling starts at
+# PREPARE_SLOW, so a late commit is a late slowdown too) - and by the
+# time the switch started, the cone had grown large enough (bbox_h hit
+# 240 = full frame height) to occlude LaneFollower's own scan rows mid-
+# maneuver. Measured real closing rate: ~440mm/s - commit=2500 gives
+# ~5s of buffer instead of ~2s. See obstacle_planner.py's __init__.
 CONE_WATCH_DISTANCE_MM = 3000
-CONE_COMMIT_DISTANCE_MM = 1200
-CONE_EMERGENCY_DISTANCE_MM = 400
+CONE_COMMIT_DISTANCE_MM = 2500
+CONE_EMERGENCY_DISTANCE_MM = 700
 CONE_WATCH_BBOX_HEIGHT_PX = 45
 CONE_COMMIT_BBOX_HEIGHT_PX = 90
 CONE_EMERGENCY_BBOX_HEIGHT_PX = 170
@@ -634,7 +643,7 @@ YELLOW_OFFSET_PLAUSIBLE_PX = 200  # generous sanity bound, not a "must already b
 # reproduced in later tubs, so this is general hardening, not a
 # root-caused fix).
 CONE_EMERGENCY_CONFIRM_FRAMES = 2
-CONE_CRITICAL_DISTANCE_MM = 200
+CONE_CRITICAL_DISTANCE_MM = 350        # raised 2026-07-30 in proportion to the commit-distance increase above
 CONE_CRITICAL_BBOX_HEIGHT_PX = 210
 
 PLANNER_PREPARE_MIN_FRAMES = 4

@@ -78,11 +78,30 @@ class ObstaclePlanner:
         self.clear_confirm_frames = getattr(cfg, 'CONE_CLEAR_CONFIRM_FRAMES', 5)
         self.lane_acquire_confirm_frames = getattr(cfg, 'CONE_LANE_ACQUIRE_CONFIRM_FRAMES', 6)
 
-        # mm thresholds: architecture-level starting points, NOT verified
-        # against real depth+approach data (see module docstring).
+        # mm thresholds. RAISED 2026-07-30 after cone_test2 (a real active-
+        # mode approach with valid depth throughout): commit=1200mm didn't
+        # trigger PREPARE_SLOW/the switch until the cone was already at
+        # 1143mm and bbox_h=186 (frame-filling) - directly matching the
+        # user's own observation that it "turns way too late" and "doesn't
+        # slow down" (throttle scaling only starts once PREPARE_SLOW
+        # begins, so a late commit means a late slowdown too, by
+        # construction). Worse, by the time the switch actually started
+        # the cone kept growing large enough (bbox_h hit 240 = full frame
+        # height) to physically occlude LaneFollower's own scan rows mid-
+        # maneuver, losing both lane lines and triggering its unrelated
+        # full-loss decay-to-stop instead of completing the dodge.
+        # Measured real closing rate in that approach: ~440mm/s (4000mm ->
+        # 900mm over ~140 frames at 20Hz) - commit=2500mm (was 1200) gives
+        # roughly 5s of buffer instead of ~2s, well before the cone is
+        # large enough to occlude anything. Watch is unchanged (already
+        # triggered with plenty of lead at 3000mm); emergency/critical
+        # raised proportionally for consistent margin below the new
+        # commit distance. Still only checked against two real approaches
+        # (cone_approach_right2, cone_test2) - not yet confirmed across
+        # different speeds.
         self.watch_distance_mm = getattr(cfg, 'CONE_WATCH_DISTANCE_MM', 3000)
-        self.commit_distance_mm = getattr(cfg, 'CONE_COMMIT_DISTANCE_MM', 1200)
-        self.emergency_distance_mm = getattr(cfg, 'CONE_EMERGENCY_DISTANCE_MM', 400)
+        self.commit_distance_mm = getattr(cfg, 'CONE_COMMIT_DISTANCE_MM', 2500)
+        self.emergency_distance_mm = getattr(cfg, 'CONE_EMERGENCY_DISTANCE_MM', 700)
         # Emergency requires this many CONSECUTIVE qualifying frames before
         # triggering SAFE_STOP, UNLESS distance/size is at or past the
         # tighter "critical" threshold below, which still triggers
@@ -92,7 +111,7 @@ class ObstaclePlanner:
         # cone_negative2, so this is a general protective measure rather
         # than a fix for a root-caused bug.
         self.emergency_confirm_frames = getattr(cfg, 'CONE_EMERGENCY_CONFIRM_FRAMES', 2)
-        self.critical_distance_mm = getattr(cfg, 'CONE_CRITICAL_DISTANCE_MM', 200)
+        self.critical_distance_mm = getattr(cfg, 'CONE_CRITICAL_DISTANCE_MM', 350)
         self.critical_bbox_height_px = getattr(cfg, 'CONE_CRITICAL_BBOX_HEIGHT_PX', 210)
 
         # bbox-height (px) fallback thresholds. Checked directly against
