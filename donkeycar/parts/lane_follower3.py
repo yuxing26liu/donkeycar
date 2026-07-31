@@ -1033,23 +1033,40 @@ class LaneFollower:
 
         On an actual switch, resets only what a lane change genuinely
         invalidates:
-        - Both trackers' continuity anchors (evict()): the previous lane's
-          solid edge is now on the WRONG side of frame from the tracker's
-          last locked position, so preferred_x continuity would actively
-          fight the switch, biasing blob selection back toward the old
-          edge instead of letting the new one latch cleanly. evict() forces
-          the same cold-start reacquire path already used for the
-          boundary-identity-swap recovery this class does elsewhere.
+        - ONLY the white tracker's continuity anchor (evict()): the
+          previous lane's solid edge is now on the WRONG side of frame
+          from white's last locked position, so its preferred_x
+          continuity would actively fight the switch. evict() forces the
+          same cold-start reacquire path already used for the boundary-
+          identity-swap recovery this class does elsewhere.
+          CRITICALLY, yellow is NOT evicted (fixed 2026-07-30 after a
+          real on-car active-mode test, cone_test1: evicting yellow here
+          too made it go None immediately after set_lane() and never
+          recover for the rest of the drive, permanently stuck in
+          SWITCH_TO_NEIGHBOR_LANE). Yellow is the dashed centerline
+          SHARED by both lanes - its physical position does not change
+          when the car switches which side it drives on, only the
+          SIGN/interpretation of which side is "ours" does. There is no
+          reason for its continuity to be invalidated, and evicting it
+          anyway forced an unnecessary, risky cold-start re-detection at
+          exactly the moment the whole maneuver depends on it (yellow is
+          now the sole acquisition anchor - see obstacle_planner.py's
+          _lane_acquired).
         - Per-row width/offset EMAs: learned for the previous lane's
           geometry as seen from THIS car's camera mount; seeded from the
           last known width (both lanes share the same paint gauge) rather
           than the raw config default, since that's the better prior.
-        - The rate-limited combined position (_last_position) and the
-          last-known-x telemetry (last_yellow_x/last_white_x): reset to
-          None so the 25px/frame position rate limiter doesn't try to slew
-          across an entire lane width - this reuses the same "reset to
-          None after sustained loss" path run() already takes for full
-          reacquisition, rather than a new code path.
+        - The rate-limited combined position (_last_position) and
+          white's last-known-x telemetry (last_white_x): reset to None so
+          the 25px/frame position rate limiter doesn't try to slew across
+          an entire lane width - this reuses the same "reset to None
+          after sustained loss" path run() already takes for full
+          reacquisition, rather than a new code path. last_yellow_x is
+          deliberately NOT reset for the same reason yellow isn't evicted
+          - its tracker keeps running uninterrupted, so the next run()
+          call naturally refreshes it from a still-valid, continuously-
+          tracked position; zeroing it here would falsely report a loss
+          that never happened.
         Explicitly NOT reset: the PID's own internal state (its output is
         recomputed against the new target next frame - the same size of
         correction any lane reacquisition already produces), current
@@ -1063,14 +1080,11 @@ class LaneFollower:
         if new_white_right_of_yellow == self.white_right_of_yellow:
             return
         self.white_right_of_yellow = new_white_right_of_yellow
-        for tracker in self.yellow_trackers:
-            tracker.evict()
         for tracker in self.white_trackers:
             tracker.evict()
         self.row_lane_width_px = [float(self.lane_width_px) for _ in self.scan_rows]
         self.row_center_offset = [0.0 for _ in self.scan_rows]
         self._last_position = None
-        self.last_yellow_x = None
         self.last_white_x = None
         self.lost_frames = 0
 

@@ -74,14 +74,21 @@ def test_set_lane_switches_and_resets_invalidated_state():
 
     assert lf.current_lane == 'left'
     assert lf.white_right_of_yellow is False
-    for tracker in lf.yellow_trackers + lf.white_trackers:
+    # ONLY white is evicted -- yellow is the shared centerline whose
+    # physical position doesn't change on a switch, so its continuity
+    # must survive (see set_lane()'s docstring / cone_test1 finding:
+    # evicting yellow too made it go None and never recover live on-car).
+    for tracker in lf.white_trackers:
         assert tracker.tracked_position is None
         assert tracker.smoothed_position is None
+    for tracker in lf.yellow_trackers:
+        assert tracker.tracked_position == 123.0
+        assert tracker.smoothed_position == 123.0
     # seeded from the last known width, not corrupted/misshapen
     assert lf.row_lane_width_px == [222.0 for _ in lf.scan_rows]
     assert lf.row_center_offset == [0.0 for _ in lf.scan_rows]
     assert lf._last_position is None
-    assert lf.last_yellow_x is None
+    assert lf.last_yellow_x == 140.0, "yellow's telemetry must NOT be reset -- its tracker is still valid"
     assert lf.last_white_x is None
     assert lf.lost_frames == 0
 
@@ -129,3 +136,25 @@ def test_run_survives_a_lane_switch_mid_drive():
     steering, throttle, out_img, yellow_x, white_x, width_px = result
     assert -1.0 <= steering <= 1.0
     assert out_img.shape == img.shape
+
+
+def test_yellow_tracker_continuity_survives_a_switch():
+    """The real regression found on-car (cone_test1, 2026-07-30):
+    set_lane() used to evict the yellow tracker too, which made
+    lane/yellow_x go None immediately after the switch and never recover
+    for the rest of that drive - permanently stuck in
+    SWITCH_TO_NEIGHBOR_LANE since yellow is the planner's sole
+    acquisition anchor. Yellow's tracker must keep its lock across a
+    switch since the physical line doesn't move."""
+    lf = make_follower(WHITE_RIGHT_OF_YELLOW=True)
+    yellow_tracker = lf.yellow_trackers[0]
+    yellow_tracker.tracked_position = 150.0
+    yellow_tracker.smoothed_position = 150.0
+    yellow_tracker.lost_frames = 0
+    yellow_tracker.just_reacquired = False
+
+    lf.set_lane('left')
+
+    assert yellow_tracker.tracked_position == 150.0
+    assert yellow_tracker.smoothed_position == 150.0
+    assert yellow_tracker.lost_frames == 0, "eviction would have left this untouched too, but confirm no reset happened"
