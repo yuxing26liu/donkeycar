@@ -613,6 +613,20 @@ CORRIDOR_WIDTH_MAX_PX = 340
 # throughout their commit-relevant windows.
 CONE_REQUIRE_VALID_DEPTH_TO_SWITCH = True
 
+# Yellow-anchor lane acquisition (see ObstaclePlanner._lane_acquired) -
+# replaces a former both-lines-visible requirement that real on-car
+# frames (tub_122/124_26-07-30) showed was unmeetable for a right-to-
+# left switch on this track (the far white edge is never in the
+# camera's FOV from the right lane, not a proximity/occlusion
+# artifact). Yellow (the line shared by both lanes) is the anchor
+# instead; freshness comes from LaneFollower's own per-tracker miss
+# counter (read directly off the tracker object by pilot_arbiter.py),
+# not from detecting repeated float values. White still improves the
+# estimate whenever both lines are actually visible; its absence no
+# longer blocks acquisition.
+YELLOW_FRESHNESS_MAX_FRAMES = 4    # matches LaneFollower's own LINE_COAST_FRAMES default
+YELLOW_OFFSET_PLAUSIBLE_PX = 200  # generous sanity bound, not a "must already be centered" requirement
+
 # Emergency requires this many consecutive qualifying frames UNLESS
 # distance/size is past the tighter "critical" threshold, which still
 # triggers instantly - protective measure added after avoid_cone's

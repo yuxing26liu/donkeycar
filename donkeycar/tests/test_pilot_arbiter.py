@@ -103,21 +103,27 @@ def test_shadow_mode_never_calls_set_lane_or_changes_throttle():
 
 def test_active_mode_eventually_calls_set_lane_and_scales_throttle():
     """This synthetic frame only paints ONE white-colored patch (on the
-    right, for the right lane) - it can't simulate a genuine post-switch
-    reacquisition of a real left lane (there's no second edge on the
-    correct side to find), so this test's scope is deliberately just
+    right, for the right lane); with the yellow-anchor acquisition fix
+    the planner now completes the full cycle quickly and repeats it
+    indefinitely against this same static frame - so this test checks
     'did active mode dispatch a real set_lane() call and scale
-    throttle', not 'did it complete the full maneuver' - that full-cycle
-    behavior is what the real tub replay (scripts/replay_cone_planner.py)
-    validates against actual recorded lane geometry."""
+    throttle at some point', not the state at one arbitrarily-chosen
+    tick count (which depends on cycle phase). Full-maneuver validation
+    against real recorded lane geometry is scripts/replay_cone_planner.py."""
     lf, arbiter = make_stack('active')
+    frame = cone_frame()
     starting_lane = lf.current_lane
-    result = run_ticks(lf, arbiter, 40)
-    state = result[2]
-    assert lf.current_lane != starting_lane, \
-        f"active mode should have switched lanes by now (planner state={state})"
-    out_throttle = result[1]
-    assert out_throttle <= lf.throttle, "throttle should be scaled down during the maneuver"
+    lanes_seen = set()
+    scaled_down = False
+    for _ in range(40):
+        lf.run(frame)
+        result = arbiter.run(frame, None, lf.steering, lf.throttle,
+                              lf.last_yellow_x, lf.last_white_x, lf.lane_width_px)
+        lanes_seen.add(lf.current_lane)
+        if result[1] < lf.throttle:
+            scaled_down = True
+    assert lanes_seen != {starting_lane}, "active mode should have switched lanes at some point"
+    assert scaled_down, "throttle should be scaled down at some point during the maneuver"
 
 
 def test_returned_debug_fields_are_populated_when_cone_present():

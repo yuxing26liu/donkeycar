@@ -31,14 +31,19 @@ def make_cfg(**overrides):
     return cfg
 
 
-def lane(yellow_x=200.0, white_x=350.0, width_px=150.0, white_right_of_yellow=True, primary_row_y=200.0):
+def lane(yellow_x=200.0, white_x=350.0, width_px=150.0, white_right_of_yellow=True, primary_row_y=200.0,
+         yellow_lost_frames=0):
     # gap (here 150px) must clear ObstaclePlanner's CORRIDOR_WIDTH_MIN_PX
     # default (90) or every detection is rejected by the corridor-
     # plausibility gate regardless of position -- real lane widths on the
     # actual car run ~150-330px (see obstacle_planner.py), so 150 is a
     # realistic default, not just "big enough to pass the gate".
+    # yellow_lost_frames=0 default means "genuinely detected this frame"
+    # -- most tests want a normally-tracking lane; staleness itself is
+    # tested explicitly (see test_stale_yellow_estimate_is_not_acquired).
     return LaneGeometry(yellow_x=yellow_x, white_x=white_x, width_px=width_px,
-                         white_right_of_yellow=white_right_of_yellow, primary_row_y=primary_row_y)
+                         white_right_of_yellow=white_right_of_yellow, primary_row_y=primary_row_y,
+                         yellow_lost_frames=yellow_lost_frames)
 
 
 def det_in_lane(distance_mm=2000.0, cx=275, w=20, h=40):
@@ -291,6 +296,73 @@ def test_stable_centered_approach_is_not_rejected_by_lateral_check():
     # must have progressed well past OBJECT_WATCH -- proves the lateral
     # check doesn't block a genuine stable/centered approach
     assert p.state not in (PlannerState.FOLLOW_LANE, PlannerState.OBJECT_WATCH), f"got {p.state}"
+
+
+def test_stale_yellow_estimate_is_not_acquired():
+    """The exact real bug: yellow_x present and plausible, but
+    yellow_lost_frames says it's stale (carried-forward telemetry, not a
+    genuine detection) - must not count as acquired. Mirrors
+    tub_122_26-07-30's real failure (yellow frozen at one value for 45+
+    frames after set_lane('left'))."""
+    cfg = make_cfg(YELLOW_FRESHNESS_MAX_FRAMES=4)
+    p = ObstaclePlanner(cfg)
+    stale_geom = lane(yellow_x=200.0, white_x=None, white_right_of_yellow=False, yellow_lost_frames=45)
+    assert p._lane_acquired(stale_geom) is False
+
+
+def test_fresh_yellow_only_is_acquired_even_without_white():
+    """The actual fix: yellow alone, fresh and plausibly-placed, is
+    sufficient - white's absence must not block acquisition (real
+    on-car frames show the far white edge is never in view from the
+    right lane at all for a right-to-left switch)."""
+    cfg = make_cfg(YELLOW_FRESHNESS_MAX_FRAMES=4)
+    p = ObstaclePlanner(cfg)
+    fresh_geom = lane(yellow_x=200.0, white_x=None, width_px=150.0,
+                       white_right_of_yellow=False, yellow_lost_frames=0)
+    assert p._lane_acquired(fresh_geom) is True
+
+
+def test_yellow_within_coast_frames_still_counts_as_fresh():
+    cfg = make_cfg(YELLOW_FRESHNESS_MAX_FRAMES=4)
+    p = ObstaclePlanner(cfg)
+    coasting_geom = lane(yellow_x=200.0, white_x=None, white_right_of_yellow=False, yellow_lost_frames=3)
+    assert p._lane_acquired(coasting_geom) is True
+
+
+def test_implausible_yellow_offset_is_not_acquired():
+    """Fresh yellow, but the implied lane-center estimate is nowhere
+    near image center (a sanity bound, not a "must already be
+    centered" requirement)."""
+    cfg = make_cfg(YELLOW_FRESHNESS_MAX_FRAMES=4, YELLOW_OFFSET_PLAUSIBLE_PX=200)
+    p = ObstaclePlanner(cfg)
+    # yellow_x=10, width=150, white_right_of_yellow=False -> sign=-1,
+    # estimated_center = 10 - 75 = -65; image_center default ~213 ->
+    # offset ~278, past the 200px plausibility bound
+    implausible_geom = lane(yellow_x=10.0, white_x=None, width_px=150.0,
+                             white_right_of_yellow=False, yellow_lost_frames=0)
+    assert p._lane_acquired(implausible_geom) is False
+
+
+def test_full_switch_cycle_using_yellow_only_after_switch():
+    """End-to-end: white genuinely unavailable for the ENTIRE neighbor-
+    lane portion (not just briefly) - the fixed planner must still
+    complete switch -> hold -> return using yellow alone, unlike the
+    real tub_122 failure this fix targets."""
+    cfg = make_cfg()
+    p = ObstaclePlanner(cfg)
+    geom = lane(white_right_of_yellow=True)
+    run_n(p, cfg.CONE_DETECT_CONFIRM_FRAMES, det_in_lane(distance_mm=1000), geom)
+    p.step(det_in_lane(distance_mm=1000), geom)
+    p.step(det_in_lane(distance_mm=1000), geom)
+    d = run_n(p, cfg.PLANNER_PREPARE_MIN_FRAMES, det_in_lane(distance_mm=900), geom)
+    assert p.state == PlannerState.SWITCH_TO_NEIGHBOR_LANE
+
+    # neighbor lane: yellow only, fresh every frame, white never found
+    neighbor_geom = lane(yellow_x=200.0, white_x=None, width_px=150.0,
+                         white_right_of_yellow=False, yellow_lost_frames=0)
+    d = run_n(p, cfg.CONE_LANE_ACQUIRE_CONFIRM_FRAMES, det_in_lane(distance_mm=800), neighbor_geom)
+    assert p.state == PlannerState.HOLD_UNTIL_CLEAR
+    assert d.requested_lane == 'left'
 
 
 def test_implausible_corridor_width_is_not_trusted():

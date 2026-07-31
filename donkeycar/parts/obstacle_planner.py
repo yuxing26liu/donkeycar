@@ -133,6 +133,18 @@ class ObstaclePlanner:
         self.center_fallback_margin_px = getattr(cfg, 'CONE_CENTER_FALLBACK_MARGIN_PX', 70)
         self.image_center_px = getattr(cfg, 'IMAGE_W', 426) / 2.0
 
+        # Yellow-anchor lane-acquisition thresholds (see _lane_acquired) -
+        # replaces the old both-lines-visible requirement, which real
+        # on-car frames showed was unmeetable for a right-to-left switch
+        # on this track (far white edge never in frame from the right
+        # lane). max_frames matches LaneFollower's own LINE_COAST_FRAMES
+        # default (4) - a normal dash gap shouldn't count as "stale".
+        # offset_plausible_px is a generous sanity bound (not a "must
+        # already be centered" requirement), sized around half of
+        # CORRIDOR_WIDTH_MAX_PX.
+        self.yellow_freshness_max_frames = getattr(cfg, 'YELLOW_FRESHNESS_MAX_FRAMES', 4)
+        self.yellow_offset_plausible_px = getattr(cfg, 'YELLOW_OFFSET_PLAUSIBLE_PX', 200)
+
         # Lateral-sweep-past veto, added 2026-07-30 after replaying real
         # on-car shadow-mode tubs (cone_approach_right2, cone_negative2):
         # a cone truly in our path stays laterally near-centered as
@@ -266,26 +278,45 @@ class ObstaclePlanner:
         return detection.bbox.h <= px_threshold
 
     def _lane_acquired(self, geometry):
-        """Stricter than _is_relevant's corridor check on purpose: this
-        gates 'is the (possibly just-switched-to) lane genuinely being
+        """Gates 'is the (possibly just-switched-to) lane genuinely being
         tracked right now', not 'is there SOME lane estimate available'.
-        LaneFollower's lane/yellow_x and lane/white_x Memory outputs are
-        last-known-good telemetry that does NOT reset to None on a miss
-        (by design, for continuity) - found via real active-mode test
-        replay (tub_122_26-07-30): after set_lane('left'), white_x
-        correctly went None (never re-acquired) but yellow_x stayed
-        frozen at one stale pre-switch value for 45+ frames, and the
-        single-line corridor fallback happily returned non-None from
-        that stale value the whole time - the planner falsely believed
-        the neighbor lane was acquired (HOLD_UNTIL_CLEAR) while
-        LaneFollower was actually completely blind and decaying to its
-        own MAX_LOST_FRAMES stop. Requiring BOTH lines closes this
-        specific hole: white_x present or not is NOT sticky the same way
-        (it only persists a value it actually had), so this is a real,
-        verified fix for the exact failure observed, not a guess."""
-        return (geometry is not None
-                and geometry.yellow_x is not None
-                and geometry.white_x is not None)
+
+        History: originally required BOTH yellow_x and white_x present,
+        after real active-mode test replay (tub_122_26-07-30) found
+        LaneFollower's lane/yellow_x Memory output is last-known-good
+        telemetry that does NOT reset to None on a miss (by design, for
+        continuity) - it stayed frozen at one stale pre-switch value for
+        45+ frames after set_lane('left'), and a single-line check
+        happily accepted it the whole time. That both-lines requirement
+        turned out to be UNMEETABLE for a right-to-left switch on this
+        track: real on-car frames (tub_122/124, well before the cone was
+        ever close) show the far/left white edge is simply never in the
+        camera's field of view from a right-lane position - it isn't a
+        proximity/occlusion artifact.
+
+        Fixed version: yellow (the dashed line shared by both lanes,
+        confirmed visible from either lane in every sampled frame) is
+        the anchor instead. Freshness comes from LaneFollower's own
+        per-tracker miss counter (yellow_trackers[0].lost_frames, read
+        directly off the tracker object by pilot_arbiter.py - not
+        derivable from the Memory-published value alone), not from
+        detecting repeated float values. White is unaffected and still
+        improves the estimate whenever both lines are actually visible
+        (see corridor() in obstacle_types.py) - this method just no
+        longer requires it."""
+        if geometry is None or geometry.yellow_x is None:
+            return False
+        if geometry.yellow_lost_frames is None or geometry.yellow_lost_frames > self.yellow_freshness_max_frames:
+            return False
+        # Plausibility: the lane-center estimate implied by yellow alone
+        # (same formula as LaneGeometry.corridor()'s one-line fallback)
+        # must sit near the image center, i.e. yellow is on the expected
+        # side for whichever lane LaneFollower is currently targeting,
+        # by a plausible amount - not a sanity-defying value.
+        sign = 1.0 if geometry.white_right_of_yellow else -1.0
+        estimated_center = geometry.yellow_x + sign * geometry.width_px / 2.0
+        offset = abs(estimated_center - self.image_center_px)
+        return offset <= self.yellow_offset_plausible_px
 
     # ---- main step ---------------------------------------------------
 

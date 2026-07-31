@@ -48,6 +48,11 @@ class PilotArbiter:
             width_px=lane_width_px,
             white_right_of_yellow=self.lane_follower.white_right_of_yellow,
             primary_row_y=self.primary_row_y,
+            # read directly off the tracker object (not the Memory bus) --
+            # lane/yellow_x itself never resets to None on a miss, so
+            # lost_frames is the clean freshness signal getattr(cfg,...)
+            # on the published value alone can't give us.
+            yellow_lost_frames=self.lane_follower.yellow_trackers[0].lost_frames,
         )
         detection, _debug = self.cone_detector.detect(cam_img, depth_img)
         decision = self.planner.step(detection, geometry)

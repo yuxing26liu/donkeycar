@@ -99,6 +99,16 @@ class LaneGeometry:
     white_right_of_yellow: bool
     primary_row_y: float
     corridor_row_scale_per_px: float = 0.0
+    # Frames since the primary-row yellow tracker last had a genuine
+    # (not carried-forward/stale) detection -- 0 means detected this
+    # exact frame. None means unknown (caller didn't/couldn't supply it,
+    # e.g. offline replay reconstructing geometry without direct tracker
+    # access). Read directly from LaneFollower.yellow_trackers[0].
+    # lost_frames by pilot_arbiter.py -- lane/yellow_x itself is
+    # last-known-good telemetry that never resets to None on a miss, so
+    # it can't be used on its own to tell fresh tracking from a stale
+    # carried-forward value (see obstacle_planner.py's acquisition logic).
+    yellow_lost_frames: Optional[int] = None
 
     @property
     def valid(self) -> bool:
