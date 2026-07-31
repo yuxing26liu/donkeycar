@@ -76,32 +76,31 @@ class ObstaclePlanner:
 
         self.detect_confirm_frames = getattr(cfg, 'CONE_DETECT_CONFIRM_FRAMES', 3)
         self.clear_confirm_frames = getattr(cfg, 'CONE_CLEAR_CONFIRM_FRAMES', 5)
-        self.lane_acquire_confirm_frames = getattr(cfg, 'CONE_LANE_ACQUIRE_CONFIRM_FRAMES', 6)
 
-        # mm thresholds. RAISED 2026-07-30 after cone_test2 (a real active-
-        # mode approach with valid depth throughout): commit=1200mm didn't
-        # trigger PREPARE_SLOW/the switch until the cone was already at
-        # 1143mm and bbox_h=186 (frame-filling) - directly matching the
-        # user's own observation that it "turns way too late" and "doesn't
-        # slow down" (throttle scaling only starts once PREPARE_SLOW
-        # begins, so a late commit means a late slowdown too, by
-        # construction). Worse, by the time the switch actually started
-        # the cone kept growing large enough (bbox_h hit 240 = full frame
-        # height) to physically occlude LaneFollower's own scan rows mid-
-        # maneuver, losing both lane lines and triggering its unrelated
-        # full-loss decay-to-stop instead of completing the dodge.
-        # Measured real closing rate in that approach: ~440mm/s (4000mm ->
-        # 900mm over ~140 frames at 20Hz) - commit=2500mm (was 1200) gives
-        # roughly 5s of buffer instead of ~2s, well before the cone is
-        # large enough to occlude anything. Watch is unchanged (already
-        # triggered with plenty of lead at 3000mm); emergency/critical
-        # raised proportionally for consistent margin below the new
-        # commit distance. Still only checked against two real approaches
-        # (cone_approach_right2, cone_test2) - not yet confirmed across
-        # different speeds.
+        # mm thresholds. REVISED AGAIN 2026-07-30 after cone_test5 (a real
+        # active-mode lane change that DID commit and switch, but too far
+        # out - commit fired at a real recorded 2449mm, matching the
+        # previous 2500mm setting - then overshot the yellow boundary and
+        # ran off track during the long, far-out crossing). Per the user's
+        # explicit direction: commit distance cut roughly 5x (2500 -> 500)
+        # so the maneuver starts close and deliberate rather than far and
+        # slow; a separate, new "slowdown" tier (below) now gives an early
+        # gentle heads-up that commit=2500 used to provide, without
+        # starting the actual lane change that early. Emergency/critical
+        # lowered to stay proportionally below the new, much closer commit
+        # point. THIS ROUND'S FIX IS PAIRED WITH the crossing-confirmation
+        # and steering-cap mechanism below - cutting commit distance alone
+        # without also bounding the overshoot would just mean running off
+        # track closer to the cone instead of farther away.
         self.watch_distance_mm = getattr(cfg, 'CONE_WATCH_DISTANCE_MM', 3000)
-        self.commit_distance_mm = getattr(cfg, 'CONE_COMMIT_DISTANCE_MM', 2500)
-        self.emergency_distance_mm = getattr(cfg, 'CONE_EMERGENCY_DISTANCE_MM', 700)
+        # New tier: cone tracked (already true in OBJECT_WATCH) AND within
+        # this distance -> mild throttle ease-off, well before the actual
+        # commit/lane-change begins. See slowdown_throttle_scale below.
+        self.slowdown_distance_mm = getattr(cfg, 'CONE_SLOWDOWN_DISTANCE_MM', 1500)
+        self.slowdown_bbox_height_px = getattr(cfg, 'CONE_SLOWDOWN_BBOX_HEIGHT_PX', 60)
+        self.slowdown_throttle_scale = getattr(cfg, 'CONE_SLOWDOWN_THROTTLE_SCALE', 0.85)
+        self.commit_distance_mm = getattr(cfg, 'CONE_COMMIT_DISTANCE_MM', 500)
+        self.emergency_distance_mm = getattr(cfg, 'CONE_EMERGENCY_DISTANCE_MM', 300)
         # Emergency requires this many CONSECUTIVE qualifying frames before
         # triggering SAFE_STOP, UNLESS distance/size is at or past the
         # tighter "critical" threshold below, which still triggers
@@ -111,8 +110,25 @@ class ObstaclePlanner:
         # cone_negative2, so this is a general protective measure rather
         # than a fix for a root-caused bug.
         self.emergency_confirm_frames = getattr(cfg, 'CONE_EMERGENCY_CONFIRM_FRAMES', 2)
-        self.critical_distance_mm = getattr(cfg, 'CONE_CRITICAL_DISTANCE_MM', 350)
+        self.critical_distance_mm = getattr(cfg, 'CONE_CRITICAL_DISTANCE_MM', 150)
         self.critical_bbox_height_px = getattr(cfg, 'CONE_CRITICAL_BBOX_HEIGHT_PX', 210)
+
+        # Commit must hold for several CONSECUTIVE frames, not just one -
+        # added after cone_test5's real approach data showed the depth
+        # percentile swinging over 1000mm between adjacent frames (e.g.
+        # 3742->2637->3117->2449mm in four consecutive frames) even though
+        # the underlying signal is trustworthy on average. A single noisy
+        # trough must not be enough to commit, especially now that commit
+        # is much closer/more consequential than before.
+        self.commit_confirm_frames = getattr(cfg, 'CONE_COMMIT_CONFIRM_FRAMES', 3)
+        # "Approaching" check: requires a net decrease in valid depth
+        # readings over a rolling window before commit is allowed - a cone
+        # that's merely visible but not actually being approached (parked
+        # off to the side, or the car momentarily stopped) shouldn't commit
+        # just because it happens to read within commit distance once.
+        self.approach_history_frames = getattr(cfg, 'CONE_APPROACH_HISTORY_FRAMES', 10)
+        self.approach_margin_mm = getattr(cfg, 'CONE_APPROACH_MARGIN_MM', 50)
+        self._distance_history = deque(maxlen=self.approach_history_frames)
 
         # bbox-height (px) fallback thresholds. Checked directly against
         # cone_approach_right's real, monotonic bbox-height progression
@@ -163,6 +179,57 @@ class ObstaclePlanner:
         # CORRIDOR_WIDTH_MAX_PX.
         self.yellow_freshness_max_frames = getattr(cfg, 'YELLOW_FRESHNESS_MAX_FRAMES', 4)
         self.yellow_offset_plausible_px = getattr(cfg, 'YELLOW_OFFSET_PLAUSIBLE_PX', 200)
+
+        # Yellow-crossing detection + steering-cap taper, added 2026-07-30
+        # after cone_test5's overshoot (see PlannerDecision.steering_cap's
+        # comment in obstacle_types.py for the exact failure this fixes).
+        # _crossing_signed_distance() uses the SAME white_right_of_yellow
+        # sign convention LaneGeometry.corridor() already uses to turn
+        # yellow_x's position relative to image center into a signed
+        # value that's positive while still clearly on the original side
+        # and shrinks toward/past zero as the car physically crosses.
+        # margin_px: at/above this, treat the car as "clearly still on
+        # the original side" (roughly the ~145px offset yellow sat at
+        # right after set_lane('left') in cone_test5, before the real
+        # sweep toward center began). taper_px: at/below this (a tight
+        # band approaching dead-center, not literal 0px), steering is
+        # fully tapered down to the floor.
+        self.crossing_margin_px = getattr(cfg, 'CONE_CROSSING_MARGIN_PX', 130)
+        self.crossing_taper_px = getattr(cfg, 'CONE_CROSSING_TAPER_PX', 20)
+        # Confirmation must hold for several fresh frames, not one noisy
+        # detection (a frozen carried-forward yellow_x must not be able
+        # to satisfy this - see yellow_lost_frames check in
+        # _crossing_confirmed_this_frame). cone_test5's own 16-frame
+        # frozen-yellow stretch (idx142-157) is exactly the kind of stale
+        # read this must reject.
+        self.crossing_confirm_frames = getattr(cfg, 'CONE_CROSSING_CONFIRM_FRAMES', 6)
+        # Steering must have actually settled, not just the yellow-side/
+        # offset checks passing - cone_test5's HOLD_UNTIL_CLEAR triggered
+        # (via offset-plausibility alone, the old _lane_acquired check)
+        # right around the true crossing point at idx163, while steering
+        # was STILL -0.65 to -0.72 and took another 13+ frames to ease -
+        # offset-plausible was necessary but not sufficient evidence the
+        # maneuver had actually stabilized. Set comfortably above the
+        # floor cap below (reachable once tapered) but well under the
+        # old pinned ~0.65-1.0 values seen during the overshoot.
+        self.crossing_steering_stable_max = getattr(cfg, 'CONE_CROSSING_STEERING_STABLE_MAX', 0.3)
+
+        # LaneFollower's raw steering is correct in DIRECTION during a
+        # lane change (same hardened PID, just re-targeted at the other
+        # lane) but its tanh saturation treats "target is a whole lane-
+        # width away" the same as any other large error, pinning near
+        # +/-1.0 for 20+ frames (cone_test5: -1.0 at idx143, then -0.75
+        # to -0.79 through idx162). The real avoid_cone reference
+        # maneuver (human-driven) never exceeded ~0.63 in either
+        # direction and always corrected back within a handful of
+        # frames. max_steer caps the MAGNITUDE (not direction) of
+        # LaneFollower's own steering during SWITCH_TO_NEIGHBOR_LANE/
+        # RETURN_TO_ORIGINAL_LANE only (see PlannerDecision.steering_cap,
+        # applied by pilot_arbiter.py); floor_factor further tightens
+        # that cap as the car nears the boundary (see
+        # _steering_cap_for_progress).
+        self.lane_change_max_steer = getattr(cfg, 'LANE_CHANGE_MAX_STEER', 0.6)
+        self.lane_change_floor_factor = getattr(cfg, 'LANE_CHANGE_FLOOR_FACTOR', 0.4)
 
         # Lateral-sweep-past veto, added 2026-07-30 after replaying real
         # on-car shadow-mode tubs (cone_approach_right2, cone_negative2):
@@ -219,9 +286,10 @@ class ObstaclePlanner:
         self._frames_in_state = 0
         self._watch_count = 0
         self._clear_count = 0
-        self._acquire_count = 0
         self._safe_recover_count = 0
         self._emergency_count = 0
+        self._commit_confirm_count = 0
+        self._crossing_confirm_count = 0
         self._maneuver_side = None      # 'left' | 'right' -- the neighbor lane this maneuver targets
         self._original_side = None      # lane to return to
         self._closest_seen = None       # tracks whether the cone has started retreating in HOLD
@@ -337,9 +405,123 @@ class ObstaclePlanner:
         offset = abs(estimated_center - self.image_center_px)
         return offset <= self.yellow_offset_plausible_px
 
+    def _update_distance_history(self, detection):
+        """Call exactly once per tick (mirrors _update_lateral_history) -
+        maintains the rolling valid-depth history _is_approaching() reads.
+        Cleared on a miss so a later, different cone doesn't inherit a
+        stale trend. Not appended (but not cleared either) on a frame
+        where the cone is visible but depth is momentarily invalid -
+        bbox-height has no comparable per-frame noise profile recorded
+        for this project to protect against (see _is_approaching)."""
+        if detection is None:
+            self._distance_history.clear()
+            return
+        if detection.distance_valid:
+            self._distance_history.append(detection.distance_mm)
+
+    def _is_approaching(self, detection):
+        """True if this cone's recent depth trend is a genuine net
+        decrease, not just noise - added after cone_test5's real depth
+        readings showed the percentile swinging over 1000mm between
+        adjacent frames (3742->2637->3117->2449mm) even on an otherwise
+        genuinely-closing approach. Compares the average of the first
+        half of the rolling window against the second half (rather than
+        the two raw endpoint readings) so a single noisy sample at
+        either edge can't flip the verdict. Bbox-height-only detections
+        (distance_valid False) are left ungated here - the existing
+        require_valid_depth_to_switch check already keeps them from
+        committing on their own by default, and no comparable noise
+        profile has been recorded for that fallback path."""
+        if not detection.distance_valid:
+            return True
+        if len(self._distance_history) < self.approach_history_frames:
+            return False
+        history = list(self._distance_history)
+        mid = len(history) // 2
+        if mid == 0:
+            # A 1-frame window can't show a trend at all -- don't block
+            # on it rather than divide by zero.
+            return True
+        earlier_avg = sum(history[:mid]) / mid
+        later_avg = sum(history[mid:]) / (len(history) - mid)
+        return (later_avg - earlier_avg) <= -self.approach_margin_mm
+
+    def _crossing_signed_distance(self, geometry):
+        """Signed pixel distance of yellow from image center: positive
+        while the car is still clearly on the ORIGINAL side of the
+        boundary, shrinking toward and past zero as the car physically
+        crosses. Uses geometry.white_right_of_yellow exactly as
+        LaneFollower reports it THIS frame (already flipped by
+        set_lane() to the target-lane convention), not self._maneuver_
+        side, so this reflects what the tracker is actually doing right
+        now rather than what the planner merely intended."""
+        if geometry is None or geometry.yellow_x is None:
+            return None
+        sign = 1.0 if geometry.white_right_of_yellow else -1.0
+        return sign * (geometry.yellow_x - self.image_center_px)
+
+    def _crossing_progress(self, geometry):
+        """0.0 = clearly still on the original side (full lane-change
+        steering authority, i.e. cap == lane_change_max_steer), 1.0 =
+        at/past the taper point close to the yellow boundary (cap ==
+        the tightened floor). Returns 1.0 (max caution) if yellow isn't
+        trackable at all this frame - a missing/frozen anchor is exactly
+        the situation cone_test5's pinned steering happened under, so
+        losing yellow entirely must never be treated as "clearly still
+        far from the boundary"."""
+        signed = self._crossing_signed_distance(geometry)
+        if signed is None:
+            return 1.0
+        if signed >= self.crossing_margin_px:
+            return 0.0
+        if signed <= self.crossing_taper_px:
+            return 1.0
+        span = self.crossing_margin_px - self.crossing_taper_px
+        return (self.crossing_margin_px - signed) / span
+
+    def _steering_cap_for_progress(self, progress):
+        """Maps crossing progress (0..1) to a steering magnitude cap,
+        linearly tapering from lane_change_max_steer at progress=0 down
+        to lane_change_max_steer * lane_change_floor_factor at
+        progress=1."""
+        floor = self.lane_change_max_steer * self.lane_change_floor_factor
+        return self.lane_change_max_steer - progress * (self.lane_change_max_steer - floor)
+
+    def _crossing_confirmed_this_frame(self, geometry, raw_steering):
+        """Per-frame check for 'has the car genuinely crossed into (and
+        stabilized in) the target lane' - gates the SWITCH_TO_NEIGHBOR_
+        LANE/RETURN_TO_ORIGINAL_LANE FSM transition once held for
+        crossing_confirm_frames consecutive frames. Distinct from the
+        older _lane_acquired() (still used unchanged for the PREPARE_
+        SLOW pre-switch check and SAFE_STOP auto-recovery) by also
+        requiring steering demand to have actually settled - added after
+        cone_test5 showed HOLD_UNTIL_CLEAR triggering, via the offset-
+        plausibility check alone, right around the true crossing point
+        while steering was STILL -0.65 to -0.72 and took another 13+
+        frames to ease: offset-plausible was necessary but not
+        sufficient evidence the maneuver had actually stabilized.
+        raw_steering=None (caller didn't supply it) fails safe to False,
+        same convention as an unknown yellow_lost_frames -- an unwired
+        caller must not be able to silently skip the steering gate."""
+        if geometry is None or geometry.yellow_x is None:
+            return False
+        if geometry.yellow_lost_frames is None or geometry.yellow_lost_frames > self.yellow_freshness_max_frames:
+            return False
+        signed = self._crossing_signed_distance(geometry)
+        if signed is None or signed > 0:
+            return False
+        sign = 1.0 if geometry.white_right_of_yellow else -1.0
+        estimated_center = geometry.yellow_x + sign * geometry.width_px / 2.0
+        offset = abs(estimated_center - self.image_center_px)
+        if offset > self.yellow_offset_plausible_px:
+            return False
+        if raw_steering is None or abs(raw_steering) > self.crossing_steering_stable_max:
+            return False
+        return True
+
     # ---- main step ---------------------------------------------------
 
-    def step(self, detection, geometry):
+    def step(self, detection, geometry, raw_steering=None):
         """One frame's decision. Always runs the full state machine
         regardless of rollout mode -- callers (cv_control.py) decide
         whether to actually call LaneFollower.set_lane() based on
@@ -347,7 +529,8 @@ class ObstaclePlanner:
         'active' would have done."""
         self._frames_in_state += 1
         self._update_lateral_history(detection)
-        transition = self._step_fsm(detection, geometry)
+        self._update_distance_history(detection)
+        transition = self._step_fsm(detection, geometry, raw_steering)
         if transition is not None:
             new_state, reason = transition
             logger.info(f"ObstaclePlanner: {self.state.value} -> {new_state.value} ({reason})")
@@ -360,11 +543,21 @@ class ObstaclePlanner:
         cone_in_path = self._is_relevant(detection, geometry)
         requested_lane = None
         throttle_scale = 1.0
+        steering_cap = None
 
         if self.state == PlannerState.FOLLOW_LANE:
             throttle_scale = 1.0
         elif self.state == PlannerState.OBJECT_WATCH:
-            throttle_scale = 1.0
+            # New mild ease-off tier, added 2026-07-30: a gentle heads-up
+            # slowdown once the cone is being tracked and within
+            # slowdown_distance_mm, well before the (now much closer)
+            # commit distance actually begins the maneuver - previously
+            # this state never touched throttle at all.
+            if detection is not None and self._distance_at_or_below(
+                    detection, self.slowdown_distance_mm, self.slowdown_bbox_height_px):
+                throttle_scale = self.slowdown_throttle_scale
+            else:
+                throttle_scale = 1.0
         elif self.state == PlannerState.CONFIRMED_IN_PATH:
             throttle_scale = self.prepare_throttle_scale
         elif self.state == PlannerState.PREPARE_SLOW:
@@ -372,19 +565,22 @@ class ObstaclePlanner:
         elif self.state == PlannerState.SWITCH_TO_NEIGHBOR_LANE:
             requested_lane = self._maneuver_side
             throttle_scale = self.switch_throttle_scale
+            steering_cap = self._steering_cap_for_progress(self._crossing_progress(geometry))
         elif self.state == PlannerState.HOLD_UNTIL_CLEAR:
             requested_lane = self._maneuver_side
             throttle_scale = self.hold_throttle_scale
         elif self.state == PlannerState.RETURN_TO_ORIGINAL_LANE:
             requested_lane = self._original_side
             throttle_scale = self.return_throttle_scale
+            steering_cap = self._steering_cap_for_progress(self._crossing_progress(geometry))
         elif self.state == PlannerState.SAFE_STOP:
             throttle_scale = 0.0
 
         return PlannerDecision(state=self.state, reason=reason_out, requested_lane=requested_lane,
-                                throttle_scale=throttle_scale, cone_in_path=cone_in_path)
+                                throttle_scale=throttle_scale, cone_in_path=cone_in_path,
+                                steering_cap=steering_cap)
 
-    def _step_fsm(self, detection, geometry):
+    def _step_fsm(self, detection, geometry, raw_steering):
         """Returns (new_state, reason) if a transition should happen this
         frame, else None (stay in self.state)."""
         relevant = self._is_relevant(detection, geometry)
@@ -418,6 +614,7 @@ class ObstaclePlanner:
         if self.state == PlannerState.FOLLOW_LANE:
             self._watch_count = self._watch_count + 1 if relevant else 0
             if self._watch_count >= self.detect_confirm_frames:
+                self._commit_confirm_count = 0
                 return PlannerState.OBJECT_WATCH, f"cone relevant for {self._watch_count} frames"
             return None
 
@@ -426,11 +623,25 @@ class ObstaclePlanner:
                 self._clear_count = 0
                 within_commit = self._distance_at_or_below(detection, self.commit_distance_mm,
                                                              self.commit_bbox_height_px)
-                if within_commit:
+                # Commit must hold for commit_confirm_frames CONSECUTIVE
+                # frames, and the cone must actually be approaching (not
+                # just momentarily read close by a single noisy depth
+                # sample) - added 2026-07-30 after cone_test5's real
+                # depth data showed >1000mm swings between adjacent
+                # frames. See _is_approaching()/commit_confirm_frames.
+                if within_commit and self._is_approaching(detection):
                     if self.require_valid_depth_to_switch and not detection.distance_valid:
+                        self._commit_confirm_count = 0
                         return None  # close enough by bbox-height alone, but no real depth to trust yet
-                    return PlannerState.CONFIRMED_IN_PATH, "cone within commit distance"
+                    self._commit_confirm_count += 1
+                    if self._commit_confirm_count >= self.commit_confirm_frames:
+                        return PlannerState.CONFIRMED_IN_PATH, (
+                            f"cone within commit distance and approaching, confirmed "
+                            f"{self._commit_confirm_count} consecutive frames")
+                    return None
+                self._commit_confirm_count = 0
                 return None
+            self._commit_confirm_count = 0
             self._clear_count += 1
             if self._clear_count >= self.clear_confirm_frames:
                 return PlannerState.FOLLOW_LANE, "cone cleared before commit distance"
@@ -458,20 +669,26 @@ class ObstaclePlanner:
             if self._frames_in_state >= self.prepare_min_frames and self._lane_acquired(geometry):
                 self._original_side = geometry.white_right_of_yellow and 'right' or 'left'
                 self._maneuver_side = 'left' if self._original_side == 'right' else 'right'
-                self._acquire_count = 0
                 self._closest_seen = None
+                self._crossing_confirm_count = 0
                 return PlannerState.SWITCH_TO_NEIGHBOR_LANE, f"committing to switch to {self._maneuver_side}"
             return None
 
         if self.state == PlannerState.SWITCH_TO_NEIGHBOR_LANE:
             if self._frames_in_state >= self.maneuver_timeout_frames:
-                return PlannerState.SAFE_STOP, "maneuver timeout awaiting neighbor-lane acquisition"
-            if self._lane_acquired(geometry):
-                self._acquire_count += 1
+                return PlannerState.SAFE_STOP, "maneuver timeout awaiting neighbor-lane crossing confirmation"
+            # Replaced _lane_acquired() with _crossing_confirmed_this_frame()
+            # 2026-07-30 after cone_test5: the offset-plausibility check
+            # alone triggered right around the true crossing point while
+            # steering was still pinned at -0.65 to -0.72, so this now
+            # also requires steering demand to have settled (see that
+            # method's docstring).
+            if self._crossing_confirmed_this_frame(geometry, raw_steering):
+                self._crossing_confirm_count += 1
             else:
-                self._acquire_count = 0
-            if self._acquire_count >= self.lane_acquire_confirm_frames:
-                return PlannerState.HOLD_UNTIL_CLEAR, "neighbor lane geometry acquired"
+                self._crossing_confirm_count = 0
+            if self._crossing_confirm_count >= self.crossing_confirm_frames:
+                return PlannerState.HOLD_UNTIL_CLEAR, "neighbor-lane crossing confirmed"
             return None
 
         if self.state == PlannerState.HOLD_UNTIL_CLEAR:
@@ -495,18 +712,23 @@ class ObstaclePlanner:
             else:
                 self._clear_count = 0
             if self._clear_count >= self.clear_confirm_frames:
+                self._crossing_confirm_count = 0
                 return PlannerState.RETURN_TO_ORIGINAL_LANE, "cone confirmed passed"
             return None
 
         if self.state == PlannerState.RETURN_TO_ORIGINAL_LANE:
             if self._frames_in_state >= self.maneuver_timeout_frames:
-                return PlannerState.SAFE_STOP, "maneuver timeout awaiting original-lane re-acquisition"
-            if self._lane_acquired(geometry):
-                self._acquire_count += 1
+                return PlannerState.SAFE_STOP, "maneuver timeout awaiting original-lane crossing confirmation"
+            # Same _crossing_confirmed_this_frame() swap as the switch
+            # leg above (see that transition's comment) - cone_test5
+            # showed the identical overshoot pattern recur symmetrically
+            # on the return leg.
+            if self._crossing_confirmed_this_frame(geometry, raw_steering):
+                self._crossing_confirm_count += 1
             else:
-                self._acquire_count = 0
-            if self._acquire_count >= self.lane_acquire_confirm_frames:
-                return PlannerState.FOLLOW_LANE, "original lane re-acquired"
+                self._crossing_confirm_count = 0
+            if self._crossing_confirm_count >= self.crossing_confirm_frames:
+                return PlannerState.FOLLOW_LANE, "original lane crossing confirmed"
             return None
 
         if self.state == PlannerState.SAFE_STOP:

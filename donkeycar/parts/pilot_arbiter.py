@@ -57,6 +57,17 @@ class PilotArbiter:
         # mean a real stop.
         self.min_maneuver_throttle = getattr(cfg, 'PLANNER_MIN_MANEUVER_THROTTLE',
                                               getattr(cfg, 'THROTTLE_MIN', 0.15))
+        # Steering rate limit, added 2026-07-30 after cone_test5's return
+        # leg: right after RETURN_TO_ORIGINAL_LANE began, commanded
+        # steering oscillated wildly frame-to-frame (-0.13 -> +0.216 ->
+        # -0.375 -> -0.6 -> ... -> -0.794 within ~10 frames) before white
+        # reappeared and it settled. Bounds how much the CAPPED steering
+        # (see decision.steering_cap below) can change per frame, applied
+        # only while a cap is active (SWITCH_TO_NEIGHBOR_LANE/RETURN_TO_
+        # ORIGINAL_LANE in ACTIVE mode) -- normal lane-following steering
+        # is never rate-limited by this.
+        self.lane_change_steer_rate_limit = getattr(cfg, 'LANE_CHANGE_STEER_RATE_LIMIT', 0.15)
+        self._last_out_steering = None
 
     def run(self, cam_img, depth_img, pilot_steering, pilot_throttle,
             lane_yellow_x, lane_white_x, lane_width_px):
@@ -73,15 +84,30 @@ class PilotArbiter:
             yellow_lost_frames=self.lane_follower.yellow_trackers[0].lost_frames,
         )
         detection, _debug = self.cone_detector.detect(cam_img, depth_img)
-        decision = self.planner.step(detection, geometry)
+        decision = self.planner.step(detection, geometry, raw_steering=pilot_steering)
 
-        out_steering = pilot_steering  # never overridden -- see module docstring
+        out_steering = pilot_steering  # overridden only by the capped/rate-limited value below
         out_throttle = pilot_throttle
 
         if self.mode == RolloutMode.ACTIVE:
             if decision.requested_lane is not None \
                     and decision.requested_lane != self.lane_follower.current_lane:
                 self.lane_follower.set_lane(decision.requested_lane)
+            if decision.steering_cap is not None:
+                # Bound the MAGNITUDE (never the direction/sign) of
+                # LaneFollower's own steering during the crossing -- see
+                # ObstaclePlanner._steering_cap_for_progress and the
+                # module docstring's reuse-the-existing-PID rationale.
+                cap = abs(decision.steering_cap)
+                capped = max(-cap, min(cap, pilot_steering))
+                if self._last_out_steering is not None:
+                    delta = capped - self._last_out_steering
+                    limit = self.lane_change_steer_rate_limit
+                    if delta > limit:
+                        capped = self._last_out_steering + limit
+                    elif delta < -limit:
+                        capped = self._last_out_steering - limit
+                out_steering = capped
             scaled_throttle = pilot_throttle * decision.throttle_scale
             if 0.0 < decision.throttle_scale < 1.0:
                 # actively maneuvering (not FOLLOW_LANE/OBJECT_WATCH at
@@ -92,7 +118,10 @@ class PilotArbiter:
                 out_throttle = max(scaled_throttle, self.min_maneuver_throttle)
             else:
                 out_throttle = scaled_throttle
-        elif self.mode == RolloutMode.SHADOW:
+            self._last_out_steering = out_steering
+        else:
+            self._last_out_steering = None
+        if self.mode == RolloutMode.SHADOW:
             if decision.requested_lane is not None or decision.throttle_scale < 1.0:
                 logger.info(f"[SHADOW] would apply: requested_lane={decision.requested_lane} "
                             f"throttle_scale={decision.throttle_scale:.2f} state={decision.state.value} "

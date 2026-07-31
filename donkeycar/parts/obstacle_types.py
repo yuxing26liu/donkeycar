@@ -182,3 +182,17 @@ class PlannerDecision:
     requested_lane: Optional[str]     # 'left' | 'right' | None (no change requested)
     throttle_scale: float             # multiply LaneFollower's throttle by this
     cone_in_path: bool
+    # Added 2026-07-30 after cone_test5 (real active-mode lane change that
+    # overshot the yellow boundary and ran off track): during
+    # SWITCH_TO_NEIGHBOR_LANE/RETURN_TO_ORIGINAL_LANE, LaneFollower's own
+    # raw steering (still correct in DIRECTION, since it's the same
+    # hardened PID, just now targeting the flipped lane) pinned near +/-1.0
+    # for 30+ frames because the tanh saturation treats "target is now on
+    # the other side of a whole lane width away" the same as any other
+    # large error. steering_cap bounds that raw output's MAGNITUDE (not
+    # direction) during the crossing, tapering down as the car actually
+    # approaches the yellow boundary (see ObstaclePlanner._crossing_
+    # progress) - None means "don't cap, use LaneFollower's steering as
+    # normal" (every other state, including once the crossing is
+    # confirmed). Applied only in ACTIVE mode by pilot_arbiter.py.
+    steering_cap: Optional[float] = None

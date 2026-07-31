@@ -17,10 +17,18 @@ def make_cfg(**overrides):
     cfg = SimpleNamespace(
         CONE_DETECT_CONFIRM_FRAMES=3,
         CONE_CLEAR_CONFIRM_FRAMES=3,
-        CONE_LANE_ACQUIRE_CONFIRM_FRAMES=3,
+        CONE_CROSSING_CONFIRM_FRAMES=3,
         CONE_WATCH_DISTANCE_MM=3000,
         CONE_COMMIT_DISTANCE_MM=1200,
         CONE_EMERGENCY_DISTANCE_MM=400,
+        # Commit-confirm/approach-trend defaults kept trivial (1 frame,
+        # 0mm margin) here so this file's existing single/few-tick tests
+        # keep behaving like a plain "within commit distance" check -
+        # commit_confirm_frames/is_approaching's own debounce/noise-
+        # rejection behavior is covered by dedicated tests below.
+        CONE_COMMIT_CONFIRM_FRAMES=1,
+        CONE_APPROACH_HISTORY_FRAMES=2,
+        CONE_APPROACH_MARGIN_MM=0,
         PLANNER_PREPARE_MIN_FRAMES=2,
         PLANNER_HOLD_MIN_FRAMES=2,
         PLANNER_MANEUVER_TIMEOUT_FRAMES=50,
@@ -58,10 +66,15 @@ def det_other_lane(distance_mm=2000.0, cx=100, w=20, h=40):
                       distance_mm=distance_mm, distance_valid=True, distance_source='depth')
 
 
-def run_n(planner, n, detection, geometry):
+def run_n(planner, n, detection, geometry, raw_steering=0.0):
+    # raw_steering defaults to 0.0 ("settled") so existing tests that
+    # don't care about the steering-stability gate (see
+    # _crossing_confirmed_this_frame in obstacle_planner.py) aren't
+    # blocked by it; tests that specifically exercise that gate pass
+    # their own value.
     decision = None
     for _ in range(n):
-        decision = planner.step(detection, geometry)
+        decision = planner.step(detection, geometry, raw_steering=raw_steering)
     return decision
 
 
@@ -103,7 +116,11 @@ def test_full_happy_path_switch_hold_return():
     cfg = make_cfg()
     p = ObstaclePlanner(cfg)
     geom = lane(white_right_of_yellow=True)  # currently in 'right' lane
-    neighbor_geom = lane(yellow_x=200.0, white_x=50.0, white_right_of_yellow=False)
+    # yellow_x=260 (comfortably past image_center_px=213, given the
+    # default IMAGE_W=426) so it reads as clearly crossed by
+    # _crossing_confirmed_this_frame's signed-distance check, not just
+    # barely on one side of it.
+    neighbor_geom = lane(yellow_x=260.0, white_x=110.0, white_right_of_yellow=False)
 
     # 1) approach: confirm in-path (3 ticks to cross detect_confirm_frames),
     # then a 4th tick evaluates OBJECT_WATCH's own commit-distance check.
@@ -122,8 +139,10 @@ def test_full_happy_path_switch_hold_return():
     assert p.state == PlannerState.SWITCH_TO_NEIGHBOR_LANE
     assert d.requested_lane == 'left'
 
-    # 3) neighbor lane geometry acquired for N frames -> HOLD_UNTIL_CLEAR
-    d = run_n(p, cfg.CONE_LANE_ACQUIRE_CONFIRM_FRAMES, det_in_lane(distance_mm=800), neighbor_geom)
+    # 3) neighbor-lane crossing confirmed (fresh yellow, correct/crossed
+    # side, plausible offset, steering settled) for N frames -> HOLD_UNTIL_CLEAR
+    d = run_n(p, cfg.CONE_CROSSING_CONFIRM_FRAMES, det_in_lane(distance_mm=800), neighbor_geom,
+              raw_steering=0.0)
     assert p.state == PlannerState.HOLD_UNTIL_CLEAR
     assert d.requested_lane == 'left'
 
@@ -144,10 +163,10 @@ def test_full_happy_path_switch_hold_return():
     assert p.state == PlannerState.RETURN_TO_ORIGINAL_LANE
     assert d.requested_lane == 'right'
 
-    # 5) original lane geometry re-acquired (now fed geom, representing
+    # 5) original-lane crossing confirmed (now fed geom, representing
     # LaneFollower having actually switched back per requested_lane above)
     # -> FOLLOW_LANE
-    d = run_n(p, cfg.CONE_LANE_ACQUIRE_CONFIRM_FRAMES, None, geom)
+    d = run_n(p, cfg.CONE_CROSSING_CONFIRM_FRAMES, None, geom, raw_steering=0.0)
     assert p.state == PlannerState.FOLLOW_LANE
     assert d.requested_lane is None
     assert d.throttle_scale == 1.0
@@ -178,7 +197,7 @@ def test_emergency_close_cone_forces_safe_stop():
 
 
 def test_maneuver_timeout_forces_safe_stop():
-    cfg = make_cfg(PLANNER_MANEUVER_TIMEOUT_FRAMES=5, CONE_LANE_ACQUIRE_CONFIRM_FRAMES=100)
+    cfg = make_cfg(PLANNER_MANEUVER_TIMEOUT_FRAMES=5)
     p = ObstaclePlanner(cfg)
     geom = lane()
     run_n(p, cfg.CONE_DETECT_CONFIRM_FRAMES, det_in_lane(distance_mm=1000), geom)
@@ -186,9 +205,10 @@ def test_maneuver_timeout_forces_safe_stop():
     p.step(det_in_lane(distance_mm=1000), geom)  # -> PREPARE_SLOW
     run_n(p, cfg.PLANNER_PREPARE_MIN_FRAMES, det_in_lane(distance_mm=900), geom)
     assert p.state == PlannerState.SWITCH_TO_NEIGHBOR_LANE
-    # neighbor lane never acquires (acquire threshold impossibly high) --
-    # must eventually safe-stop rather than hang in the maneuver forever
-    d = run_n(p, 10, det_in_lane(distance_mm=900), geom)
+    # neighbor lane never crosses (steering held pinned above the
+    # crossing-stability gate) -- must eventually safe-stop rather than
+    # hang in the maneuver forever
+    d = run_n(p, 10, det_in_lane(distance_mm=900), geom, raw_steering=1.0)
     assert p.state == PlannerState.SAFE_STOP
 
 
@@ -357,10 +377,13 @@ def test_full_switch_cycle_using_yellow_only_after_switch():
     d = run_n(p, cfg.PLANNER_PREPARE_MIN_FRAMES, det_in_lane(distance_mm=900), geom)
     assert p.state == PlannerState.SWITCH_TO_NEIGHBOR_LANE
 
-    # neighbor lane: yellow only, fresh every frame, white never found
-    neighbor_geom = lane(yellow_x=200.0, white_x=None, width_px=150.0,
+    # neighbor lane: yellow only, fresh every frame, white never found.
+    # yellow_x=260 (comfortably past image_center_px=213) so it reads as
+    # clearly crossed, same reasoning as test_full_happy_path_switch_hold_return.
+    neighbor_geom = lane(yellow_x=260.0, white_x=None, width_px=150.0,
                          white_right_of_yellow=False, yellow_lost_frames=0)
-    d = run_n(p, cfg.CONE_LANE_ACQUIRE_CONFIRM_FRAMES, det_in_lane(distance_mm=800), neighbor_geom)
+    d = run_n(p, cfg.CONE_CROSSING_CONFIRM_FRAMES, det_in_lane(distance_mm=800), neighbor_geom,
+              raw_steering=0.0)
     assert p.state == PlannerState.HOLD_UNTIL_CLEAR
     assert d.requested_lane == 'left'
 
@@ -398,3 +421,145 @@ def test_decision_always_populated_even_in_disabled_mode():
     d = p.step(det_in_lane(distance_mm=1000), lane())
     assert d is not None
     assert d.state is not None
+
+
+# ---- cone_test5 fix: commit-confirm-frames + approaching check ---------
+
+def test_single_noisy_close_reading_does_not_commit():
+    """The exact real bug: cone_test5's depth percentile swung >1000mm
+    between adjacent frames (e.g. 3742->2637->3117->2449mm) even on a
+    genuinely-closing approach. A single frame that happens to read
+    within commit distance, sandwiched between frames that don't, must
+    not commit by itself - both commit_confirm_frames (consecutive-frame
+    requirement) and _is_approaching (trend requirement) must hold."""
+    cfg = make_cfg(CONE_COMMIT_DISTANCE_MM=1200, CONE_COMMIT_CONFIRM_FRAMES=3,
+                    CONE_APPROACH_HISTORY_FRAMES=4, CONE_APPROACH_MARGIN_MM=50)
+    p = ObstaclePlanner(cfg)
+    geom = lane()
+    run_n(p, cfg.CONE_DETECT_CONFIRM_FRAMES, det_in_lane(distance_mm=3000), geom)
+    assert p.state == PlannerState.OBJECT_WATCH
+    # noisy sequence: mostly far, one single close dip, back to far --
+    # not a real approach, must never commit
+    noisy_sequence = [3000, 2900, 1100, 3100, 2950, 3050, 2900]
+    for mm in noisy_sequence:
+        p.step(det_in_lane(distance_mm=mm), geom)
+    assert p.state == PlannerState.OBJECT_WATCH, \
+        "a single noisy close reading amid a non-approaching sequence must not commit"
+
+
+def test_sustained_approach_within_commit_distance_does_commit():
+    """The legitimate case the debounce above must not break: a real,
+    sustained closing approach that stays within commit distance for
+    commit_confirm_frames consecutive frames does commit."""
+    cfg = make_cfg(CONE_COMMIT_DISTANCE_MM=1200, CONE_COMMIT_CONFIRM_FRAMES=3,
+                    CONE_APPROACH_HISTORY_FRAMES=4, CONE_APPROACH_MARGIN_MM=50)
+    p = ObstaclePlanner(cfg)
+    geom = lane()
+    run_n(p, cfg.CONE_DETECT_CONFIRM_FRAMES, det_in_lane(distance_mm=3000), geom)
+    assert p.state == PlannerState.OBJECT_WATCH
+    # exactly commit_confirm_frames=3 consecutive qualifying, genuinely-
+    # closing readings -- must commit right on the 3rd, before any
+    # further ticks let CONFIRMED_IN_PATH cascade on to PREPARE_SLOW
+    closing_sequence = [1150, 1100, 1050]
+    d = None
+    for mm in closing_sequence:
+        d = p.step(det_in_lane(distance_mm=mm), geom)
+    assert p.state == PlannerState.CONFIRMED_IN_PATH
+
+
+def test_commit_confirm_count_resets_on_a_broken_streak():
+    """Commit-confirm frames must be CONSECUTIVE - a single frame that
+    breaks the streak (reads back outside commit distance) resets the
+    counter, so a brief in-and-out doesn't accumulate toward commit."""
+    cfg = make_cfg(CONE_COMMIT_DISTANCE_MM=1200, CONE_COMMIT_CONFIRM_FRAMES=3,
+                    CONE_APPROACH_HISTORY_FRAMES=4, CONE_APPROACH_MARGIN_MM=50)
+    p = ObstaclePlanner(cfg)
+    geom = lane()
+    run_n(p, cfg.CONE_DETECT_CONFIRM_FRAMES, det_in_lane(distance_mm=3000), geom)
+    # two qualifying frames, then one frame that reads back outside
+    # commit distance (breaks the streak), then only two more qualifying
+    # frames -- must not reach commit_confirm_frames=3
+    for mm in [1150, 1100, 2900, 1150, 1100]:
+        p.step(det_in_lane(distance_mm=mm), geom)
+    assert p.state == PlannerState.OBJECT_WATCH
+
+
+# ---- cone_test5 fix: yellow-crossing detection + steering-cap taper ----
+
+def test_crossing_not_confirmed_when_yellow_stale():
+    """A frozen carried-forward yellow_x (the exact cone_test5 16-frame
+    freeze, idx142-157) must not be able to confirm a crossing, even if
+    its value happens to be on the crossed side and steering is settled."""
+    cfg = make_cfg()
+    p = ObstaclePlanner(cfg)
+    stale = lane(yellow_x=260.0, white_right_of_yellow=False, yellow_lost_frames=45)
+    assert p._crossing_confirmed_this_frame(stale, raw_steering=0.0) is False
+
+
+def test_crossing_not_confirmed_on_wrong_side():
+    """Yellow still fresh and on the ORIGINAL side (not yet crossed) must
+    not confirm, even with steering settled."""
+    cfg = make_cfg()
+    p = ObstaclePlanner(cfg)
+    # white_right_of_yellow=False (post-set_lane('left') convention) but
+    # yellow_x=67.7 is still well left of image_center_px=213 -- exactly
+    # cone_test5's frozen post-switch value, before the real sweep began
+    not_yet_crossed = lane(yellow_x=67.7, white_right_of_yellow=False, yellow_lost_frames=0)
+    assert p._crossing_confirmed_this_frame(not_yet_crossed, raw_steering=0.0) is False
+
+
+def test_crossing_not_confirmed_while_steering_unsettled():
+    """The exact real bug: cone_test5's HOLD_UNTIL_CLEAR fired (under the
+    OLD _lane_acquired check) right around the true crossing point while
+    steering was still -0.65 to -0.72. Fresh + correct-side + plausible
+    yellow must NOT be enough on its own if steering hasn't settled."""
+    cfg = make_cfg(CONE_CROSSING_STEERING_STABLE_MAX=0.3)
+    p = ObstaclePlanner(cfg)
+    crossed_geom = lane(yellow_x=260.0, white_right_of_yellow=False, yellow_lost_frames=0)
+    assert p._crossing_confirmed_this_frame(crossed_geom, raw_steering=-0.65) is False
+    assert p._crossing_confirmed_this_frame(crossed_geom, raw_steering=0.2) is True
+
+
+def test_crossing_not_confirmed_when_raw_steering_missing():
+    """A caller that doesn't supply raw_steering (e.g. an un-upgraded
+    replay/test harness) must fail safe to 'not confirmed', not silently
+    skip the steering gate."""
+    cfg = make_cfg()
+    p = ObstaclePlanner(cfg)
+    crossed_geom = lane(yellow_x=260.0, white_right_of_yellow=False, yellow_lost_frames=0)
+    assert p._crossing_confirmed_this_frame(crossed_geom, raw_steering=None) is False
+
+
+def test_crossing_progress_tapers_between_margin_and_taper_px():
+    """0.0 while clearly on the original side (at/beyond crossing_margin_px),
+    1.0 once at/past crossing_taper_px, linear in between - and the
+    resulting steering cap must taper from lane_change_max_steer down to
+    the floor accordingly."""
+    cfg = make_cfg(CONE_CROSSING_MARGIN_PX=130, CONE_CROSSING_TAPER_PX=20,
+                    LANE_CHANGE_MAX_STEER=0.6, LANE_CHANGE_FLOOR_FACTOR=0.4)
+    p = ObstaclePlanner(cfg)
+    # white_right_of_yellow=False -> sign=-1; signed = -(yellow_x-213)
+    far_from_boundary = lane(yellow_x=213.0 - 145.0, white_right_of_yellow=False)  # signed=145 >= margin
+    at_taper = lane(yellow_x=213.0 - 15.0, white_right_of_yellow=False)  # signed=15 <= taper
+    midway = lane(yellow_x=213.0 - 75.0, white_right_of_yellow=False)  # signed=75, midway between 20 and 130
+
+    assert p._crossing_progress(far_from_boundary) == 0.0
+    assert p._crossing_progress(at_taper) == 1.0
+    mid_progress = p._crossing_progress(midway)
+    assert 0.0 < mid_progress < 1.0
+
+    floor = 0.6 * 0.4
+    assert p._steering_cap_for_progress(0.0) == 0.6
+    assert p._steering_cap_for_progress(1.0) == pytest.approx(floor)
+    mid_cap = p._steering_cap_for_progress(mid_progress)
+    assert floor < mid_cap < 0.6
+
+
+def test_crossing_progress_is_max_caution_when_yellow_untrackable():
+    """Losing yellow entirely (e.g. total occlusion) must never be
+    treated as 'clearly still far from the boundary' - it must return
+    the same max-caution progress as being right at the boundary."""
+    cfg = make_cfg()
+    p = ObstaclePlanner(cfg)
+    no_yellow = lane(yellow_x=None)
+    assert p._crossing_progress(no_yellow) == 1.0

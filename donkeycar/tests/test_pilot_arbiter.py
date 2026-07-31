@@ -144,7 +144,7 @@ def test_active_mode_floors_throttle_instead_of_compounding_scales():
 
     class FakePlanner:
         mode = None
-        def step(self, detection, geometry):
+        def step(self, detection, geometry, raw_steering=None):
             return PlannerDecision(state=PlannerState.SWITCH_TO_NEIGHBOR_LANE, reason='test',
                                     requested_lane=None, throttle_scale=0.5, cone_in_path=False)
 
@@ -178,7 +178,7 @@ def test_safe_stop_throttle_scale_is_not_floored():
             return None, {}
 
     class FakePlanner:
-        def step(self, detection, geometry):
+        def step(self, detection, geometry, raw_steering=None):
             return PlannerDecision(state=PlannerState.SAFE_STOP, reason='test',
                                     requested_lane=None, throttle_scale=0.0, cone_in_path=False)
 

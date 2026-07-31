@@ -582,19 +582,40 @@ CONE_DEPTH_MIN_VALID_PX = 20
 # known unresolved false-positive finding on the cone_negative tub.
 CONE_DETECT_CONFIRM_FRAMES = 3
 CONE_CLEAR_CONFIRM_FRAMES = 5
-CONE_LANE_ACQUIRE_CONFIRM_FRAMES = 6
-# RAISED 2026-07-30 after cone_test2 (real active-mode approach, valid
-# depth throughout): commit=1200mm didn't fire until the cone was
-# already at 1143mm/frame-filling, directly matching the observed "turns
-# way too late"/"doesn't slow down" (throttle scaling starts at
-# PREPARE_SLOW, so a late commit is a late slowdown too) - and by the
-# time the switch started, the cone had grown large enough (bbox_h hit
-# 240 = full frame height) to occlude LaneFollower's own scan rows mid-
-# maneuver. Measured real closing rate: ~440mm/s - commit=2500 gives
-# ~5s of buffer instead of ~2s. See obstacle_planner.py's __init__.
+# REVISED AGAIN 2026-07-30 after cone_test5 (a real active-mode lane
+# change that DID commit and switch - at a real recorded 2449mm,
+# matching the previous 2500mm setting below - but then overshot the
+# yellow boundary and ran off track during the long, far-out crossing).
+# Per the user's explicit direction: commit distance cut roughly 5x
+# (2500 -> 500) so the maneuver starts close and deliberate instead of
+# far and slow. This alone would just mean running off track closer to
+# the cone instead of farther away - it's paired with the new crossing-
+# confirmation + steering-cap taper mechanism below (see
+# ObstaclePlanner._crossing_progress/_steering_cap_for_progress and
+# PlannerDecision.steering_cap in obstacle_types.py) and with a
+# consecutive-frame + approaching-trend requirement on commit itself
+# (cone_test5's real depth readings swung >1000mm between adjacent
+# frames even on a genuinely-closing approach - see CONE_COMMIT_
+# CONFIRM_FRAMES/CONE_APPROACH_HISTORY_FRAMES/CONE_APPROACH_MARGIN_MM
+# below). Emergency/critical lowered proportionally to stay below the
+# new, much closer commit point.
 CONE_WATCH_DISTANCE_MM = 3000
-CONE_COMMIT_DISTANCE_MM = 2500
-CONE_EMERGENCY_DISTANCE_MM = 700
+# New tier: cone tracked (already true in OBJECT_WATCH) AND within this
+# distance -> a mild throttle ease-off, well before the actual commit/
+# lane-change begins - gives the early heads-up commit=2500 used to
+# provide, without starting the maneuver that early.
+CONE_SLOWDOWN_DISTANCE_MM = 1500
+CONE_SLOWDOWN_BBOX_HEIGHT_PX = 60
+CONE_SLOWDOWN_THROTTLE_SCALE = 0.85
+CONE_COMMIT_DISTANCE_MM = 500
+CONE_EMERGENCY_DISTANCE_MM = 300
+# Commit must hold for this many CONSECUTIVE frames, and the cone must
+# actually be approaching over a rolling window (not just momentarily
+# read close by one noisy depth sample) - see ObstaclePlanner.
+# _is_approaching for exactly how the trend is computed.
+CONE_COMMIT_CONFIRM_FRAMES = 3
+CONE_APPROACH_HISTORY_FRAMES = 10
+CONE_APPROACH_MARGIN_MM = 50
 CONE_WATCH_BBOX_HEIGHT_PX = 45
 CONE_COMMIT_BBOX_HEIGHT_PX = 90
 CONE_EMERGENCY_BBOX_HEIGHT_PX = 170
@@ -636,6 +657,46 @@ CONE_REQUIRE_VALID_DEPTH_TO_SWITCH = True
 YELLOW_FRESHNESS_MAX_FRAMES = 4    # matches LaneFollower's own LINE_COAST_FRAMES default
 YELLOW_OFFSET_PLAUSIBLE_PX = 200  # generous sanity bound, not a "must already be centered" requirement
 
+# Yellow-crossing detection + steering-cap taper, added 2026-07-30 after
+# cone_test5's overshoot (see PlannerDecision.steering_cap's comment in
+# obstacle_types.py for the exact failure this fixes, and ObstaclePlanner.
+# _crossing_signed_distance/_crossing_progress/_crossing_confirmed_this_
+# frame for the mechanism). margin_px: at/above this signed pixel offset
+# from image center, treat the car as "clearly still on the original
+# side" (~145px is roughly where yellow sat right after set_lane('left')
+# in cone_test5, before the real sweep toward center began). taper_px:
+# at/below this (a tight band approaching dead-center), steering is
+# fully tapered to the floor. confirm_frames: crossing must hold for
+# this many fresh frames, not one noisy detection - cone_test5's own
+# 16-frame frozen-yellow stretch is exactly the kind of stale read this
+# must reject. steering_stable_max: crossing isn't confirmed until
+# steering has actually settled below this, not just the yellow-side/
+# offset checks passing - cone_test5's HOLD_UNTIL_CLEAR fired (under the
+# old offset-only check) while steering was still -0.65 to -0.72.
+CONE_CROSSING_MARGIN_PX = 130
+CONE_CROSSING_TAPER_PX = 20
+CONE_CROSSING_CONFIRM_FRAMES = 6
+CONE_CROSSING_STEERING_STABLE_MAX = 0.3
+
+# LaneFollower's raw steering is correct in DIRECTION during a lane
+# change (same hardened PID, just re-targeted at the other lane) but its
+# tanh saturation treats "target is a whole lane-width away" the same as
+# any other large error, pinning near +/-1.0 for 20+ frames (cone_test5:
+# -1.0 at idx143, then -0.75 to -0.79 through idx162). The real
+# avoid_cone reference maneuver (human-driven) never exceeded ~0.63 in
+# either direction. max_steer caps the MAGNITUDE (not direction) of
+# LaneFollower's own steering during SWITCH_TO_NEIGHBOR_LANE/RETURN_TO_
+# ORIGINAL_LANE only (applied by pilot_arbiter.py); floor_factor further
+# tightens that cap as the car nears the boundary; steer_rate_limit
+# bounds how fast the commanded steering can change frame-to-frame
+# during those same states - added after cone_test5's return leg
+# oscillated wildly frame-to-frame (-0.13 -> +0.216 -> -0.375 -> -0.6
+# ... -> -0.794 within ~10 frames) right after RETURN_TO_ORIGINAL_LANE
+# began.
+LANE_CHANGE_MAX_STEER = 0.6
+LANE_CHANGE_FLOOR_FACTOR = 0.4
+LANE_CHANGE_STEER_RATE_LIMIT = 0.15
+
 # Emergency requires this many consecutive qualifying frames UNLESS
 # distance/size is past the tighter "critical" threshold, which still
 # triggers instantly - protective measure added after avoid_cone's
@@ -643,7 +704,7 @@ YELLOW_OFFSET_PLAUSIBLE_PX = 200  # generous sanity bound, not a "must already b
 # reproduced in later tubs, so this is general hardening, not a
 # root-caused fix).
 CONE_EMERGENCY_CONFIRM_FRAMES = 2
-CONE_CRITICAL_DISTANCE_MM = 350        # raised 2026-07-30 in proportion to the commit-distance increase above
+CONE_CRITICAL_DISTANCE_MM = 150        # lowered 2026-07-30 in proportion to the commit-distance cut above
 CONE_CRITICAL_BBOX_HEIGHT_PX = 210
 
 PLANNER_PREPARE_MIN_FRAMES = 4

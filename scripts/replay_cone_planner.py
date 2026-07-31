@@ -108,8 +108,16 @@ def replay_tub(tub_name, tubs_dir, cfg, out_dir, apply_set_lane=False, max_frame
     summary = dict(tub=tub_name, n_frames=len(recs), states=[], transitions=[],
                    detections=0, relevant_frames=0, depth_frames=0,
                    bbox_height_series=[], distance_series=[], state_series=[],
-                   set_lane_calls=[])
+                   set_lane_calls=[], steering_series=[])
     prev_state = planner.state
+    # Mirrors pilot_arbiter.py's steering-cap + rate-limit exactly (same
+    # sign-preserving clamp, same delta bound) so this replay actually
+    # exercises what ACTIVE mode would command, not just the planner's
+    # state transitions -- only meaningful once apply_set_lane actually
+    # retargets LaneFollower, same as the real arbiter only capping in
+    # RolloutMode.ACTIVE.
+    steer_rate_limit = getattr(cfg, 'LANE_CHANGE_STEER_RATE_LIMIT', 0.15)
+    last_out_steering = None
 
     for rec in recs:
         rgb = load_rgb(tub_dir, rec)
@@ -117,11 +125,11 @@ def replay_tub(tub_name, tubs_dir, cfg, out_dir, apply_set_lane=False, max_frame
         if depth is not None:
             summary['depth_frames'] += 1
 
-        lf.run(rgb)  # reconstruct lane geometry (steering/throttle from this discarded -- manual drive)
+        lf.run(rgb)  # reconstruct lane geometry; lf.steering is what LaneFollower itself would command
         geometry = make_lane_geometry(lf, primary_row_y)
 
         detection, ddebug = detector.detect(rgb, depth)
-        decision = planner.step(detection, geometry)
+        decision = planner.step(detection, geometry, raw_steering=lf.steering)
 
         if detection is not None:
             summary['detections'] += 1
@@ -131,6 +139,21 @@ def replay_tub(tub_name, tubs_dir, cfg, out_dir, apply_set_lane=False, max_frame
         if decision.cone_in_path:
             summary['relevant_frames'] += 1
         summary['state_series'].append([rec['_index'], decision.state.value])
+
+        out_steering = lf.steering
+        if apply_set_lane and decision.steering_cap is not None:
+            cap = abs(decision.steering_cap)
+            capped = max(-cap, min(cap, lf.steering))
+            if last_out_steering is not None:
+                delta = capped - last_out_steering
+                if delta > steer_rate_limit:
+                    capped = last_out_steering + steer_rate_limit
+                elif delta < -steer_rate_limit:
+                    capped = last_out_steering - steer_rate_limit
+            out_steering = capped
+        if apply_set_lane:
+            last_out_steering = out_steering
+        summary['steering_series'].append([rec['_index'], lf.steering, out_steering, decision.steering_cap])
 
         if planner.state != prev_state:
             summary['transitions'].append(dict(idx=rec['_index'], frm=prev_state.value,
