@@ -655,6 +655,21 @@ PLANNER_PREPARE_THROTTLE_SCALE = 0.6
 PLANNER_SWITCH_THROTTLE_SCALE = 0.5
 PLANNER_HOLD_THROTTLE_SCALE = 0.6
 PLANNER_RETURN_THROTTLE_SCALE = 0.8
+# Added 2026-07-30 after cone_test4: LaneFollower's own confidence-based
+# speed policy already drops to THROTTLE_MIN as soon as detection
+# confidence falls (which happens right after a lane switch, while
+# re-acquiring) - the *_THROTTLE_SCALE values above then multiply THAT
+# already-reduced value, not nominal cruising throttle. Confirmed
+# directly: cone_test4 recorded throttle=0.075 (exactly THROTTLE_MIN=
+# 0.15 * PLANNER_SWITCH_THROTTLE_SCALE=0.5) for the entire 300-frame
+# maneuver, and the cone's recorded distance never changed the whole
+# time - the car wasn't slow, it was too close to stalled to make any
+# progress. Should match THROTTLE_MIN below (THROTTLE_MIN isn't defined
+# yet at this point in the file, so this can't just reference it
+# directly - pilot_arbiter.py falls back to cfg.THROTTLE_MIN itself if
+# this key isn't set at all). Does NOT apply to SAFE_STOP (throttle_
+# scale=0.0), which must still mean a real stop.
+PLANNER_MIN_MANEUVER_THROTTLE = 0.15
 
 
 #

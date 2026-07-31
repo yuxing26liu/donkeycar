@@ -126,6 +126,75 @@ def test_active_mode_eventually_calls_set_lane_and_scales_throttle():
     assert scaled_down, "throttle should be scaled down at some point during the maneuver"
 
 
+def test_active_mode_floors_throttle_instead_of_compounding_scales():
+    """The exact real bug (cone_test4, 2026-07-30): LaneFollower's own
+    confidence-based speed policy already drops pilot_throttle to
+    THROTTLE_MIN as soon as detection confidence falls (which happens
+    right after a lane switch) - PLANNER_SWITCH_THROTTLE_SCALE=0.5 then
+    multiplied THAT already-reduced value, not nominal cruising
+    throttle, landing on throttle=0.075 (0.15*0.5) for the entire
+    maneuver - too low to actually move the car (recorded cone distance
+    never changed for the full 300-frame/15s timeout). The floor must
+    win over the compounded (lower) product."""
+    from donkeycar.parts.obstacle_types import PlannerDecision, PlannerState
+
+    class FakeDetector:
+        def detect(self, cam_img, depth_img):
+            return None, {}
+
+    class FakePlanner:
+        mode = None
+        def step(self, detection, geometry):
+            return PlannerDecision(state=PlannerState.SWITCH_TO_NEIGHBOR_LANE, reason='test',
+                                    requested_lane=None, throttle_scale=0.5, cone_in_path=False)
+
+    from donkeycar.parts.obstacle_types import RolloutMode
+    cfg = make_cfg('active')
+    cfg.PLANNER_MIN_MANEUVER_THROTTLE = 0.15
+    pid = PID(-0.01, 0.0, -0.00035)
+    lf = LaneFollower(pid, cfg)
+    fake_planner = FakePlanner()
+    fake_planner.mode = RolloutMode.ACTIVE
+    arbiter = PilotArbiter(cfg, lf, FakeDetector(), fake_planner)
+
+    frame = cone_frame()
+    # LaneFollower's own low-confidence crawl -- already-reduced input
+    low_confidence_pilot_throttle = 0.15
+    result = arbiter.run(frame, None, 0.0, low_confidence_pilot_throttle, None, None, 150.0)
+    out_throttle = result[1]
+
+    compounded = low_confidence_pilot_throttle * 0.5  # = 0.075, the actual observed bug value
+    assert out_throttle > compounded, "throttle must not be left at the stalling compounded value"
+    assert out_throttle == 0.15, "floored at PLANNER_MIN_MANEUVER_THROTTLE"
+
+
+def test_safe_stop_throttle_scale_is_not_floored():
+    """throttle_scale=0.0 (SAFE_STOP) must still mean a real stop -- the
+    floor only applies to genuine in-between maneuver scaling."""
+    from donkeycar.parts.obstacle_types import PlannerDecision, PlannerState, RolloutMode
+
+    class FakeDetector:
+        def detect(self, cam_img, depth_img):
+            return None, {}
+
+    class FakePlanner:
+        def step(self, detection, geometry):
+            return PlannerDecision(state=PlannerState.SAFE_STOP, reason='test',
+                                    requested_lane=None, throttle_scale=0.0, cone_in_path=False)
+
+    cfg = make_cfg('active')
+    cfg.PLANNER_MIN_MANEUVER_THROTTLE = 0.15
+    pid = PID(-0.01, 0.0, -0.00035)
+    lf = LaneFollower(pid, cfg)
+    fake_planner = FakePlanner()
+    fake_planner.mode = RolloutMode.ACTIVE
+    arbiter = PilotArbiter(cfg, lf, FakeDetector(), fake_planner)
+
+    frame = cone_frame()
+    result = arbiter.run(frame, None, 0.0, 0.30, None, None, 150.0)
+    assert result[1] == 0.0, "SAFE_STOP must still fully stop the car, not get floored"
+
+
 def test_returned_debug_fields_are_populated_when_cone_present():
     lf, arbiter = make_stack('observe')
     result = run_ticks(lf, arbiter, 3)

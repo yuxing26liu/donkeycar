@@ -39,6 +39,24 @@ class PilotArbiter:
         self.planner = obstacle_planner
         self.mode = self.planner.mode
         self.primary_row_y = lane_follower.scan_rows[0]['scan_y']
+        # Minimum absolute throttle during an active maneuver, added
+        # 2026-07-30 after cone_test4: LaneFollower's OWN confidence-based
+        # speed policy already drops to THROTTLE_MIN as soon as detection
+        # confidence falls (which naturally happens right after a lane
+        # switch, while re-acquiring) - the planner's throttle_scale
+        # (e.g. 0.5 during SWITCH_TO_NEIGHBOR_LANE) then multiplies THAT
+        # already-reduced value, not the nominal cruising throttle.
+        # Confirmed directly: cone_test4 recorded throttle=0.075 for the
+        # entire 300-frame maneuver (exactly THROTTLE_MIN=0.15 * 0.5) and
+        # the cone's distance never changed the whole time - the car
+        # wasn't slow, it was too close to stalled to make real progress,
+        # so the maneuver just sat there until the 15s timeout gave up.
+        # This floor stops the two independent slowdowns from compounding
+        # below a speed that can actually complete a maneuver - it does
+        # NOT apply to SAFE_STOP (throttle_scale=0.0), which must still
+        # mean a real stop.
+        self.min_maneuver_throttle = getattr(cfg, 'PLANNER_MIN_MANEUVER_THROTTLE',
+                                              getattr(cfg, 'THROTTLE_MIN', 0.15))
 
     def run(self, cam_img, depth_img, pilot_steering, pilot_throttle,
             lane_yellow_x, lane_white_x, lane_width_px):
@@ -64,7 +82,16 @@ class PilotArbiter:
             if decision.requested_lane is not None \
                     and decision.requested_lane != self.lane_follower.current_lane:
                 self.lane_follower.set_lane(decision.requested_lane)
-            out_throttle = pilot_throttle * decision.throttle_scale
+            scaled_throttle = pilot_throttle * decision.throttle_scale
+            if 0.0 < decision.throttle_scale < 1.0:
+                # actively maneuvering (not FOLLOW_LANE/OBJECT_WATCH at
+                # scale 1.0, not a genuine SAFE_STOP at scale 0.0) -- floor
+                # it so this scale-down can't compound with LaneFollower's
+                # own already-reduced low-confidence throttle into
+                # something too small to actually move the car
+                out_throttle = max(scaled_throttle, self.min_maneuver_throttle)
+            else:
+                out_throttle = scaled_throttle
         elif self.mode == RolloutMode.SHADOW:
             if decision.requested_lane is not None or decision.throttle_scale < 1.0:
                 logger.info(f"[SHADOW] would apply: requested_lane={decision.requested_lane} "
